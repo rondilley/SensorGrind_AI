@@ -1,0 +1,538 @@
+"""
+report/render - rendering primitives extracted from comprehensive_report.py.
+
+Contains:
+  - Mermaid block builders (pie, xychart-beta bar/line, sequence, flowchart,
+    sankey-beta, gantt)
+  - Matplotlib-backed SVG fallbacks (bar/line) used when Mermaid would
+    crowd labels
+  - smart_bar / smart_line picker that switches between Mermaid + SVG
+  - mermaid_histogram, percentile_table, svg_heatmap
+  - HTML head/style + write_html
+  - PDF rendering via WeasyPrint with Mermaid pre-render to SVG
+  - safe_read_table / safe_columns DuckDB helpers
+
+The split is motivated by the multi-AI methodology review: the original
+comprehensive_report.py was 2300+ lines and impossible to unit-test in
+pieces.  Keeping the "how to draw" code here lets the section-building
+code in comprehensive_report.py stay focused on data + narrative.
+"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sg import lib
+
+OUT_PATH = lib.REPORTS / "COMPREHENSIVE.md"
+HTML_PATH = lib.REPORTS / "COMPREHENSIVE.html"
+PDF_PATH  = lib.REPORTS / "COMPREHENSIVE.pdf"
+VISUALS_DIR = lib.REPORTS / "visuals"
+
+MMDC = os.environ.get(
+    "SG_MMDC",
+    str(Path.home() / ".local" / "mmdc" / "node_modules" / ".bin" / "mmdc"),
+)
+PUPPETEER_CONFIG = os.environ.get(
+    "SG_PUPPETEER_CONFIG",
+    str(Path.home() / ".local" / "mmdc" / "puppeteer-config.json"),
+)
+
+
+# ----------------------------------------------------------------------
+# Mermaid blocks
+# ----------------------------------------------------------------------
+
+def mermaid_pie(title: str, data: list[tuple[str, float]]) -> str:
+    lines = ["```mermaid", "pie showData", f'    title {title}']
+    for label, value in data:
+        safe = str(label).replace('"', "'")
+        lines.append(f'    "{safe}" : {value}')
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def mermaid_xychart_bar(title: str, x_labels: list[str], y_values: list[float],
+                        x_title: str = "", y_title: str = "") -> str:
+    safe = [str(x).replace('"', "'") for x in x_labels]
+    x = ", ".join(f'"{s}"' for s in safe)
+    y = ", ".join(f"{v:.0f}" for v in y_values)
+    lines = ["```mermaid", "xychart-beta",
+             f'    title "{title}"',
+             f'    x-axis [{x}]',
+             f'    y-axis "{y_title}"' if y_title else '    y-axis "count"',
+             f"    bar [{y}]",
+             "```"]
+    return "\n".join(lines)
+
+
+def mermaid_xychart_line(title: str, x_labels: list[str], y_values: list[float],
+                         y_title: str = "value") -> str:
+    safe = [str(x).replace('"', "'") for x in x_labels]
+    x = ", ".join(f'"{s}"' for s in safe)
+    y = ", ".join(f"{v:.0f}" for v in y_values)
+    lines = ["```mermaid", "xychart-beta",
+             f'    title "{title}"',
+             f'    x-axis [{x}]',
+             f'    y-axis "{y_title}"',
+             f"    line [{y}]",
+             "```"]
+    return "\n".join(lines)
+
+
+def mermaid_sequence(actors: list[str],
+                     messages: list[tuple[str, str, str]]) -> str:
+    lines = ["```mermaid", "sequenceDiagram"]
+    for a in actors:
+        safe = a.replace(' ', '_')
+        lines.append(f'    participant {safe} as {a}')
+    for src, dst, msg in messages:
+        s = src.replace(' ', '_')
+        d = dst.replace(' ', '_')
+        lines.append(f'    {s}->>{d}: {msg}')
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def mermaid_flowchart(direction: str, nodes: list[tuple[str, str]],
+                      edges: list[tuple[str, str, str]]) -> str:
+    lines = ["```mermaid", f"flowchart {direction}"]
+    for nid, lbl in nodes:
+        lines.append(f'    {nid}["{lbl}"]')
+    for src, dst, lbl in edges:
+        if lbl:
+            lines.append(f'    {src} -->|{lbl}| {dst}')
+        else:
+            lines.append(f'    {src} --> {dst}')
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def mermaid_sankey(rows: list[tuple[str, str, float]]) -> str:
+    lines = ["```mermaid", "sankey-beta", ""]
+    for s, t, v in rows:
+        lines.append(f"{s},{t},{int(v)}")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def mermaid_gantt(title: str,
+                  items: list[tuple[str, str, str, str]]) -> str:
+    lines = ["```mermaid", "gantt",
+             "    dateFormat YYYY-MM-DD",
+             f"    title {title}",
+             "    axisFormat %Y-%m"]
+    cur_section = None
+    for section, task, start, end in items:
+        if section != cur_section:
+            lines.append(f"    section {section}")
+            cur_section = section
+        clean_task = task.replace(":", "-")
+        lines.append(f"    {clean_task} :{start}, {end}")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# Matplotlib fallbacks
+# ----------------------------------------------------------------------
+
+def svg_bar_chart(title: str, x_labels: list[str], y_values: list[float],
+                  out_path: Path, x_title: str = "",
+                  y_title: str = "count") -> str:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = len(x_labels)
+    max_lbl = max((len(str(x)) for x in x_labels), default=0)
+    rotation = 0 if max_lbl <= 3 and n <= 8 else (45 if max_lbl <= 8 else 60)
+
+    fig_w = max(7.5, min(16, 0.6 * n + 2))
+    fig_h = 4.5 if rotation <= 45 else 5.5
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    bars = ax.bar(range(n), y_values, color="#3b6ea5",
+                  edgecolor="#08306b", linewidth=0.6)
+    ax.set_xticks(range(n))
+    ax.set_xticklabels([str(x) for x in x_labels],
+                       rotation=rotation,
+                       ha=("right" if rotation else "center"))
+    if x_title:
+        ax.set_xlabel(x_title)
+    ax.set_ylabel(y_title)
+    ax.set_title(title)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.yaxis.grid(True, linestyle="--", color="#e5e7eb", linewidth=0.7)
+    ax.set_axisbelow(True)
+    if any(v > 1000 for v in y_values):
+        ax.yaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _: f"{int(v):,}"))
+    if n <= 20:
+        for rect, val in zip(bars, y_values):
+            if val <= 0:
+                continue
+            ax.text(rect.get_x() + rect.get_width() / 2,
+                    rect.get_height(),
+                    f"{int(val):,}" if val >= 1 else f"{val:.2f}",
+                    ha="center", va="bottom", fontsize=8, color="#374151")
+    plt.tight_layout()
+    fig.savefig(out_path, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    rel = out_path.relative_to(OUT_PATH.parent)
+    return f"![{title}]({rel})"
+
+
+def svg_line_chart(title: str, x_labels: list[str], y_values: list[float],
+                   out_path: Path, y_title: str = "value") -> str:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = len(x_labels)
+    max_lbl = max((len(str(x)) for x in x_labels), default=0)
+    rotation = 0 if max_lbl <= 3 and n <= 8 else (45 if max_lbl <= 8 else 60)
+
+    fig_w = max(8, min(16, 0.55 * n + 2))
+    fig_h = 4.2
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.plot(range(n), y_values, marker="o", color="#08306b",
+            markerfacecolor="#3b6ea5", linewidth=1.5)
+    ax.set_xticks(range(n))
+    ax.set_xticklabels([str(x) for x in x_labels],
+                       rotation=rotation,
+                       ha=("right" if rotation else "center"))
+    ax.set_ylabel(y_title)
+    ax.set_title(title)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.yaxis.grid(True, linestyle="--", color="#e5e7eb", linewidth=0.7)
+    ax.set_axisbelow(True)
+    if any(v > 1000 for v in y_values):
+        ax.yaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _: f"{int(v):,}"))
+    plt.tight_layout()
+    fig.savefig(out_path, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    rel = out_path.relative_to(OUT_PATH.parent)
+    return f"![{title}]({rel})"
+
+
+_BAR_CHART_COUNTER = [0]
+
+
+def smart_bar(title: str, x_labels: list[str], y_values: list[float],
+              x_title: str = "", y_title: str = "count") -> str:
+    max_lbl = max((len(str(x)) for x in x_labels), default=0)
+    n = len(x_labels)
+    needs_svg = max_lbl > 4 or n > 12
+    if not needs_svg:
+        return mermaid_xychart_bar(title, x_labels, y_values, y_title=y_title)
+    VISUALS_DIR.mkdir(parents=True, exist_ok=True)
+    _BAR_CHART_COUNTER[0] += 1
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_",
+                  title.lower())[:48] or f"bar_{_BAR_CHART_COUNTER[0]:03d}"
+    out_path = VISUALS_DIR / f"{slug}.svg"
+    return svg_bar_chart(title, x_labels, y_values, out_path,
+                         x_title=x_title, y_title=y_title)
+
+
+def smart_line(title: str, x_labels: list[str], y_values: list[float],
+               y_title: str = "value") -> str:
+    max_lbl = max((len(str(x)) for x in x_labels), default=0)
+    n = len(x_labels)
+    needs_svg = max_lbl > 4 or n > 12
+    if not needs_svg:
+        return mermaid_xychart_line(title, x_labels, y_values, y_title=y_title)
+    VISUALS_DIR.mkdir(parents=True, exist_ok=True)
+    _BAR_CHART_COUNTER[0] += 1
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_",
+                  title.lower())[:48] or f"line_{_BAR_CHART_COUNTER[0]:03d}"
+    out_path = VISUALS_DIR / f"{slug}.svg"
+    return svg_line_chart(title, x_labels, y_values, out_path,
+                          y_title=y_title)
+
+
+def mermaid_histogram(title: str, values: list[float], n_bins: int = 10,
+                      y_title: str = "count") -> str:
+    if not values:
+        return "_(no data)_"
+    lo, hi = min(values), max(values)
+    if hi == lo:
+        hi = lo + 1.0
+    bins = [0] * n_bins
+    width = (hi - lo) / n_bins
+    for v in values:
+        i = min(n_bins - 1, int((v - lo) / width))
+        bins[i] += 1
+    labels = [f"{lo + i*width:.1f}-{lo + (i+1)*width:.1f}"
+              for i in range(n_bins)]
+    return smart_bar(title, labels, bins, y_title=y_title)
+
+
+def percentile_table(values: list[float], unit: str = "") -> str:
+    import numpy as np
+    if not values:
+        return "_(no data)_"
+    arr = np.array(values)
+    pct = [10, 25, 50, 75, 90, 95, 99]
+    rows = ["| pct | value |", "| --- | --- |"]
+    rows.append(f"| count | {len(arr):,} |")
+    rows.append(f"| mean | {arr.mean():.2f} {unit} |")
+    rows.append(f"| std | {arr.std():.2f} {unit} |")
+    rows.append(f"| min | {arr.min():.2f} {unit} |")
+    rows.append(f"| max | {arr.max():.2f} {unit} |")
+    for p in pct:
+        rows.append(f"| p{p} | {np.percentile(arr, p):.2f} {unit} |")
+    return "\n".join(rows)
+
+
+def svg_heatmap(matrix: list[list[float]], row_labels: list[str],
+                col_labels: list[str], out_path: Path,
+                title: str = "") -> str:
+    flat = [v for row in matrix for v in row]
+    if not flat:
+        return "_(no data)_"
+    mx = max(flat) or 1.0
+    rows = len(matrix)
+    cols = len(matrix[0]) if matrix else 0
+
+    cell_w, cell_h = 56, 22
+    margin_l, margin_t, margin_r, margin_b = 70, 50, 24, 80
+    width = margin_l + cols * cell_w + margin_r
+    height = margin_t + rows * cell_h + margin_b
+
+    def color(v: float) -> str:
+        r0, g0, b0 = 247, 251, 255
+        r1, g1, b1 = 8, 48, 107
+        t = (v / mx) if mx > 0 else 0.0
+        t = t ** 0.6
+        r = int(r0 + (r1 - r0) * t)
+        g = int(g0 + (g1 - g0) * t)
+        b = int(b0 + (b1 - b0) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    parts: list[str] = []
+    parts.append(f'<svg xmlns="http://www.w3.org/2000/svg" '
+                 f'width="{width}" height="{height}" '
+                 f'viewBox="0 0 {width} {height}" '
+                 f'font-family="system-ui, sans-serif">')
+    parts.append('<style>text{font-size:11px}'
+                 '.title{font-size:14px;font-weight:600}'
+                 '.legendlabel{font-size:10px;fill:#555}</style>')
+    parts.append('<rect width="100%" height="100%" fill="#ffffff"/>')
+
+    if title:
+        parts.append(f'<text class="title" x="{width/2:.0f}" y="22" '
+                     f'text-anchor="middle">{title}</text>')
+
+    for i, label in enumerate(col_labels):
+        cx = margin_l + i * cell_w + cell_w / 2
+        parts.append(f'<text x="{cx:.0f}" y="{margin_t - 6}" '
+                     f'text-anchor="middle">{label}</text>')
+
+    for i, row in enumerate(matrix):
+        cy = margin_t + i * cell_h + cell_h / 2 + 4
+        parts.append(f'<text x="{margin_l - 8}" y="{cy:.0f}" '
+                     f'text-anchor="end">{row_labels[i]}</text>')
+        for j, v in enumerate(row):
+            x = margin_l + j * cell_w
+            y = margin_t + i * cell_h
+            c = color(v)
+            parts.append(
+                f'<rect x="{x:.0f}" y="{y:.0f}" '
+                f'width="{cell_w}" height="{cell_h}" '
+                f'fill="{c}" stroke="#e5e7eb" stroke-width="0.5">'
+                f'<title>{row_labels[i]} {col_labels[j]}: '
+                f'{int(v):,}</title></rect>'
+            )
+
+    legend_y = margin_t + rows * cell_h + 24
+    legend_w = cols * cell_w
+    gid = "heat_grad"
+    parts.append(f'<defs><linearGradient id="{gid}" x1="0%" x2="100%">')
+    for i in range(11):
+        t = i / 10
+        v = t * mx
+        parts.append(f'<stop offset="{int(t*100)}%" '
+                     f'stop-color="{color(v)}"/>')
+    parts.append('</linearGradient></defs>')
+    parts.append(f'<rect x="{margin_l}" y="{legend_y}" '
+                 f'width="{legend_w}" height="14" '
+                 f'fill="url(#{gid})" stroke="#9ca3af" stroke-width="0.5"/>')
+    parts.append(f'<text class="legendlabel" x="{margin_l}" '
+                 f'y="{legend_y + 28}" text-anchor="start">0</text>')
+    parts.append(f'<text class="legendlabel" '
+                 f'x="{margin_l + legend_w}" y="{legend_y + 28}" '
+                 f'text-anchor="end">{int(mx):,}</text>')
+    parts.append(f'<text class="legendlabel" '
+                 f'x="{margin_l + legend_w/2}" y="{legend_y + 28}" '
+                 f'text-anchor="middle">{int(mx/2):,}</text>')
+    parts.append('</svg>')
+
+    out_path.write_text("\n".join(parts))
+    rel = out_path.relative_to(OUT_PATH.parent)
+    return f"![{title or 'heatmap'}]({rel})"
+
+
+# ----------------------------------------------------------------------
+# HTML / PDF rendering
+# ----------------------------------------------------------------------
+
+_MERMAID_BLOCK = re.compile(r"```mermaid\n(.*?)\n```", re.DOTALL)
+
+
+def render_mermaid_to_svg(mmd_src: str, out_path: Path) -> bool:
+    if not Path(MMDC).exists():
+        return False
+    with tempfile.NamedTemporaryFile("w", suffix=".mmd", delete=False) as f:
+        f.write(mmd_src)
+        tmp = f.name
+    try:
+        cmd = [MMDC, "-i", tmp, "-o", str(out_path), "-b", "white"]
+        if Path(PUPPETEER_CONFIG).exists():
+            cmd.extend(["-p", PUPPETEER_CONFIG])
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        return r.returncode == 0 and out_path.exists()
+    except Exception as e:
+        print(f"[report] mmdc failed: {e}", file=sys.stderr)
+        return False
+    finally:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+def md_to_html_body(md_text: str) -> str:
+    from markdown_it import MarkdownIt
+    md = MarkdownIt("commonmark", {"html": True, "linkify": False,
+                                   "typographer": False})
+    md.enable("table").enable("strikethrough")
+    return md.render(md_text)
+
+
+HTML_STYLE = """
+:root { color-scheme: light; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+       "Helvetica Neue", Arial, sans-serif; max-width: 1200px; margin: 24px auto;
+       padding: 0 24px 80px; color: #1f2328; line-height: 1.55; }
+h1 { border-bottom: 1px solid #d0d7de; padding-bottom: 8px; margin-top: 32px; }
+h2 { border-bottom: 1px solid #eaeef2; padding-bottom: 6px; margin-top: 28px; }
+h3 { margin-top: 22px; }
+table { border-collapse: collapse; margin: 12px 0; font-size: 13px;
+        width: 100%; table-layout: auto; }
+th, td { border: 1px solid #d0d7de; padding: 6px 10px; text-align: left;
+         vertical-align: top; word-wrap: break-word; overflow-wrap: anywhere;
+         hyphens: auto; }
+th { background: #f6f8fa; font-weight: 600; }
+tr:nth-child(even) td { background: #fafbfc; }
+code { background: #f6f8fa; padding: 2px 5px; border-radius: 4px;
+       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+       font-size: 12.5px; word-wrap: break-word; overflow-wrap: anywhere; }
+pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto;
+      font-size: 12.5px; }
+pre code { background: transparent; padding: 0; }
+img { max-width: 100%; height: auto; }
+blockquote { border-left: 4px solid #d0d7de; padding-left: 14px; color: #57606a;
+             margin: 12px 0; }
+.mermaid { background: #fff; padding: 6px; border-radius: 6px; }
+hr { border: 0; border-top: 1px solid #d0d7de; margin: 28px 0; }
+@media print {
+  body { max-width: none; margin: 0; padding: 10mm; font-size: 9.5pt; }
+  h1, h2, h3 { page-break-after: avoid; }
+  table { font-size: 7.5pt; width: 100%; table-layout: fixed; }
+  th, td { padding: 3px 5px; word-wrap: break-word; overflow-wrap: anywhere;
+           hyphens: auto; -webkit-hyphens: auto; }
+  pre, code { font-size: 7.5pt; word-wrap: break-word; overflow-wrap: anywhere;
+              white-space: pre-wrap; }
+  pre { padding: 6px; }
+  img, .mermaid { page-break-inside: avoid; max-width: 100%; }
+}
+"""
+
+HTML_HEAD = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SensorGrind_AI Comprehensive Report</title>
+<style>{style}</style>
+</head>
+<body>
+{body}
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({{startOnLoad:false, theme:'neutral', securityLevel:'loose'}});
+document.querySelectorAll('pre > code.language-mermaid, pre code.language-mermaid').forEach(function(el){{
+  var pre = el.parentElement;
+  var div = document.createElement('div');
+  div.className = 'mermaid';
+  div.textContent = el.textContent;
+  pre.replaceWith(div);
+}});
+mermaid.run();
+</script>
+</body>
+</html>
+"""
+
+
+def write_html(md_text: str, html_path: Path) -> None:
+    body = md_to_html_body(md_text)
+    html_path.write_text(HTML_HEAD.format(style=HTML_STYLE, body=body))
+
+
+def prerender_mermaid_for_pdf(md_text: str, svg_dir: Path) -> str:
+    svg_dir.mkdir(parents=True, exist_ok=True)
+    counter = [0]
+
+    def _sub(m: re.Match) -> str:
+        counter[0] += 1
+        idx = counter[0]
+        src = m.group(1)
+        out = svg_dir / f"mmd_{idx:04d}.svg"
+        ok = render_mermaid_to_svg(src, out)
+        if not ok:
+            return m.group(0)
+        return (f"![mermaid {idx}]"
+                f"({out.relative_to(lib.REPORTS).as_posix()})")
+
+    return _MERMAID_BLOCK.sub(_sub, md_text)
+
+
+def write_pdf(md_text: str, pdf_path: Path) -> None:
+    from weasyprint import HTML, CSS
+    pdf_md = prerender_mermaid_for_pdf(md_text, VISUALS_DIR / "mermaid")
+    body = md_to_html_body(pdf_md)
+    html_doc = HTML_HEAD.format(style=HTML_STYLE, body=body)
+    HTML(string=html_doc, base_url=str(lib.REPORTS)).write_pdf(
+        str(pdf_path),
+        stylesheets=[CSS(string="@page { size: A4; margin: 14mm; }")],
+    )
+
+
+# ----------------------------------------------------------------------
+# DuckDB helpers used by section composers
+# ----------------------------------------------------------------------
+
+def safe_read_table(con, path: Path, where: str = "") -> list[tuple]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    sql = f"SELECT * FROM read_parquet('{path}')"
+    if where:
+        sql += f" WHERE {where}"
+    return con.execute(sql).fetchall()
+
+
+def safe_columns(con, path: Path) -> list[str]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    rows = con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet('{path}')"
+    ).fetchall()
+    return [r[0] for r in rows]
