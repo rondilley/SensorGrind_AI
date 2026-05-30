@@ -123,10 +123,37 @@ def mermaid_sankey(rows: list[tuple[str, str, float]]) -> str:
 
 def mermaid_gantt(title: str,
                   items: list[tuple[str, str, str, str]]) -> str:
+    # Mermaid's default Gantt tick spacing is 3-7 days regardless of the
+    # full date range, so multi-year charts render with bare "M-D" labels
+    # that look meaningless without a year.  Pick a tick interval based
+    # on the actual span and pin the axis format to match.
+    starts = [s for _, _, s, _ in items if s]
+    ends   = [e for _, _, _, e in items if e]
+    span_days = 0
+    if starts and ends:
+        try:
+            import datetime as _dt
+            s_min = min(_dt.date.fromisoformat(s) for s in starts)
+            e_max = max(_dt.date.fromisoformat(e) for e in ends)
+            span_days = (e_max - s_min).days
+        except (ValueError, TypeError):
+            span_days = 0
+    if span_days >= 365:
+        tick_interval = "1month"
+        axis_format   = "%Y-%m"
+    elif span_days >= 60:
+        tick_interval = "1week"
+        axis_format   = "%Y-%m-%d"
+    else:
+        tick_interval = "1day"
+        axis_format   = "%Y-%m-%d"
+
     lines = ["```mermaid", "gantt",
              "    dateFormat YYYY-MM-DD",
              f"    title {title}",
-             "    axisFormat %Y-%m"]
+             f"    axisFormat {axis_format}",
+             f"    tickInterval {tick_interval}",
+             "    weekday monday"]
     cur_section = None
     for section, task, start, end in items:
         if section != cur_section:
@@ -217,6 +244,144 @@ def svg_line_chart(title: str, x_labels: list[str], y_values: list[float],
         ax.yaxis.set_major_formatter(
             matplotlib.ticker.FuncFormatter(lambda v, _: f"{int(v):,}"))
     plt.tight_layout()
+    fig.savefig(out_path, format="svg", bbox_inches="tight")
+    plt.close(fig)
+    rel = out_path.relative_to(OUT_PATH.parent)
+    return f"![{title}]({rel})"
+
+
+def svg_gantt_chart(title: str,
+                    items: list[tuple[str, str, str, str]],
+                    out_path: Path) -> str:
+    """Render a Gantt chart as an SVG via matplotlib.
+
+    items: list of (section, label, start_iso, end_iso).  Section is
+    ignored for now; labels are placed top-to-bottom in input order
+    (so callers can pre-sort to put the most important bars at the top).
+    """
+    import datetime as _dt
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.dates import (DateFormatter, MonthLocator, WeekdayLocator,
+                                  AutoDateLocator)
+    import matplotlib.dates as mdates
+
+    rows: list[tuple[str, _dt.date, _dt.date]] = []
+    for _section, label, start, end in items:
+        try:
+            s = _dt.date.fromisoformat(start[:10])
+            e = _dt.date.fromisoformat(end[:10])
+        except (ValueError, TypeError):
+            continue
+        if e <= s:
+            e = s + _dt.timedelta(days=1)
+        rows.append((label, s, e))
+    if not rows:
+        return ""
+
+    n = len(rows)
+    span_days = (max(r[2] for r in rows) - min(r[1] for r in rows)).days
+    fig_w = max(10.0, min(18.0, 0.18 * span_days / 7 + 8))
+    fig_h = max(3.0, 0.30 * n + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    # Bars top->bottom in input order (#1 at the top after invert_yaxis).
+    bar_color = "#3b6ea5"
+    bars: list = []
+    for i, (_label, s, e) in enumerate(rows):
+        b = ax.barh(i, (e - s).days, left=mdates.date2num(s), height=0.55,
+                    color=bar_color, edgecolor="#08306b", linewidth=0.5,
+                    align="center")
+        bars.append(b[0])
+    # Hide the y-axis tick labels - labels are placed onto the bars
+    # themselves (or just outside, with a connector) below.
+    ax.set_yticks(range(n))
+    ax.set_yticklabels([""] * n)
+    ax.tick_params(axis="y", length=0)
+    ax.invert_yaxis()
+    # Need final x-limits before we measure pixel widths.
+    ax.relim()
+    ax.autoscale(enable=True, axis="x", tight=False)
+
+    # Time axis: monthly ticks for multi-year spans, weekly otherwise.
+    if span_days >= 365:
+        locator   = MonthLocator(interval=1)
+        formatter = DateFormatter("%b-%Y")
+    elif span_days >= 60:
+        locator   = WeekdayLocator(byweekday=0)   # Mondays
+        formatter = DateFormatter("%d/%m/%Y")
+    else:
+        locator   = AutoDateLocator()
+        formatter = DateFormatter("%d/%m/%Y")
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right",
+             fontsize=9)
+
+    # Gridlines: subtle gray dashes at every month, no heavy axis lines.
+    ax.xaxis.grid(True, which="major", color="#9ca3af", linestyle="--",
+                  linewidth=0.6, alpha=0.7)
+    ax.set_axisbelow(True)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    ax.spines["left"].set_color("#9ca3af")
+    ax.spines["bottom"].set_color("#9ca3af")
+    ax.tick_params(axis="x", length=3, color="#9ca3af")
+    ax.tick_params(axis="y", length=0)
+
+    ax.set_title(title, loc="left", fontsize=11)
+    ax.set_xlabel("date")
+
+    # Place labels: inside the bar (white text, centered) if the label
+    # fits with margin; otherwise just outside the right edge with a
+    # thin connector and black text.  We measure widths in display
+    # (pixel) coordinates so the decision matches what the SVG viewer
+    # will actually render.
+    plt.tight_layout()
+    fig.canvas.draw()                  # populate the renderer
+    renderer = fig.canvas.get_renderer()
+    label_fontsize = 9
+    inside_pad_px = 6                  # pixels of padding inside the bar
+    outside_pad_px = 4                 # gap between bar end and label
+    connector_color = "#6b7280"
+    for i, ((label, s, e), bar) in enumerate(zip(rows, bars)):
+        # Bar geometry in display pixels.
+        x_left_data  = mdates.date2num(s)
+        x_right_data = mdates.date2num(e)
+        x_left_px, y_px  = ax.transData.transform((x_left_data,  i))
+        x_right_px, _    = ax.transData.transform((x_right_data, i))
+        bar_width_px = x_right_px - x_left_px
+
+        # Estimate text width by actually rendering it offscreen.
+        probe = ax.text(0, 0, label, fontsize=label_fontsize)
+        bbox  = probe.get_window_extent(renderer=renderer)
+        text_w_px = bbox.width
+        text_h_px = bbox.height
+        probe.remove()
+
+        if bar_width_px >= text_w_px + 2 * inside_pad_px:
+            # Inside the bar, centered.
+            mid_data = x_left_data + (x_right_data - x_left_data) / 2
+            ax.text(mid_data, i, label,
+                    ha="center", va="center",
+                    color="white", fontsize=label_fontsize, zorder=3)
+        else:
+            # Outside the bar to the right; small line connector from
+            # the bar's right edge to the start of the text so the eye
+            # can map the label back to its bar.
+            label_x_px = x_right_px + outside_pad_px
+            label_x_data = ax.transData.inverted().transform(
+                (label_x_px, y_px))[0]
+            ax.text(label_x_data, i, " " + label,
+                    ha="left", va="center",
+                    color="#111827", fontsize=label_fontsize, zorder=3)
+            # Connector: a short horizontal line from the bar end to the
+            # label's anchor.  Drawn in data coords on the same axes.
+            ax.plot([x_right_data, label_x_data], [i, i],
+                    color=connector_color, linewidth=0.6, zorder=2,
+                    clip_on=False)
+
     fig.savefig(out_path, format="svg", bbox_inches="tight")
     plt.close(fig)
     rel = out_path.relative_to(OUT_PATH.parent)

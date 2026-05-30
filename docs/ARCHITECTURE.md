@@ -82,8 +82,23 @@ Extracted indicators of compromise -- one row per (src_ip, ioc_kind, value).
 
 ## 2. Pipeline DAG
 
-35 stages. The orchestrator (`src/evolve.py`) builds the dependency graph
-from:
+37 stages (analyzers, features, ML chain, pattern + longitudinal, deep
+packet / payload / behavior, non-IP / origin / attribution, blind-spot
+analyzers, **cross-signal conclusions**, output).  Preceded by an
+out-of-DAG stage:
+
+- **`scripts/consolidate_logs.py`** -- consolidates raw rotated honeypi00
+  syslog `.gz` files into a single sorted, deduplicated, clock-skew-
+  corrected `merged.log.gz`.  Honeypi00's RTC has been intermittently
+  resetting to 2019-02-14 since 2025-09-23; the consolidator detects
+  per-run skew via FortiGate `date= time= tz=` and newsyslog ISO-UTC
+  prefix anchors in the same syslog stream, then rewrites both the
+  leading ISO column AND each event's body `PacketTime:` field with the
+  corrected wallclock time.  Outputs:
+    `~/temp/sensor_logs/consolidated/{merged.log.gz, manifest.tsv}`
+    `output/reports/clock_skew/clock_skew.{md,parquet}`
+
+The orchestrator (`src/evolve.py`) builds the dependency graph from:
 
 1. **Explicit edges** in `EXPLICIT_DEPS` (the hard ordering requirements).
 2. **Inferred edges** by glob-overlap between each stage's declared inputs
@@ -130,8 +145,48 @@ stages to a `ProcessPoolExecutor`.
 - `selfmimic` -- detects inbound echo of the sensor's own banners
 - `adversarysim` -- synthetic-archetype regression harness
 
+**Cross-signal conclusions (v2.6, added 2026-05-29)**
+- `correlate` -- runs 18 hand-coded cross-analyzer rules over every
+  per-analyzer parquet + the risk snapshot, producing
+  `output/conclusions/findings.parquet`.  Rules include:
+    * `telco_ss7_recon` -- SCTP from sources also scanning telco TCP
+      ports (SIP 5060/5061, M3UA 2905, Diameter 3868, S1AP 36412, GTP
+      2123/2152)
+    * `routing_proto_on_public_ip` -- OSPF/EIGRP/PIM/VRRP arrivals
+    * `ipsec_probe_from_scanner` -- ESP/AH arrivals from scanners
+    * `covert_tunnel_setup` -- IP-in-IP / 6to4 / GRE / ETHERIP arrivals
+    * `multi_transport_bulletproof` -- sources mixing TCP+UDP+ICMP with
+      payload from bulletproof ASNs
+    * `botnet_in_coordination_wave` -- confirmed-botnet IPs inside
+      payload-synchronized waves
+    * `synchronized_campaign_burst` -- >=5 distinct campaigns sharing
+      the same peak day (coordinated push)
+    * `recent_tight_campaign` -- last-60-days campaigns with burst < 7d
+      and >= 500 IPs
+    * `bulletproof_high_density_asns` -- abuse-tolerant ASNs with
+      >50% threat density
+    * `rdp_credential_spray` -- single mstshash reused across many IPs
+    * `low_slow_subnet_coordinated`, `wrong_proto_for_port`,
+      `icmp_payload_anomalies`, `tcp_midstream_or_syn_payload`,
+      `global_arrival_burst`, `local_only_targeted_ports`,
+      `honeypot_aware_self_mimic`, `critical_persistent_botnet`
+- `conclude` -- for each finding, calls the configured LLM
+  (anthropic / openai / xai / mistral / gemini, first key + SDK wins;
+  same provider-discovery pattern as `aipayloaddecode`) to write a
+  structured narrative: `ai_title`, `ai_what`, `ai_why_noteworthy`,
+  `ai_threat_model`, `ai_risk_if_realized`, `ai_recommended_action`,
+  `ai_confidence`.  Responses are cached by sha256 of the rendered
+  prompt under `output/ai_cache/conclude_*.json`, so re-runs are free
+  unless `--force`.  Outputs `output/conclusions/conclusions.{parquet,md}`
+  which the comprehensive report consumes as Section 0.5.
+
 **Output**
-- `report` -- composes the 17-section comprehensive report (+ Section 0)
+- `report` -- composes 25+ sections incl. Section 0 (TL;DR), Section 0.5
+  (Cross-Signal Findings & Conclusions), and Section 6
+  (campaign-onset).  Campaign Gantt is rendered as a matplotlib SVG
+  (`svg_gantt_chart` in `src/report/render.py`) with month-year axis
+  labels, gray dashed gridlines, and on-bar labels (white inside,
+  black outside with gray connector for short bars).
 - `aireview` -- multi-AI self-review (Claude, OpenAI, xAI, Mistral, Gemini)
 
 ### Skip-if-fresh cache

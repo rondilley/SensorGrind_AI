@@ -776,6 +776,137 @@ def pat_self_mimic_honeypot_aware(con) -> list[dict]:
     )]
 
 
+def pat_synchronized_campaign_burst(con) -> list[dict]:
+    """N+ distinct payloads sharing the same peak day - coordinated push."""
+    if not _have(con, "waves"):
+        return []
+    rows = con.execute("""
+        SELECT date_trunc('day', peak_day) AS d,
+               count(*)                    AS campaign_count,
+               sum(ip_count)               AS total_ips,
+               sum(peak_count)             AS total_peak_day_ips,
+               list(l7_proto)              AS l7s,
+               list(ip_count ORDER BY ip_count DESC)[:5] AS top_ip_counts,
+               list(sample_ips)            AS all_samples
+        FROM waves
+        WHERE is_campaign = TRUE
+          AND peak_day IS NOT NULL
+        GROUP BY d
+        HAVING count(*) >= 5
+        ORDER BY campaign_count DESC, total_ips DESC
+        LIMIT 10
+    """).fetchall()
+    if not rows:
+        return []
+    out: list[dict] = []
+    for d, n_camps, total_ips, peak_ips, l7s, top_counts, all_samples in rows:
+        ips: list[str] = []
+        for s in (all_samples or []):
+            if s:
+                ips.extend(p.strip() for p in s.split(",") if p.strip())
+        seen: set[str] = set()
+        uniq_ips = [ip for ip in ips if not (ip in seen or seen.add(ip))]
+        l7_counter: dict[str, int] = {}
+        for p in (l7s or []):
+            if p:
+                l7_counter[p] = l7_counter.get(p, 0) + 1
+        out.append(_finding(
+            pattern_id="synchronized_campaign_burst",
+            pattern_title=(
+                f"Synchronized push: {int(n_camps)} distinct payloads "
+                f"peaked together on {d.date().isoformat() if hasattr(d,'date') else str(d)[:10]}"
+            ),
+            severity="critical",
+            category="coordinated-push",
+            src_ips=uniq_ips[:25],
+            key_metrics={
+                "peak_day":                str(d)[:10],
+                "distinct_campaigns":      int(n_camps),
+                "total_ips_across_camps":  int(total_ips),
+                "total_peak_day_ips":      int(peak_ips),
+                "top_campaign_ip_counts":  [int(x) for x in (top_counts or [])],
+                "l7_breakdown":            l7_counter,
+            },
+            evidence_refs=[
+                {"section": "6", "label": "Top 50 campaigns table - rows sharing this peak_day"},
+                {"section": "6", "label": "Top 20 campaign Gantt"},
+            ],
+            report_anchor="#6-coordinated-activity---campaign-onsets--arrival-bursts",
+            first_seen=str(d)[:10],
+            last_seen=str(d)[:10],
+        ))
+    return out
+
+
+def pat_recent_tight_campaign(con) -> list[dict]:
+    """Campaigns launched recently with tight burst windows + large operator counts."""
+    if not _have(con, "waves"):
+        return []
+    corpus_max = con.execute(
+        "SELECT max(last_seen) FROM waves WHERE is_campaign = TRUE"
+    ).fetchone()[0]
+    if corpus_max is None:
+        return []
+    rows = con.execute(f"""
+        SELECT payload_sha256, l7_proto, ip_count, peak_count,
+               launch_ts, peak_day, decay_ts,
+               burst_window_days, density_score, sample_ips
+        FROM waves
+        WHERE is_campaign = TRUE
+          AND launch_ts >= TIMESTAMP '{corpus_max}' - INTERVAL '60 days'
+          AND burst_window_days < 7
+          AND ip_count >= 500
+        ORDER BY density_score DESC
+        LIMIT 25
+    """).fetchall()
+    if not rows:
+        return []
+    sample_ips: list[str] = []
+    for r in rows:
+        s = r[9]
+        if s:
+            for ip in s.split(","):
+                ip = ip.strip()
+                if ip and ip not in sample_ips:
+                    sample_ips.append(ip)
+                    if len(sample_ips) >= 25:
+                        break
+        if len(sample_ips) >= 25:
+            break
+    return [_finding(
+        pattern_id="recent_tight_campaign",
+        pattern_title=(
+            f"{len(rows)} fresh tight campaigns launched in the last 60 days "
+            "(burst < 7d, >=500 IPs each)"
+        ),
+        severity="high",
+        category="campaign-onset",
+        src_ips=sample_ips,
+        key_metrics={
+            "campaign_count":  len(rows),
+            "window":          f"{corpus_max} minus 60d -> {corpus_max}",
+            "top": [
+                {
+                    "l7":         r[1] or "unknown",
+                    "ip_count":   int(r[2]),
+                    "peak_count": int(r[3] or 0),
+                    "launch_ts":  str(r[4])[:19],
+                    "peak_day":   str(r[5])[:10],
+                    "decay_ts":   str(r[6])[:19],
+                    "burst_days": round(float(r[7]), 2),
+                    "density":    round(float(r[8]), 0),
+                }
+                for r in rows[:10]
+            ],
+        },
+        evidence_refs=[
+            {"section": "6", "label": "Top 50 campaigns table (sorted by density_score)"},
+            {"section": "6", "label": "Campaign launches per month"},
+        ],
+        report_anchor="#6-coordinated-activity---campaign-onsets--arrival-bursts",
+    )]
+
+
 def pat_critical_persistent_botnet(con) -> list[dict]:
     """Critical-tier IPs with botnet rationale AND long persistence."""
     risk_path = _newest_risk_path()
@@ -814,6 +945,8 @@ PATTERNS: list[Callable] = [
     pat_covert_tunnel_setup,
     pat_multi_transport_bulletproof,
     pat_botnet_in_coordination_wave,
+    pat_synchronized_campaign_burst,
+    pat_recent_tight_campaign,
     pat_bulletproof_high_density,
     pat_rdp_credential_spray,
     pat_low_slow_subnet_coordinated,

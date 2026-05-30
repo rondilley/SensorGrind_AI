@@ -44,7 +44,7 @@ from report.render import (
     MMDC, PUPPETEER_CONFIG,
     mermaid_pie, mermaid_xychart_bar, mermaid_xychart_line,
     mermaid_sequence, mermaid_flowchart, mermaid_sankey, mermaid_gantt,
-    svg_bar_chart, svg_line_chart, smart_bar, smart_line,
+    svg_bar_chart, svg_line_chart, svg_gantt_chart, smart_bar, smart_line,
     mermaid_histogram, percentile_table, svg_heatmap,
     render_mermaid_to_svg, md_to_html_body, write_html,
     prerender_mermaid_for_pdf, write_pdf,
@@ -1141,9 +1141,12 @@ def run(args: argparse.Namespace) -> int:
               "moments when many fresh operators / fresh exploits "
               "started hitting the sensor; gaps mark quiet periods._")
             P("")
-            P(smart_bar("Campaign launches",
-                        [(ym, n) for ym, n in campaign_launches_by_month],
-                        "month", "new campaigns"))
+            P(smart_bar(
+                "Campaign launches",
+                [ym for ym, _ in campaign_launches_by_month],
+                [float(n) for _, n in campaign_launches_by_month],
+                "month", "new campaigns",
+            ))
 
         # ---- gantt of top 20 campaign lifespans ----
         gantt_items = []
@@ -1166,9 +1169,15 @@ def run(args: argparse.Namespace) -> int:
               "first-arrivals to the p95 (decay).  Short bars = "
               "tightly clustered campaigns; longer bars = slow-rolling "
               "campaigns that nevertheless concentrated within their "
-              "burst window, not the whole corpus._")
+              "burst window, not the whole corpus.  X-axis is dd/mm/yyyy, "
+              "monthly gridlines._")
             P("")
-            P(mermaid_gantt("Top 20 campaign lifespans", gantt_items))
+            VISUALS_DIR.mkdir(parents=True, exist_ok=True)
+            P(svg_gantt_chart(
+                "Top 20 campaign lifespans",
+                gantt_items,
+                VISUALS_DIR / "top20_campaign_lifespans.svg",
+            ))
 
         # ---- top 50 table ----
         H(3, f"Top 50 campaigns by density_score ({len(campaign_rows)} shown)")
