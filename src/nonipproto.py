@@ -82,6 +82,21 @@ RESULT_SCHEMA = pa.schema([
     ("sample_printable", pa.string()),
 ])
 
+# Per-(src_ip, proto_num) detail.  The non-TCP/UDP/ICMP corpus is tiny
+# (a few thousand lines across the full log), so we persist every src
+# that touched a given protocol instead of capping at SRC_CAP.  The
+# correlator joins this on src_ip against portscans/scannerintel to find
+# IPs that did, say, TCP telco-port scans AND sent SCTP packets.
+PER_IP_SCHEMA = pa.schema([
+    ("src_ip",     pa.string()),
+    ("proto_num",  pa.uint8()),
+    ("proto_name", pa.string()),
+    ("packets",    pa.uint32()),
+    ("total_bytes", pa.uint64()),
+    ("first_seen", pa.string()),
+    ("last_seen",  pa.string()),
+])
+
 PROTO_RE = re.compile(rb" UNKNOWN-IPv4-Protocol:(\d+) (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) -> ")
 LEN_RE   = re.compile(rb" Len:(\d+) ")
 TTL_RE   = re.compile(rb" TTL:(\d+) ")
@@ -109,6 +124,11 @@ def run(args: argparse.Namespace) -> int:
     sample_src: dict[int, bytes] = {}
     sample_pkt: dict[int, bytes] = {}
     ttl_counts: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    # per-(src_ip,proto) aggregates - unbounded; the corpus is small
+    per_ip_pkts:  dict[tuple[bytes, int], int] = defaultdict(int)
+    per_ip_bytes: dict[tuple[bytes, int], int] = defaultdict(int)
+    per_ip_first: dict[tuple[bytes, int], bytes] = {}
+    per_ip_last:  dict[tuple[bytes, int], bytes] = {}
 
     n_lines = 0
     n_match = 0
@@ -140,9 +160,13 @@ def run(args: argparse.Namespace) -> int:
                 srcs[num].add(src_ip)
                 if num not in sample_src:
                     sample_src[num] = src_ip
+            key = (src_ip, num)
+            per_ip_pkts[key] += 1
             ml = LEN_RE.search(raw)
             if ml:
-                bytes_seen[num] += int(ml.group(1))
+                ln = int(ml.group(1))
+                bytes_seen[num] += ln
+                per_ip_bytes[key] += ln
             mt = TIME_RE.search(raw)
             if mt:
                 d = mt.group(1)
@@ -150,6 +174,10 @@ def run(args: argparse.Namespace) -> int:
                     first[num] = d
                 if num not in last or d > last[num]:
                     last[num] = d
+                if key not in per_ip_first or d < per_ip_first[key]:
+                    per_ip_first[key] = d
+                if key not in per_ip_last or d > per_ip_last[key]:
+                    per_ip_last[key] = d
             mttl = TTL_RE.search(raw)
             if mttl:
                 ttl_counts[num][int(mttl.group(1))] += 1
@@ -210,6 +238,24 @@ def run(args: argparse.Namespace) -> int:
     pq.write_table(pa.Table.from_pylist(rows, schema=RESULT_SCHEMA),
                    OUT_DIR / "nonipproto.parquet",
                    compression="zstd", compression_level=3)
+
+    # Per-IP detail table - one row per (src_ip, proto_num).
+    per_ip_rows = []
+    for (sip, num), pkts in sorted(per_ip_pkts.items(), key=lambda x: -x[1]):
+        name, _ = PROTO_NUM.get(num, (f"proto-{num}", ""))
+        per_ip_rows.append({
+            "src_ip":      sip.decode("ascii", errors="replace"),
+            "proto_num":   num,
+            "proto_name":  name,
+            "packets":     pkts,
+            "total_bytes": per_ip_bytes.get((sip, num), 0),
+            "first_seen":  per_ip_first.get((sip, num), b"").decode("ascii", errors="replace"),
+            "last_seen":   per_ip_last.get((sip, num), b"").decode("ascii", errors="replace"),
+        })
+    pq.write_table(pa.Table.from_pylist(per_ip_rows, schema=PER_IP_SCHEMA),
+                   OUT_DIR / "per_ip.parquet",
+                   compression="zstd", compression_level=3)
+    print(f"[nonip] wrote per_ip detail rows={len(per_ip_rows)}", file=sys.stderr)
 
     md = [
         "# nonipproto - non-TCP/UDP/ICMP IPv4 traffic catalog", "",

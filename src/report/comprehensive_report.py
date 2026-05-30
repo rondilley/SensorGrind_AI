@@ -181,15 +181,41 @@ def run(args: argparse.Namespace) -> int:
             ORDER BY ip_count DESC
         """).fetchall()
 
-    # ---- coordination waves ----
+    # ---- coordination waves (campaigns + always-on background) ----
     wave_path = lib.OUTPUT_DIR / "patterns" / "coordination" / "payload_waves.parquet"
-    wave_rows = []
+    # Top-N campaigns by density_score (ip_count * corpus_span / burst_window).
+    # Filtered to is_campaign=true so always-on background payloads
+    # (whose senders span the entire corpus) don't pollute the view.
+    campaign_rows: list = []
+    # Per-month new-campaign-launch counts (driven by launch_ts).
+    campaign_launches_by_month: list = []
+    # Largest wave (any payload) — used in the executive summary bullet.
+    biggest_wave: tuple | None = None
     if wave_path.exists():
-        wave_rows = con.execute(f"""
-            SELECT ip_count, first_seen, last_seen, span_minutes, median_ipd_sec, l7_proto, sample_ips
+        campaign_rows = con.execute(f"""
+            SELECT ip_count, launch_ts, peak_day, decay_ts,
+                   burst_window_days, peak_count, l7_proto, sample_ips,
+                   density_score
             FROM read_parquet('{wave_path}')
-            ORDER BY ip_count DESC LIMIT 20
+            WHERE is_campaign = TRUE
+            ORDER BY density_score DESC LIMIT 50
         """).fetchall()
+        campaign_launches_by_month = con.execute(f"""
+            SELECT strftime(launch_ts, '%Y-%m') AS ym, count(*) AS n
+            FROM read_parquet('{wave_path}')
+            WHERE is_campaign = TRUE AND launch_ts IS NOT NULL
+            GROUP BY ym ORDER BY ym
+        """).fetchall()
+        biggest_row = con.execute(f"""
+            SELECT ip_count, first_seen, last_seen, span_minutes,
+                   median_ipd_sec, l7_proto, sample_ips
+            FROM read_parquet('{wave_path}')
+            ORDER BY ip_count DESC LIMIT 1
+        """).fetchone()
+        if biggest_row is not None:
+            biggest_wave = biggest_row
+    # Keep an alias for the executive-summary bullet path below.
+    wave_rows = [biggest_wave] if biggest_wave else []
 
     burst_path = lib.OUTPUT_DIR / "patterns" / "coordination" / "arrival_bursts.parquet"
     burst_rows = []
@@ -527,6 +553,25 @@ def run(args: argparse.Namespace) -> int:
                 "threat_summary": summ, "analysis": analysis, "model": model,
             }
 
+    # ---- cross-signal conclusions ----
+    # Produced by conclusions/correlate + conclusions/synthesize.  Each
+    # row is one rule-matched pattern + the LLM-written narrative.
+    conclusions_rows: list[dict] = []
+    concl_path = lib.OUTPUT_DIR / "conclusions" / "conclusions.parquet"
+    if concl_path.exists():
+        try:
+            cols = con.execute(
+                f"DESCRIBE SELECT * FROM read_parquet('{concl_path}')"
+            ).fetchall()
+            col_names = [c[0] for c in cols]
+            for r in con.execute(
+                f"SELECT * FROM read_parquet('{concl_path}')"
+            ).fetchall():
+                conclusions_rows.append(dict(zip(col_names, r)))
+        except Exception as e:
+            print(f"[report] could not read conclusions.parquet: {e}",
+                  file=sys.stderr)
+
     con.close()
 
     # ------------------------------------------------------------------
@@ -573,6 +618,15 @@ def run(args: argparse.Namespace) -> int:
     if auto_rules:
         P(f"- **{len(auto_rules):,} new behavioral rules** auto-promoted "
           f"this run — review and deploy. See Section 13.")
+    if conclusions_rows:
+        sev_count = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for r in conclusions_rows:
+            sev_count[r["severity"]] = sev_count.get(r["severity"], 0) + 1
+        sev_summary = ", ".join(
+            f"**{n} {s}**" for s, n in sev_count.items() if n
+        )
+        P(f"- **{len(conclusions_rows)} cross-signal findings** "
+          f"({sev_summary}) flagged by the correlator — see Section 0.5.")
     P("")
     if risk_top:
         P("### Top 5 threat IPs (by composite risk score)\n")
@@ -637,6 +691,118 @@ def run(args: argparse.Namespace) -> int:
         P(f"- {s}")
     P("")
     P("---")
+
+    # ---------- 0.5 Cross-Signal Findings & Conclusions ----------
+    # Each entry is a pattern the correlator matched across two or more
+    # analyzers, plus the AI-written conclusion (what / why-noteworthy /
+    # threat-model / risk / recommended-action).  The point of this
+    # section is to STOP the report from saying "this is noteworthy"
+    # without explaining why.  When the synthesize stage has no AI
+    # provider, the AI fields are blank and only the rule-detected
+    # metadata is rendered.
+    if conclusions_rows:
+        H(2, "0.5 Cross-Signal Findings & Conclusions")
+        P("**What this section shows:** patterns that only become visible "
+          "when two or more analyzers' outputs are looked at *together*.  "
+          "Each card explains what the combination of signals is, why it's "
+          "anomalous in the context of an unsolicited-inbound honeypot, "
+          "the closest real-world threat model, and what a defender "
+          "should do about it this week.  Findings come from "
+          "`output/conclusions/findings.parquet` (rule-based correlator) "
+          "with narratives written by `conclusions/synthesize.py`.")
+        P("")
+        sev_emoji = {"critical": "[CRIT]", "high": "[HIGH]",
+                     "medium": "[MED]",  "low":  "[LOW]"}
+        sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        sorted_concl = sorted(conclusions_rows,
+                              key=lambda r: sev_order.get(r["severity"], 9))
+        P("### Index of findings\n")
+        P("| sev | title | sources | category | jump |")
+        P("| --- | --- | --- | --- | --- |")
+        for r in sorted_concl:
+            title0 = r["ai_title"] or r["pattern_title"]
+            anchor = f"#05-{r['pattern_id'].replace('_', '-')}"
+            P(f"| {sev_emoji.get(r['severity'], r['severity'])} | "
+              f"{title0} | {r['src_ip_count']} | {r['category']} | "
+              f"[jump]({anchor}) |")
+        P("")
+        for r in sorted_concl:
+            title1 = r["ai_title"] or r["pattern_title"]
+            sev_tag = sev_emoji.get(r["severity"], r["severity"].upper())
+            slug = r["pattern_id"].replace("_", "-")
+            # Use an HTML anchor so the link target survives markdown
+            # heading-slug normalization across renderers.
+            md.append(f'\n<a id="05-{slug}"></a>')
+            H(3, f"{sev_tag} {title1}")
+            meta_bits = [
+                f"pattern: `{r['pattern_id']}`",
+                f"category: {r['category']}",
+                f"sources: {r['src_ip_count']}",
+            ]
+            if r.get("ai_confidence"):
+                meta_bits.append(f"confidence: {r['ai_confidence']}")
+            if r.get("first_seen") or r.get("last_seen"):
+                meta_bits.append(
+                    f"seen: {r['first_seen'] or '?'} -> "
+                    f"{r['last_seen'] or '?'}"
+                )
+            P(f"_{' | '.join(meta_bits)}_")
+            P("")
+            if r["ai_what"]:
+                P(f"**What:** {r['ai_what']}")
+                P("")
+            if r["ai_why_noteworthy"]:
+                P(f"**Why it's noteworthy:** {r['ai_why_noteworthy']}")
+                P("")
+            if r["ai_threat_model"]:
+                P(f"**Threat model:** {r['ai_threat_model']}")
+                P("")
+            if r["ai_risk_if_realized"]:
+                P(f"**Risk if realized:** {r['ai_risk_if_realized']}")
+                P("")
+            if r["ai_recommended_action"]:
+                P("**Recommended action:**\n")
+                for line in r["ai_recommended_action"].split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("-"):
+                        P(line)
+                    else:
+                        P(f"- {line}")
+                P("")
+            # Evidence + IPs + ASNs
+            try:
+                ev_refs = json.loads(r["evidence_refs"])
+            except Exception:
+                ev_refs = []
+            if ev_refs:
+                P("**Evidence:**\n")
+                for ev in ev_refs:
+                    P(f"- Section {ev.get('section','?')}: "
+                      f"{ev.get('label','')}")
+                P("")
+            if r["src_ips_sample"]:
+                ips_l = [s for s in r["src_ips_sample"].split(",") if s]
+                shown = ", ".join(f"`{ip}`" for ip in ips_l[:10])
+                more = (f" (+{len(ips_l) - 10} more)"
+                        if len(ips_l) > 10 else "")
+                P(f"**Representative source IPs:** {shown}{more}\n")
+            if r["asns_sample"]:
+                P(f"**ASNs:** {r['asns_sample']}\n")
+            if r["countries_sample"]:
+                P(f"**Countries:** {r['countries_sample']}\n")
+            P("")
+        P("---")
+    else:
+        # When no findings or no conclusions file yet, point operators
+        # at the stage rather than going silent.
+        H(2, "0.5 Cross-Signal Findings & Conclusions")
+        P("_No cross-signal findings produced this run.  Run "
+          "`src/conclusions/correlate.py` then "
+          "`src/conclusions/synthesize.py` to populate this section._")
+        P("")
+        P("---")
 
     # ---------- 1. Executive Summary ----------
     H(2, "1. Executive Summary")
@@ -951,50 +1117,83 @@ def run(args: argparse.Namespace) -> int:
         for r in seq_rows:
             P(f"| {r[0]} | {r[1]} | {r[2]:,} | {r[3]:.1%} |")
 
-    # ---------- 6. Coordinated Activity ----------
-    H(2, "6. Coordinated Activity")
-    P("**What this shows:** moments when many distinct source IPs sent "
-      "the same payload SHA-256 within a short window (synchronized "
-      "wave), and minute-buckets where the rate of new-to-this-sensor "
-      "IPs spiked far above baseline (arrival burst).  Waves indicate a "
-      "botnet C2 'kick' or a centrally-orchestrated scanning campaign; "
-      "arrival bursts capture fresh worm propagation or coordinated "
-      "scan launches.  Tightness = IPs per minute of first-arrival "
-      "spread; higher = more synchronized.")
-    if wave_rows:
-        H(3, "Top 20 payload-synchronized waves")
-        P("_Each row is a distinct payload SHA-256 sent by 10+ source "
-          "IPs.  `span_min` = total minutes between earliest and latest "
-          "first-arrival across the senders; `median_ipd_s` = median "
-          "seconds between consecutive sender first-arrivals.  Small "
-          "span_min with thousands of IPs means an extremely tight "
-          "synchronized wave (centralized C2 push); large span_min "
-          "means the same payload was reused across years (long-tail "
-          "botnet membership)._")
-        P("")
-        P("| ips | first_seen | span_min | median_ipd_s | l7 |")
-        P("| --- | --- | --- | --- | --- |")
-        for r in wave_rows:
-            P(f"| {r[0]:,} | {r[1]} | {r[3]:.1f} | {r[4]:.1f} | {r[5]} |")
-
-        # Gantt of the top 5 waves
-        gantt_items = []
-        for i, r in enumerate(wave_rows[:5]):
-            n, first, last, *_ = r
-            section = "Top payload waves"
-            task = f"wave-{i+1}-{n}ips"
-            gantt_items.append((section, task,
-                                first.date().isoformat() if hasattr(first, 'date') else str(first)[:10],
-                                last.date().isoformat() if hasattr(last, 'date') else str(last)[:10]))
-        if gantt_items:
-            H(3, "Top 5 wave timelines")
-            P("_Gantt of the five biggest waves' lifespans (first-arrival "
-              "of the earliest sender to first-arrival of the latest).  "
-              "A bar that spans years means the same payload kept hitting "
-              "the sensor across the entire corpus - the classic Mozi "
-              "sinkhole tail._")
+    # ---------- 6. Coordinated Activity / Campaigns ----------
+    H(2, "6. Coordinated Activity - Campaign Onsets & Arrival Bursts")
+    P("**What this shows:** the *leading edge* of attack and scan "
+      "campaigns visible at the sensor.  A campaign here is a single "
+      "payload SHA-256 sent by many distinct IPs where the bulk of "
+      "those senders first-touched the sensor in a focused slice of "
+      "time, rather than spread evenly across the multi-year corpus.  "
+      "We compute the per-IP first-arrival distribution per payload, "
+      "extract the p5 (launch), p25, p50, p75, p95 (decay), and the "
+      "single busiest day (peak), then rank by density_score = "
+      "ip_count * (corpus_span_days / burst_window_days).  Always-on "
+      "background payloads (whose senders span the whole corpus) are "
+      "filtered out.  Arrival bursts capture the complementary view: "
+      "minute-buckets where the rate of new-to-this-sensor IPs spiked "
+      "far above baseline.")
+    if campaign_rows:
+        # ---- per-month launch histogram ----
+        if campaign_launches_by_month:
+            H(3, "New campaign launches per month (campaign p5 \"launch_ts\")")
+            P("_Counts the number of distinct campaign payloads whose "
+              "p5 first-arrival lands in each month.  Spikes mark "
+              "moments when many fresh operators / fresh exploits "
+              "started hitting the sensor; gaps mark quiet periods._")
             P("")
-            P(mermaid_gantt("Coordinated wave timelines", gantt_items))
+            P(smart_bar("Campaign launches",
+                        [(ym, n) for ym, n in campaign_launches_by_month],
+                        "month", "new campaigns"))
+
+        # ---- gantt of top 20 campaign lifespans ----
+        gantt_items = []
+        for i, r in enumerate(campaign_rows[:20]):
+            (n, launch_ts, peak_day, decay_ts, burst_d,
+             peak_n, l7p, _samples, _density) = r
+            if launch_ts is None or decay_ts is None:
+                continue
+            section = f"Top 20 campaigns"
+            task = (f"#{i+1} {n}ips/{burst_d:.0f}d "
+                    f"{l7p or 'unknown'}")
+            gantt_items.append((
+                section, task,
+                launch_ts.date().isoformat() if hasattr(launch_ts, "date") else str(launch_ts)[:10],
+                decay_ts.date().isoformat()  if hasattr(decay_ts, "date")  else str(decay_ts)[:10],
+            ))
+        if gantt_items:
+            H(3, "Top 20 campaign lifespans (Gantt: launch_ts -> decay_ts)")
+            P("_Each bar runs from the p5 (launch) of per-IP "
+              "first-arrivals to the p95 (decay).  Short bars = "
+              "tightly clustered campaigns; longer bars = slow-rolling "
+              "campaigns that nevertheless concentrated within their "
+              "burst window, not the whole corpus._")
+            P("")
+            P(mermaid_gantt("Top 20 campaign lifespans", gantt_items))
+
+        # ---- top 50 table ----
+        H(3, f"Top 50 campaigns by density_score ({len(campaign_rows)} shown)")
+        P("_`burst_d` = days between p5 (launch) and p95 (decay) of per-IP "
+          "first-arrivals.  `peak_d_ips` = number of new senders that "
+          "first-touched the sensor on the campaign's busiest day.  "
+          "`density_score` rewards both large operator counts and tight "
+          "burst windows._")
+        P("")
+        P("| # | launch_ts | peak_day | decay_ts | burst_d | ip_count | "
+          "peak_d_ips | l7 | density | sample_ips |")
+        P("| ---: | --- | --- | --- | ---: | ---: | ---: | --- | ---: | --- |")
+        for i, r in enumerate(campaign_rows, 1):
+            (n, launch_ts, peak_day, decay_ts, burst_d, peak_n, l7p,
+             samples, density) = r
+            samples_short = (samples or "")[:80].replace("|", "\\|")
+            launch_s = (launch_ts.strftime("%Y-%m-%d %H:%M")
+                        if hasattr(launch_ts, "strftime") else str(launch_ts)[:16])
+            peak_s = (peak_day.strftime("%Y-%m-%d")
+                      if hasattr(peak_day, "strftime") else str(peak_day)[:10])
+            decay_s = (decay_ts.strftime("%Y-%m-%d %H:%M")
+                       if hasattr(decay_ts, "strftime") else str(decay_ts)[:16])
+            P(f"| {i} | {launch_s} | {peak_s} | {decay_s} | "
+              f"{burst_d:.1f} | {n:,} | {peak_n:,} | "
+              f"{l7p or 'unknown'} | {density:,.0f} | {samples_short} |")
 
     if burst_rows:
         H(3, "Top 15 arrival bursts (sudden floods of new IPs)")

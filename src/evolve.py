@@ -79,6 +79,9 @@ STAGES: dict[str, list[str]] = {
     "dnstlsintel":   [str(SRC / "dnstlsintel.py")],
     "selfmimic":     [str(SRC / "selfmimic.py")],
     "adversarysim":  [str(SRC / "adversarysim.py")],
+    # --- v2.6 cross-analyzer correlator + AI-written conclusions ---
+    "correlate":    [str(SRC / "conclusions" / "correlate.py")],
+    "conclude":     [str(SRC / "conclusions" / "synthesize.py")],
     "report":       [str(SRC / "report" / "comprehensive_report.py")],
     # --- v2.4 cross-AI review of the tool itself ---
     "aireview":     [str(SRC / "aireview.py")],
@@ -148,10 +151,12 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
     "risk":         ["score"],
     "dossiers":     ["risk"],
     "mining":       ["features"],
-    "promote":      ["mining"],
+    "promote":      ["mining", "risk"],
     "longitudinal": ["analyzers"],
-    "chains":       ["analyzers"],
-    "sequences":    ["analyzers"],
+    # chains/sequences read ip features + risk; without them they exit early
+    # or fall back to no-tier filtering.
+    "chains":       ["analyzers", "features", "risk"],
+    "sequences":    ["analyzers", "features"],
     "coordination": ["analyzers"],
     "actors":       ["features"],
     "drift":        ["features"],
@@ -166,14 +171,25 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
     "isc_compare":     ["analyzers"],
     "nonipproto":      ["analyzers"],
     "aipayloaddecode": ["nonipproto"],
-    "asnintel":        ["analyzers"],
-    "cidrintel":       ["analyzers"],
+    # asnintel and cidrintel join packets against per-IP features AND
+    # the risk-scored IP set (risk tier, threat density, ASN/CIDR rollups).
+    "asnintel":        ["analyzers", "features", "risk"],
+    "cidrintel":       ["analyzers", "features", "risk"],
     "tooling":         ["analyzers"],
-    "actorlink":       ["analyzers", "tooling"],
+    # actorlink walks the medium+ risk-tier IPs through tooling fingerprints;
+    # exits if risk is missing.
+    "actorlink":       ["analyzers", "tooling", "risk"],
     "originintel":     ["actorlink"],
     "slowlow":         ["analyzers"],
     "dnstlsintel":     ["analyzers"],
     "selfmimic":       ["analyzers"],
+    # correlate reads every per-analyzer parquet + the risk snapshot;
+    # depend broadly so it runs after everything it might join against.
+    "correlate":       ["risk", "nonipproto", "protocolanomaly",
+                        "asnintel", "cidrintel", "tooling", "slowlow",
+                        "selfmimic", "isc_compare", "coordination",
+                        "chains"],
+    "conclude":        ["correlate"],
     # adversarysim consults other analyzers' outputs for coverage scoring;
     # depending on a broad set of stages keeps it last among siblings.
     "adversarysim":    ["slowlow", "dnstlsintel", "selfmimic",
@@ -188,7 +204,8 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
                      "protocolanomaly", "isc_compare", "nonipproto",
                      "aipayloaddecode", "asnintel", "cidrintel", "tooling",
                      "actorlink", "originintel",
-                     "slowlow", "dnstlsintel", "selfmimic"],
+                     "slowlow", "dnstlsintel", "selfmimic",
+                     "correlate", "conclude"],
     "aireview":     ["report"],
 }
 
