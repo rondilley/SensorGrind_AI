@@ -57,16 +57,6 @@ FINDING_SCHEMA = pa.schema([
 ])
 
 
-def _table(con, path: Path, view_name: str) -> bool:
-    if not path.exists():
-        return False
-    con.execute(
-        f"CREATE OR REPLACE VIEW {view_name} AS "
-        f"SELECT * FROM read_parquet('{path.as_posix()}')"
-    )
-    return True
-
-
 def _newest_risk_path() -> Path | None:
     base = lib.OUTPUT_DIR / "risk" / "ip_risk"
     if not base.exists():
@@ -124,21 +114,34 @@ def _finding(
 # Telco-relevant TCP ports.  TCP-side reconnaissance of any of these
 # coincident with a real SCTP packet from the same source is the
 # canonical SS7 / Diameter / SIGTRAN reconnaissance footprint.
-TELCO_TCP_PORTS = {
-    2123:  "GTP-C (GPRS Tunneling Protocol control)",
-    2152:  "GTP-U (GPRS Tunneling Protocol user)",
-    2905:  "M3UA (SS7 MTP3 User Adaptation)",
-    2944:  "MEGACO/H.248 text",
-    2945:  "MEGACO/H.248 binary",
-    3868:  "Diameter",
-    5060:  "SIP",
-    5061:  "SIPS",
-    5868:  "Diameter-DTLS",
-    36412: "S1AP (LTE eNodeB-MME)",
-    36422: "X2AP (LTE inter-eNodeB)",
-    36443: "M2AP",
-    36444: "M3AP",
-}
+#   2123/2152 = GTP-C/-U (GPRS), 2905 = M3UA (SS7),
+#   2944/2945 = MEGACO/H.248, 3868 = Diameter, 5060/5061 = SIP/SIPS,
+#   5868 = Diameter-DTLS, 36412 = S1AP (LTE eNodeB-MME),
+#   36422 = X2AP (inter-eNodeB), 36443/36444 = M2AP/M3AP.
+TELCO_TCP_PORTS: frozenset[int] = frozenset({
+    2123, 2152, 2905, 2944, 2945, 3868, 5060, 5061, 5868,
+    36412, 36422, 36443, 36444,
+})
+
+
+# ----------------------------------------------------------------------
+# Pattern thresholds (centralized so they can be tuned in one place
+# rather than buried as inline magic numbers across 18 rule functions).
+# ----------------------------------------------------------------------
+MIN_BULLETPROOF_DENSITY     = 0.50   # asnintel threat_density cutoff
+MIN_BULLETPROOF_IP_COUNT    = 50
+MIN_RDP_SPRAY_IPS           = 25
+MIN_SELFMIMIC_SCORE         = 0.50
+MIN_RECENT_CAMPAIGN_IPS     = 500
+MAX_RECENT_CAMPAIGN_BURST_D = 7
+RECENT_CAMPAIGN_WINDOW_D    = 60
+MIN_SYNC_BURST_CAMPAIGNS    = 5
+MIN_LOWSLOW_SPAN_DAYS       = 90
+MAX_LOWSLOW_DENSITY         = 0.10
+MIN_LOWSLOW_SUBNET_MEMBERS  = 3
+MIN_ARRIVAL_BURST_RATIO     = 5.0
+MIN_BOTNET_SIGNAL           = 0.5
+MIN_BOTNET_PERSISTENCE      = 0.6
 
 
 # ----------------------------------------------------------------------
@@ -159,7 +162,7 @@ def pat_telco_ss7_recon(con) -> list[dict]:
         return out
     sctp_ips = [r[0] for r in sctp]
 
-    telco_ports_list = sorted(TELCO_TCP_PORTS.keys())
+    telco_ports_list = sorted(TELCO_TCP_PORTS)
     port_in = ",".join(str(p) for p in telco_ports_list)
     hits_by_ip: dict[str, dict] = {}
 
@@ -509,14 +512,14 @@ def pat_botnet_in_coordination_wave(con) -> list[dict]:
 def pat_bulletproof_high_density(con) -> list[dict]:
     if not _have(con, "asnintel"):
         return []
-    rows = con.execute("""
+    rows = con.execute(f"""
         SELECT asn, asn_org, country_iso, ip_count, threat_ip_count,
                threat_density, pkt_total, top_ports, top_botnet_fams,
                cooperation_score, risk_grade, block_recommend
         FROM asnintel
         WHERE bulletproof_flag = TRUE
-          AND threat_density > 0.5
-          AND ip_count >= 50
+          AND threat_density > {MIN_BULLETPROOF_DENSITY}
+          AND ip_count >= {MIN_BULLETPROOF_IP_COUNT}
         ORDER BY threat_density DESC, ip_count DESC LIMIT 20
     """).fetchall()
     if not rows:
@@ -546,11 +549,11 @@ def pat_rdp_credential_spray(con) -> list[dict]:
     """One mstshash cookie reused across many source IPs."""
     if not _have(con, "rdpbrute"):
         return []
-    rows = con.execute("""
+    rows = con.execute(f"""
         SELECT mstshash, src_ip_count, hit_count,
                first_seen, last_seen, day_count, sample_srcs
         FROM rdpbrute
-        WHERE src_ip_count >= 25
+        WHERE src_ip_count >= {MIN_RDP_SPRAY_IPS}
         ORDER BY src_ip_count DESC LIMIT 25
     """).fetchall()
     if not rows:
@@ -580,11 +583,13 @@ def pat_low_slow_subnet_coordinated(con) -> list[dict]:
     """Long-span low-density scanners with multiple subnet members."""
     if not _have(con, "slowlow"):
         return []
-    rows = con.execute("""
+    rows = con.execute(f"""
         SELECT src_ip, span_days, active_days, density, subnet24,
                subnet_members, asn_org, country_iso
         FROM slowlow
-        WHERE span_days >= 90 AND density < 0.1 AND subnet_members >= 3
+        WHERE span_days >= {MIN_LOWSLOW_SPAN_DAYS}
+          AND density < {MAX_LOWSLOW_DENSITY}
+          AND subnet_members >= {MIN_LOWSLOW_SUBNET_MEMBERS}
         ORDER BY subnet_members DESC, span_days DESC LIMIT 40
     """).fetchall()
     if not rows:
@@ -693,10 +698,10 @@ def pat_tcp_midstream_spoof(con) -> list[dict]:
 def pat_global_arrival_burst(con) -> list[dict]:
     if not _have(con, "bursts"):
         return []
-    rows = con.execute("""
+    rows = con.execute(f"""
         SELECT bucket_start, new_ip_count, baseline, ratio
         FROM bursts
-        WHERE ratio >= 5.0
+        WHERE ratio >= {MIN_ARRIVAL_BURST_RATIO}
         ORDER BY ratio DESC LIMIT 15
     """).fetchall()
     if not rows:
@@ -749,11 +754,11 @@ def pat_local_only_vnc_targeting(con) -> list[dict]:
 def pat_self_mimic_honeypot_aware(con) -> list[dict]:
     if not _have(con, "selfmimic"):
         return []
-    rows = con.execute("""
+    rows = con.execute(f"""
         SELECT src_ip, echo_count, banner_hits, mimic_score,
                first_seen, last_seen, country_iso, asn_org
         FROM selfmimic
-        WHERE mimic_score >= 0.5
+        WHERE mimic_score >= {MIN_SELFMIMIC_SCORE}
         ORDER BY mimic_score DESC, echo_count DESC LIMIT 25
     """).fetchall()
     if not rows:
@@ -780,7 +785,7 @@ def pat_synchronized_campaign_burst(con) -> list[dict]:
     """N+ distinct payloads sharing the same peak day - coordinated push."""
     if not _have(con, "waves"):
         return []
-    rows = con.execute("""
+    rows = con.execute(f"""
         SELECT date_trunc('day', peak_day) AS d,
                count(*)                    AS campaign_count,
                sum(ip_count)               AS total_ips,
@@ -792,7 +797,7 @@ def pat_synchronized_campaign_burst(con) -> list[dict]:
         WHERE is_campaign = TRUE
           AND peak_day IS NOT NULL
         GROUP BY d
-        HAVING count(*) >= 5
+        HAVING count(*) >= {MIN_SYNC_BURST_CAMPAIGNS}
         ORDER BY campaign_count DESC, total_ips DESC
         LIMIT 10
     """).fetchall()
@@ -853,9 +858,10 @@ def pat_recent_tight_campaign(con) -> list[dict]:
                burst_window_days, density_score, sample_ips
         FROM waves
         WHERE is_campaign = TRUE
-          AND launch_ts >= TIMESTAMP '{corpus_max}' - INTERVAL '60 days'
-          AND burst_window_days < 7
-          AND ip_count >= 500
+          AND launch_ts >= TIMESTAMP '{corpus_max}'
+                          - INTERVAL '{RECENT_CAMPAIGN_WINDOW_D} days'
+          AND burst_window_days < {MAX_RECENT_CAMPAIGN_BURST_D}
+          AND ip_count >= {MIN_RECENT_CAMPAIGN_IPS}
         ORDER BY density_score DESC
         LIMIT 25
     """).fetchall()
@@ -916,8 +922,8 @@ def pat_critical_persistent_botnet(con) -> list[dict]:
         SELECT src_ip, risk_score, persistence, botnet_signal, rationale
         FROM read_parquet('{risk_path.as_posix()}')
         WHERE risk_tier = 'critical'
-          AND botnet_signal > 0.5
-          AND persistence > 0.6
+          AND botnet_signal > {MIN_BOTNET_SIGNAL}
+          AND persistence > {MIN_BOTNET_PERSISTENCE}
         ORDER BY risk_score DESC LIMIT 50
     """).fetchall()
     if not rows:
@@ -992,8 +998,13 @@ def _register_views(con) -> None:
         ("chains",           P / "attack_chains" / "patterns.parquet"),
     ]
     for view, path in mapping:
-        if _table(con, path, view):
-            _REGISTERED.add(view)
+        if not path.exists():
+            continue
+        con.execute(
+            f"CREATE OR REPLACE VIEW {view} AS "
+            f"SELECT * FROM read_parquet('{path.as_posix()}')"
+        )
+        _REGISTERED.add(view)
 
     try:
         lib.register_views(con)

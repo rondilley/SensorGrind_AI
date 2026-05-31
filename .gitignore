@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# LLM API keys.  Every *.key.txt at the repo root is a live credential
+# (claude, openai, xai, mistral, gemini).  Permissions are 0600 but a
+# single `git add -A` would still stage them; keep them out by pattern.
+*.key.txt
+*.key

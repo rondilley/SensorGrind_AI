@@ -105,13 +105,11 @@ def run(args: argparse.Namespace) -> int:
         ml_score_values = [r[1] for r in sample]
 
     # ---- benignfilter summary ----
-    benign_org_counts: list[tuple] = []
-    bf_path = lib.REPORTS / "benignfilter" / "benignfilter.parquet"
-    if bf_path.exists():
-        benign_org_counts = con.execute(f"""
-            SELECT org, count(*), sum(pkt_count) FROM read_parquet('{bf_path}')
-            GROUP BY org ORDER BY count(*) DESC
-        """).fetchall()
+    benign_org_counts = lib.load_report(
+        con, lib.REPORTS / "benignfilter" / "benignfilter.parquet",
+        "SELECT org, count(*), sum(pkt_count) FROM {path} "
+        "GROUP BY org ORDER BY count(*) DESC",
+    )
 
     # ---- geographic breakdown ----
     geo_rows = []
@@ -144,24 +142,19 @@ def run(args: argparse.Namespace) -> int:
     l7_mix = {lib.L7_NAME.get(p, str(p)): n for p, n in l7_rows}
 
     # ---- workhours heatmap ----
-    wh_path = lib.REPORTS / "workhours" / "workhours.parquet"
     heat_grid: dict[tuple[int, int], int] = {}
-    if wh_path.exists():
-        wh_rows = con.execute(f"""
-            SELECT dow, hour_utc, pkt_count FROM read_parquet('{wh_path}')
-        """).fetchall()
-        for d, h, c in wh_rows:
-            heat_grid[(int(d), int(h))] = int(c)
+    for d, h, c in lib.load_report(
+        con, lib.REPORTS / "workhours" / "workhours.parquet",
+        "SELECT dow, hour_utc, pkt_count FROM {path}",
+    ):
+        heat_grid[(int(d), int(h))] = int(c)
 
     # ---- attack chains ----
-    chains_path = lib.OUTPUT_DIR / "patterns" / "attack_chains" / "patterns.parquet"
-    chain_rows = []
-    if chains_path.exists():
-        chain_rows = con.execute(f"""
-            SELECT chain, ip_count, avg_span_d, avg_risk
-            FROM read_parquet('{chains_path}')
-            ORDER BY ip_count DESC LIMIT 25
-        """).fetchall()
+    chain_rows = lib.load_report(
+        con, lib.OUTPUT_DIR / "patterns" / "attack_chains" / "patterns.parquet",
+        "SELECT chain, ip_count, avg_span_d, avg_risk FROM {path} "
+        "ORDER BY ip_count DESC LIMIT 25",
+    )
 
     # ---- sequences ----
     seq_path = lib.OUTPUT_DIR / "patterns" / "sequences" / "ngrams.parquet"
@@ -217,14 +210,11 @@ def run(args: argparse.Namespace) -> int:
     # Keep an alias for the executive-summary bullet path below.
     wave_rows = [biggest_wave] if biggest_wave else []
 
-    burst_path = lib.OUTPUT_DIR / "patterns" / "coordination" / "arrival_bursts.parquet"
-    burst_rows = []
-    if burst_path.exists():
-        burst_rows = con.execute(f"""
-            SELECT bucket_start, new_ip_count, ratio
-            FROM read_parquet('{burst_path}')
-            ORDER BY ratio DESC LIMIT 15
-        """).fetchall()
+    burst_rows = lib.load_report(
+        con, lib.OUTPUT_DIR / "patterns" / "coordination" / "arrival_bursts.parquet",
+        "SELECT bucket_start, new_ip_count, ratio FROM {path} "
+        "ORDER BY ratio DESC LIMIT 15",
+    )
 
     # ---- itemsets / rules ----
     cand_path = lib.OUTPUT_DIR / "patterns" / "candidate_rules.parquet"
@@ -244,15 +234,12 @@ def run(args: argparse.Namespace) -> int:
         """).fetchall()
 
     # ---- HDBSCAN clusters ----
-    cluster_path = lib.OUTPUT_DIR / "patterns" / "actor_clusters" / "summary.parquet"
-    cluster_rows = []
-    if cluster_path.exists():
-        cluster_rows = con.execute(f"""
-            SELECT cluster_id, size, top_country, top_asn_org, avg_port_count,
-                   dominant_l7, benign_fraction, botnet_fraction, sample_ips
-            FROM read_parquet('{cluster_path}')
-            ORDER BY size DESC LIMIT 20
-        """).fetchall()
+    cluster_rows = lib.load_report(
+        con, lib.OUTPUT_DIR / "patterns" / "actor_clusters" / "summary.parquet",
+        "SELECT cluster_id, size, top_country, top_asn_org, avg_port_count, "
+        "dominant_l7, benign_fraction, botnet_fraction, sample_ips "
+        "FROM {path} ORDER BY size DESC LIMIT 20",
+    )
 
     # ---- drift ----
     drift_path = lib.OUTPUT_DIR / "patterns" / "drift" / "drift.parquet"

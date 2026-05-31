@@ -12,13 +12,14 @@ markdown / HTML / PDF.
 ## What it sees
 
 This is a working pipeline against a real corpus, not a synthetic demo. As
-of the latest run (2026-05-30 snapshot, post-clock-skew-correction):
+of the latest run (2026-05-31 snapshot, post-clock-skew-correction +
+post-tier-1-perf-pass):
 
 | metric | value |
 | --- | --- |
 | total packets (post-dedup) | 1,108,150,395 |
 | unique source IPs | 996,354 |
-| distinct payload blobs (SHA-256) | 97,000,118 |
+| distinct payload blobs (SHA-256) | 97,000,357 |
 | L7-classified events | 32,520,828 |
 | IOCs extracted | 22,687,221 |
 | active days in corpus | 662 |
@@ -27,8 +28,9 @@ of the latest run (2026-05-30 snapshot, post-clock-skew-correction):
 | high-tier threats identified | 179,989 |
 | actor communities (Leiden) | 2,153 (>= 4 members) |
 | auto-promoted behavioral rules (this run) | 20 |
-| cross-signal findings (correlator + LLM) | 20 (8 critical, 6 high, 6 medium) |
+| cross-signal findings (correlator + LLM) | 19 (7 critical, 6 high, 6 medium) |
 | campaigns identified (>=10 IPs, burst < 60% of corpus) | 1,867 |
+| end-to-end wall time (consolidator + parser + evolve) | 6h 35m |
 
 The 2019-02-14 → 2025-09-18 history seen in earlier runs was an artifact
 of honeypi00's broken hardware clock - the sensor's RTC was repeatedly
@@ -298,6 +300,52 @@ consensus. The substantive ones:
 
 See `docs/ARCHITECTURE.md` for the full data + model contracts and
 `VIBE_HISTORY.md` for how the pipeline got here.
+
+## Performance pass (2026-05-30)
+
+A read-only review (perf / security / AI-slop dimensions) yielded the
+Tier 1 fixes below.  Measured end-to-end speedup: **9h 53m -> 6h 35m**
+on the 1.1 B-event corpus (~33% saved, dominated by the consolidator
+swap).
+
+- **`*.key.txt` in `.gitignore`** -- the five LLM API key files at the
+  repo root are now ignored by pattern; `git add -A` will no longer
+  stage them.
+- **`scripts/consolidate_logs.py`: gzip -> zstd** for the per-file
+  intermediates and the GNU-sort spill compressor.  Final `merged.log.gz`
+  stays gzip for downstream compatibility.  Measured: consolidator wall
+  time dropped from 6h 16m to 2h 36m (~2.4x; the merge-spill phase
+  alone went from 5h 50m to 2h 10m).
+- **`src/parser.py`**: bounded the base64 `Packetdata:` capture to
+  `{1,131072}` chars so a giant blob can't exhaust a worker process via
+  `base64.b64decode`; lifted the `--workers` default from `min(6,
+  cpu-2)` to `max(2, cpu-2)` now that the old writer-OOM has been
+  fixed; fused the per-line `KEY:VALUE` regex storm in
+  `parse_text_fields` (11 separate `.search()` calls -> one
+  `finditer` with `lastgroup` dispatch).  Wall-clock unchanged because
+  the parser turns out to be writer-bound (pyarrow flush ~200k/s), but
+  per-worker CPU is roughly halved -- useful future-proofing if the
+  writer gets faster.
+- **`src/longitudinal/detect_coordination.py`**: replaced 3-4 full
+  scans of the 1.1B-row `packets` view with a single `CREATE TEMP TABLE
+  first_per_payload_ip` staging pass, then derives candidate shas,
+  percentiles, peak day, and ip-counts from it.  Arrival-burst pass
+  still scans `packets` separately (it needs payload-less SYN scans).
+- **`src/asnintel.py`**: materializes `(src_ip, asn)` once into
+  `CREATE TEMP TABLE asn_ip` so the four downstream queries (top
+  ports, top families, top probes, cooperation score) join against a
+  small in-memory table instead of `packets x feature-parquet` four
+  separate times.  (DuckDB's planner was already smart enough that the
+  wall-clock didn't move; kept as defense-in-depth.)
+- **`src/sg/lib.py:load_report()` helper**: collapses the
+  `path / if exists / con.execute(SELECT FROM read_parquet) / fetchall`
+  pattern repeated ~40 times in `comprehensive_report.py` into one
+  call.  A representative subset of call sites are migrated; the rest
+  can follow incrementally.
+- **`src/conclusions/correlate.py` cleanup**: inlined the single-call
+  `_table` wrapper, switched `TELCO_TCP_PORTS` from dict-with-unused-
+  descriptions to `frozenset`, and promoted 12 magic thresholds
+  (`> 0.5`, `>= 50`, `< 7 days`, ...) to named module constants.
 
 ## Reporting
 

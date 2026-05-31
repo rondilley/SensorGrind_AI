@@ -142,6 +142,26 @@ def register_views(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(f"CREATE OR REPLACE VIEW iocs          AS SELECT * FROM read_parquet('{IOCS_GLOB}',    hive_partitioning=1)")
 
 
+def load_report(con: duckdb.DuckDBPyConnection, path: Path, sql: str) -> list:
+    """Run ``sql`` against a parquet at ``path`` and return the rows.
+
+    Returns ``[]`` if ``path`` doesn't exist - no analyzer's failure
+    propagates a missing input.  ``sql`` should reference the parquet
+    via the literal ``{path}`` placeholder; the helper substitutes a
+    safe ``read_parquet('...')`` expression in its place so call sites
+    don't need to repeat the if-exists / open / fetchall boilerplate.
+
+    Example:
+        rows = lib.load_report(
+            con, REPORTS / "workhours" / "workhours.parquet",
+            "SELECT dow, hour_utc, pkt_count FROM {path}",
+        )
+    """
+    if not path.exists():
+        return []
+    return con.execute(sql.format(path=f"read_parquet('{path}')")).fetchall()
+
+
 # ----------------------------------------------------------------------
 # GeoIP / ASN lookup with auto-discovery
 # ----------------------------------------------------------------------

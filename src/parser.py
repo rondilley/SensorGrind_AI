@@ -113,23 +113,33 @@ FLAG_FIN = 1 << 0
 # much cheaper than a backtracking match across 400 bytes.
 
 _PACKETTIME_RE = re.compile(rb"PacketTime:(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}\.\d+)")
-_LEN_RE        = re.compile(rb" Len:(\d+) ")
 _PROTO_RE      = re.compile(rb" IPv4/(TCP|UDP|ICMP) ")
 _TCP_UDP_FLOW  = re.compile(rb" (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+) -> (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+) ")
 _ICMP_FLOW     = re.compile(rb" (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) -> (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) ")
-_ID_RE         = re.compile(rb" ID:(\d+) ")
-_TOS_RE        = re.compile(rb" TOS:0x([0-9a-fA-F]+) ")
-_TTL_RE        = re.compile(rb" TTL:(\d+) ")
-_DGLEN_RE      = re.compile(rb" DgLen:(\d+) ")
-_TCPFLAGS_RE   = re.compile(rb" ([U\*][A\*][P\*][R\*][S\*][F\*]) ")
-_SEQ_RE        = re.compile(rb" Seq:0x([0-9a-fA-F]+) ")
-_ACK_RE        = re.compile(rb" Ack:0x([0-9a-fA-F]+) ")
-_WIN_RE        = re.compile(rb" Win:0x([0-9a-fA-F]+) ")
-_TCPLEN_RE     = re.compile(rb" TcpLen:(\d+) ")
-_RESP_RE       = re.compile(rb" Resp:([A-Z]*)(?: |$)")
-_ICMP_TYPE_RE  = re.compile(rb" Type:(\d+) ")
-_ICMP_CODE_RE  = re.compile(rb" Code:(\d+) ")
-_PKTDATA_RE    = re.compile(rb" Packetdata:([A-Za-z0-9+/=]+)")
+
+# Fused field regex.  The original code issued 11+ separate `.search()`
+# calls per line - one per `KEY:VALUE` token - which is the dominant CPU
+# cost on the 1.1 B-row parse.  A single `finditer` over this combined
+# pattern walks each line once and dispatches on `m.lastgroup`.
+#   dec_*    decimal-valued keys: Len, ID, TTL, DgLen, TcpLen, Type, Code
+#   hex_*    hex-valued keys:     TOS, Seq, Ack, Win
+#   resp_v   sensor response code (alphabetic)
+#   flags_v  TCP flag mask UAPRSF (`*`-padded for unset bits)
+_FIELDS_RE = re.compile(rb"""
+    [ ]
+    (?:
+        (?P<dec_k>Len|ID|TTL|DgLen|TcpLen|Type|Code):(?P<dec_v>\d+)
+      | (?P<hex_k>TOS|Seq|Ack|Win):0x(?P<hex_v>[0-9a-fA-F]+)
+      | Resp:(?P<resp_v>[A-Z]*)(?=[ \n]|$)
+      | (?P<flags_v>[U*][A*][P*][R*][S*][F*])(?=[ \n])
+    )
+""", re.VERBOSE)
+# Cap the base64 capture at ~96 KB encoded => ~64 KB binary, which already
+# exceeds the IPv4 total_length max (65 535).  Anything bigger can only be
+# either a sensor bug or a malicious / corrupted line trying to exhaust
+# worker RAM via `base64.b64decode` at parser.py:610.  Drop the line
+# rather than try to decode a multi-megabyte blob.
+_PKTDATA_RE    = re.compile(rb" Packetdata:([A-Za-z0-9+/=]{1,131072})")
 
 
 def _flag_mask_to_int(mask: bytes) -> int:
@@ -183,39 +193,43 @@ def parse_text_fields(line: bytes) -> dict | None:
         dst_ip = flow.group(2).decode("ascii")
         dst_port = None
 
-    def _int(rx, default=None):
-        m = rx.search(line)
-        return int(m.group(1)) if m else default
+    # Single-pass scan of the line's KEY:VALUE tokens.  Each match
+    # dispatches by `lastgroup` into one of three buckets.
+    dec_fields: dict[bytes, int] = {}
+    hex_fields: dict[bytes, int] = {}
+    tcp_flags_raw: bytes | None = None
+    sensor_resp = RESP_NONE
+    for m in _FIELDS_RE.finditer(line):
+        g = m.lastgroup
+        if g == "dec_v":
+            dec_fields[m.group("dec_k")] = int(m.group("dec_v"))
+        elif g == "hex_v":
+            hex_fields[m.group("hex_k")] = int(m.group("hex_v"), 16)
+        elif g == "resp_v":
+            sensor_resp = RESP_MAP.get(
+                m.group("resp_v").decode("ascii"), RESP_NONE
+            )
+        elif g == "flags_v":
+            tcp_flags_raw = m.group("flags_v")
 
-    def _hex_int(rx, default=None):
-        m = rx.search(line)
-        return int(m.group(1), 16) if m else default
-
-    pkt_len = _int(_LEN_RE)
-    ip_id   = _int(_ID_RE)
-    tos     = _hex_int(_TOS_RE)
-    ttl     = _int(_TTL_RE)
-    dg_len  = _int(_DGLEN_RE)
+    pkt_len = dec_fields.get(b"Len")
+    ip_id   = dec_fields.get(b"ID")
+    ttl     = dec_fields.get(b"TTL")
+    dg_len  = dec_fields.get(b"DgLen")
+    tos     = hex_fields.get(b"TOS")
 
     tcp_flags = tcp_seq = tcp_ack = tcp_win = tcp_len = None
     icmp_type = icmp_code = None
     if proto == PROTO_TCP:
-        mf = _TCPFLAGS_RE.search(line)
-        if mf:
-            tcp_flags = _flag_mask_to_int(mf.group(1))
-        tcp_seq = _hex_int(_SEQ_RE)
-        tcp_ack = _hex_int(_ACK_RE)
-        tcp_win = _hex_int(_WIN_RE)
-        tcp_len = _int(_TCPLEN_RE)
+        if tcp_flags_raw is not None:
+            tcp_flags = _flag_mask_to_int(tcp_flags_raw)
+        tcp_seq = hex_fields.get(b"Seq")
+        tcp_ack = hex_fields.get(b"Ack")
+        tcp_win = hex_fields.get(b"Win")
+        tcp_len = dec_fields.get(b"TcpLen")
     elif proto == PROTO_ICMP:
-        icmp_type = _int(_ICMP_TYPE_RE)
-        icmp_code = _int(_ICMP_CODE_RE)
-
-    m_resp = _RESP_RE.search(line)
-    if m_resp:
-        sensor_resp = RESP_MAP.get(m_resp.group(1).decode("ascii"), RESP_NONE)
-    else:
-        sensor_resp = RESP_NONE
+        icmp_type = dec_fields.get(b"Type")
+        icmp_code = dec_fields.get(b"Code")
 
     m_pkt = _PKTDATA_RE.search(line)
     pkt_b64 = m_pkt.group(1) if m_pkt else None
@@ -1012,7 +1026,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", default=str(Path.home() / "git/SensorGrind_AI/data/merged.log.gz"))
     ap.add_argument("--output", default=str(Path.home() / "git/SensorGrind_AI/output/parquet"))
-    ap.add_argument("--workers", type=int, default=min(6, max(2, (os.cpu_count() or 4) - 2)))
+    # Worker default was capped at 6 to dodge an OOM in the writer process
+    # (writer accumulated full Pool result cache when it couldn't keep up).
+    # That bug was fixed 2026-05-27 by switching to explicit Process workers
+    # + bounded queues, so we can safely scale workers with the host.
+    ap.add_argument("--workers", type=int,
+                    default=max(2, (os.cpu_count() or 4) - 2))
     ap.add_argument("--chunk-lines", type=int, default=4000,
                     help="Lines per worker chunk. Larger = less IPC overhead, "
                          "more memory per inflight chunk.")

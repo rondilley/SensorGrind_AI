@@ -75,32 +75,59 @@ BURST_SCHEMA = pa.schema([
 
 def run(args: argparse.Namespace) -> int:
     con = lib.duck(memory_limit="16GB")
-    con.execute("SET threads=4")
+    # Default threads = cpu/2 from sg.lib.duck() is appropriate for the
+    # multi-pass 1.1 B-row aggregate; the previous threads=4 cap was
+    # leaving cores idle on multi-core hosts.
     con.execute("SET preserve_insertion_order=false")
     lib.register_views(con)
 
-    # ---- 1a. find multi-sender payloads (small result set) ----
-    print("[coord] pass 1: finding multi-sender payloads...", file=sys.stderr)
-    candidates = con.execute(f"""
-        SELECT payload_sha256, count(DISTINCT src_ip) AS n_ips
-        FROM packets
-        WHERE payload_sha256 IS NOT NULL AND payload_len > 0
-        GROUP BY payload_sha256
-        HAVING count(DISTINCT src_ip) >= {args.min_ips}
-        ORDER BY n_ips DESC
-        LIMIT {args.max_waves}
-    """).fetchall()
-    print(f"[coord]   {len(candidates):,} multi-sender payloads", file=sys.stderr)
+    # ---- single read of `packets` -> per-(payload, src_ip) staging ----
+    # The previous implementation issued 3 separate full scans of the
+    # 1.1B-row view: one for multi-sender candidate shas, one for
+    # per-payload timing percentiles via wave_sha JOIN, and one for the
+    # arrival-bursts new-IP-per-minute computation.  Both candidate
+    # discovery and timing analysis aggregate at (payload_sha256, src_ip)
+    # granularity, so we materialize that once and derive everything
+    # else from it.  Arrival bursts still need an unfiltered view (an IP
+    # that sent only SYN scans has no payload), so they get their own
+    # second pass.
+    print("[coord] pass 1: per-(payload, src_ip) staging from packets...",
+          file=sys.stderr)
+    con.execute("""
+        CREATE TEMP TABLE first_per_payload_ip AS
+        SELECT p.payload_sha256, p.src_ip,
+               min(p.ts) AS first_ts,
+               any_value(p.l7_proto) AS l7
+        FROM packets p
+        WHERE p.payload_sha256 IS NOT NULL AND p.payload_len > 0
+        GROUP BY p.payload_sha256, p.src_ip
+    """)
+    staging_n = con.execute(
+        "SELECT count(*) FROM first_per_payload_ip"
+    ).fetchone()[0]
+    print(f"[coord]   {staging_n:,} (payload, src_ip) tuples staged",
+          file=sys.stderr)
 
-    if not candidates:
+    # Candidate multi-sender payloads: cheap aggregation on the staging table.
+    con.execute(f"""
+        CREATE TEMP TABLE wave_sha AS
+        SELECT payload_sha256
+        FROM first_per_payload_ip
+        GROUP BY payload_sha256
+        HAVING count(*) >= {int(args.min_ips)}
+        ORDER BY count(*) DESC
+        LIMIT {int(args.max_waves)}
+    """)
+    candidate_count = con.execute("SELECT count(*) FROM wave_sha").fetchone()[0]
+    print(f"[coord]   {candidate_count:,} multi-sender payloads",
+          file=sys.stderr)
+
+    if candidate_count == 0:
         waves = []
         corpus_span_days = 1.0
     else:
-        con.execute("CREATE TEMP TABLE wave_sha(sha BLOB)")
-        con.executemany("INSERT INTO wave_sha VALUES (?)", [(c[0],) for c in candidates])
-
-        # Corpus span: total time the sensor has observed events.  Used
-        # to compute density_score and the always-on cutoff.
+        # Corpus span: parquet min/max stats — effectively metadata-only,
+        # no scan.  Used to compute density_score and the always-on cutoff.
         corpus_row = con.execute(
             "SELECT date_diff('day', min(ts), max(ts)) FROM packets"
         ).fetchone()
@@ -110,22 +137,22 @@ def run(args: argparse.Namespace) -> int:
               f"campaign cutoff = burst_window < {max_burst_days:.0f} days",
               file=sys.stderr)
 
-        # ---- 1b. percentile-based onset detection per payload ----
+        # Per-payload percentile + peak-day analysis runs entirely off
+        # the staging table — no further scan of `packets`.
         print("[coord] pass 2: per-payload first-arrival percentiles "
-              "+ peak-day + sample IPs...", file=sys.stderr)
+              "+ peak-day + sample IPs (from staging, no packets scan)...",
+              file=sys.stderr)
         timing_rows = con.execute("""
-            WITH first_per_ip AS (
-                SELECT p.payload_sha256, p.src_ip,
-                       min(p.ts) AS first_ts,
-                       any_value(p.l7_proto) AS l7
-                FROM packets p JOIN wave_sha w ON p.payload_sha256 = w.sha
-                GROUP BY p.payload_sha256, p.src_ip
+            WITH wave_first AS (
+                SELECT fp.payload_sha256, fp.src_ip, fp.first_ts, fp.l7
+                FROM first_per_payload_ip fp
+                JOIN wave_sha w ON fp.payload_sha256 = w.payload_sha256
             ),
             per_day AS (
                 SELECT payload_sha256,
                        date_trunc('day', first_ts) AS day,
                        count(*) AS n
-                FROM first_per_ip
+                FROM wave_first
                 GROUP BY 1, 2
             ),
             peaks AS (
@@ -141,7 +168,7 @@ def run(args: argparse.Namespace) -> int:
                        EXTRACT(EPOCH FROM first_ts) -
                          EXTRACT(EPOCH FROM min(first_ts)
                                            OVER (PARTITION BY payload_sha256)) AS ipd_sec
-                FROM first_per_ip
+                FROM wave_first
             )
             SELECT
                 we.payload_sha256,
@@ -205,8 +232,9 @@ def run(args: argparse.Namespace) -> int:
           f"(burst_window < {CAMPAIGN_BURST_FRAC*100:.0f}% of corpus span)",
           file=sys.stderr)
 
-    # ---- 2. arrival bursts: minute buckets of new IPs ----
-    print("[coord] computing per-minute new-IP arrival rate...", file=sys.stderr)
+    # ---- pass 3: arrival bursts (single pass; SYN-only IPs have no
+    #              payload so this still needs the full unfiltered view) ----
+    print("[coord] pass 3: per-minute new-IP arrival rate...", file=sys.stderr)
     bursts = con.execute("""
         WITH ip_first AS (
             SELECT src_ip, min(ts) AS first_ts FROM packets GROUP BY src_ip

@@ -131,18 +131,34 @@ def run(args: argparse.Namespace) -> int:
     """).fetchall()
     print(f"[asnintel] {len(rows):,} ASNs with 5+ observed IPs", file=sys.stderr)
 
-    print("[asnintel] gathering per-ASN dominant ports/families/probes...",
+    # Materialize (src_ip, asn) for the candidate ASN set ONCE so the four
+    # downstream queries below (top ports, top botnet families, top probe
+    # tags, cooperation score) each issue a single packets-JOIN against a
+    # small in-memory table instead of joining packets to the full
+    # 1.1B-row feature parquet four separate times.
+    print("[asnintel] materializing candidate (src_ip, asn) map...",
           file=sys.stderr)
     asn_set = ", ".join(str(int(r[0])) for r in rows)
+    con.execute(f"""
+        CREATE TEMP TABLE asn_ip AS
+        SELECT src_ip, asn
+        FROM read_parquet('{feat_path}')
+        WHERE asn IN ({asn_set})
+    """)
+    asn_ip_n = con.execute("SELECT count(*) FROM asn_ip").fetchone()[0]
+    print(f"[asnintel]   {asn_ip_n:,} (src_ip, asn) tuples", file=sys.stderr)
+
+    print("[asnintel] gathering per-ASN dominant ports/families/probes...",
+          file=sys.stderr)
     # Top ports per ASN
-    port_rows = con.execute(f"""
+    port_rows = con.execute("""
         WITH ranked AS (
-            SELECT f.asn, p.dst_port, count(*) AS n,
-                   row_number() OVER (PARTITION BY f.asn ORDER BY count(*) DESC) AS rk
+            SELECT a.asn, p.dst_port, count(*) AS n,
+                   row_number() OVER (PARTITION BY a.asn ORDER BY count(*) DESC) AS rk
             FROM packets p
-            JOIN read_parquet('{feat_path}') f ON p.src_ip = f.src_ip
-            WHERE f.asn IN ({asn_set}) AND p.dst_port IS NOT NULL
-            GROUP BY f.asn, p.dst_port
+            JOIN asn_ip a ON p.src_ip = a.src_ip
+            WHERE p.dst_port IS NOT NULL
+            GROUP BY a.asn, p.dst_port
         )
         SELECT asn, dst_port, n FROM ranked WHERE rk <= 5
     """).fetchall()
@@ -154,13 +170,12 @@ def run(args: argparse.Namespace) -> int:
     if botnet_path.exists():
         fam_rows = con.execute(f"""
             WITH ranked AS (
-                SELECT f.asn, b.family, count(DISTINCT p.src_ip) AS ips,
-                       row_number() OVER (PARTITION BY f.asn ORDER BY count(DISTINCT p.src_ip) DESC) AS rk
+                SELECT a.asn, b.family, count(DISTINCT p.src_ip) AS ips,
+                       row_number() OVER (PARTITION BY a.asn ORDER BY count(DISTINCT p.src_ip) DESC) AS rk
                 FROM packets p
-                JOIN read_parquet('{feat_path}') f ON p.src_ip = f.src_ip
+                JOIN asn_ip a ON p.src_ip = a.src_ip
                 JOIN read_parquet('{botnet_path}') b ON p.payload_sha256 = b.payload_sha256
-                WHERE f.asn IN ({asn_set})
-                GROUP BY f.asn, b.family
+                GROUP BY a.asn, b.family
             )
             SELECT asn, family, ips FROM ranked WHERE rk <= 3
         """).fetchall()
@@ -171,14 +186,13 @@ def run(args: argparse.Namespace) -> int:
     if probesigs_path.exists():
         prb_rows = con.execute(f"""
             WITH ranked AS (
-                SELECT f.asn, p.probe_tag, count(DISTINCT i.src_ip) AS ips,
-                       row_number() OVER (PARTITION BY f.asn ORDER BY count(DISTINCT i.src_ip) DESC) AS rk
+                SELECT a.asn, p.probe_tag, count(DISTINCT i.src_ip) AS ips,
+                       row_number() OVER (PARTITION BY a.asn ORDER BY count(DISTINCT i.src_ip) DESC) AS rk
                 FROM iocs i
-                JOIN read_parquet('{feat_path}') f ON i.src_ip = f.src_ip
+                JOIN asn_ip a ON i.src_ip = a.src_ip
                 JOIN read_parquet('{probesigs_path}') p ON i.value = p.uri
-                WHERE f.asn IN ({asn_set})
-                  AND i.ioc_kind = {lib.IOC_ID['http_uri']}
-                GROUP BY f.asn, p.probe_tag
+                WHERE i.ioc_kind = {lib.IOC_ID['http_uri']}
+                GROUP BY a.asn, p.probe_tag
             )
             SELECT asn, probe_tag, ips FROM ranked WHERE rk <= 3
         """).fetchall()
@@ -190,14 +204,13 @@ def run(args: argparse.Namespace) -> int:
     # where >=2 IPs were active simultaneously, divided by total active buckets.
     print("[asnintel] computing cooperation (synchronized activity) score...",
           file=sys.stderr)
-    coop_rows = con.execute(f"""
+    coop_rows = con.execute("""
         WITH a AS (
-            SELECT f.asn, p.src_ip,
+            SELECT ai.asn, p.src_ip,
                    date_trunc('hour', p.ts) AS hr
             FROM packets p
-            JOIN read_parquet('{feat_path}') f ON p.src_ip = f.src_ip
-            WHERE f.asn IN ({asn_set})
-            GROUP BY f.asn, p.src_ip, hr
+            JOIN asn_ip ai ON p.src_ip = ai.src_ip
+            GROUP BY ai.asn, p.src_ip, hr
         ),
         bucket_pop AS (
             SELECT asn, hr, count(*) AS n_ips_active

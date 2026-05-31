@@ -51,7 +51,6 @@ Output
 """
 
 import argparse
-import gzip
 import multiprocessing as mp
 import os
 import re
@@ -167,9 +166,20 @@ def extract_one(args):
         stderr=subprocess.DEVNULL,
         bufsize=1 << 20,
     )
+    # Per-file intermediate writer: zstd is roughly 3-5x faster than
+    # gzip at compresslevel=3 with comparable ratio.  We pipe lines into
+    # `zstd -T0 -3` which writes the compressed `.tsv.zst` directly.
+    # zstd handles its own buffered I/O; we feed it bytes via stdin.
+    zstd_proc = subprocess.Popen(
+        ["zstd", "-T0", "-3", "-q", "-f", "-o", str(out)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        bufsize=1 << 20,
+    )
+    out_fh = zstd_proc.stdin
     try:
-        with gzip.open(out, "wt", encoding="utf-8", compresslevel=3) as out_fh:
-            for raw in proc.stdout:
+        for raw in proc.stdout:
                 # ---- anchor detection ----
                 # FortiGate is by far the most common anchor; check first.
                 m_fg = FORTI_DT_RE.search(raw)
@@ -278,7 +288,7 @@ def extract_one(args):
                     last_packet_time = packet_time
                     continue
                 line = line.rstrip("\n").replace("\t", " ")
-                out_fh.write(f"{iso}\t{line}\n")
+                out_fh.write(f"{iso}\t{line}\n".encode("utf-8"))
 
                 if first_corrected_ts is None or iso < first_corrected_ts:
                     first_corrected_ts = iso
@@ -293,8 +303,16 @@ def extract_one(args):
                 sensor_count += 1
                 last_packet_time = packet_time
     finally:
-        proc.stdout.close()
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
         proc.wait()
+        try:
+            out_fh.close()
+        except Exception:
+            pass
+        zstd_proc.wait()
 
     if sensor_count == 0:
         try:
@@ -594,7 +612,7 @@ def main():
     for p in files:
         # Flat namespace; include parent folder in the intermediate filename to avoid collisions.
         tag = f"{p.parent.name}__{p.name}"
-        out_path = tmp_dir / f"{tag}.tsv.gz"
+        out_path = tmp_dir / f"{tag}.tsv.zst"
         tasks.append((str(p), str(out_path)))
 
     # Phase 1: parallel extraction.
@@ -663,16 +681,20 @@ def main():
           f"{fmt_bytes(inter_size)} compressed")
 
     # Phase 2: global sort + dedup.
-    # zcat all intermediates -> sort -u (with gzip-compressed spill) -> gzip -> final.
-    # Using shell pipeline so byte-streams stay out of Python.
+    # Intermediates are zstd-compressed (`.tsv.zst`); sort spill is also
+    # zstd via `--compress-program=zstd` — both are ~3-5x faster than
+    # gzip at similar ratio.  The final `merged.log.gz` stays gzip
+    # because every downstream consumer (parser, ad-hoc grep, the
+    # archived script suite) expects gzip and the final-write CPU is
+    # not the bottleneck.
     t1 = time.time()
     print(f"[merge] streaming sort -u  mem={args.sort_mem}  parallel={args.sort_parallel}")
     inter_list = " ".join(f"'{p}'" for p in intermediates)
     pipeline = (
         f"set -o pipefail; "
-        f"LC_ALL=C zcat {inter_list} "
+        f"LC_ALL=C zstd -dc -T0 {inter_list} "
         f"| LC_ALL=C sort -u -S {args.sort_mem} --parallel={args.sort_parallel} "
-        f"-T '{tmp_dir}' --compress-program=gzip "
+        f"-T '{tmp_dir}' --compress-program=zstd "
         f"| gzip -c > '{final_path}.partial' "
         f"&& mv '{final_path}.partial' '{final_path}'"
     )
