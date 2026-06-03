@@ -143,6 +143,16 @@ MIN_ARRIVAL_BURST_RATIO     = 5.0
 MIN_BOTNET_SIGNAL           = 0.5
 MIN_BOTNET_PERSISTENCE      = 0.6
 
+# chainfp thresholds — per ListonCon long-tail observation.  The
+# "distinctive" tier is 10-99 source IPs sharing the same chain.
+# Rare/singleton sit below.  At the high end, anything seen from
+# >=1000 sources is internet-background and uninteresting.
+CHAINFP_DISTINCTIVE_MIN     = 10
+CHAINFP_DISTINCTIVE_MAX     = 99
+CHAINFP_MIN_TOKENS          = 3      # 2-token "SYN+RST" is too short to be a fingerprint
+CHAINFP_TOP_DISTINCTIVE     = 15     # finding fan-out cap
+CHAINFP_TOP_RARE_BURST      = 8      # rare chains promoted by burstiness
+
 
 # ----------------------------------------------------------------------
 # Pattern rules
@@ -913,6 +923,145 @@ def pat_recent_tight_campaign(con) -> list[dict]:
     )]
 
 
+def pat_anomalous_chain(con) -> list[dict]:
+    """Distinctive per-IP packet-flag chains (from chainfp).
+
+    Chains are per-source-IP sequences of `(flag_mask, proto, port)`
+    tokens within one session.  The 'distinctive' tier (10-99 sources
+    sharing the same chain) is the most informative bucket: cohesive
+    enough to be a toolkit fingerprint, rare enough not to be background
+    scanning.
+
+    This rule picks the highest-source-count distinctive chains
+    on the best-SNR window and emits one finding per chain.  The
+    LLM synth stage then narrates what the chain operationally
+    means.
+
+    The 'rare' bucket (2-9 sources) is *also* surfaced, but only
+    when the per-IP packet count is high enough that the chain
+    represents real volume (filtering out one-off probe noise).
+    """
+    if not _have(con, "chainfp"):
+        return []
+    # Pick the best-SNR window if window_snr is registered; otherwise
+    # default to 40m (matches Liston's `-t 2400` from ListonCon).
+    best_label = "40m"
+    if _have(con, "chainfp_snr"):
+        try:
+            row = con.execute("""
+                SELECT window_label FROM chainfp_snr
+                WHERE is_best = TRUE LIMIT 1
+            """).fetchone()
+            if row:
+                best_label = row[0]
+        except Exception:
+            pass
+
+    out: list[dict] = []
+
+    # Distinctive chains: cohesive small-cluster toolkit fingerprints.
+    distinctive = con.execute(f"""
+        SELECT chain, source_count, packet_count, token_count,
+               sample_ips, top_dst_ports, first_seen, last_seen
+        FROM chainfp
+        WHERE window_label = '{best_label}'
+          AND anomaly_tier = 'distinctive'
+          AND source_count BETWEEN {CHAINFP_DISTINCTIVE_MIN}
+                              AND {CHAINFP_DISTINCTIVE_MAX}
+          AND token_count >= {CHAINFP_MIN_TOKENS}
+          AND chain NOT LIKE 'ICMP/8.0,ICMP/8.0,ICMP/8.0%'
+        ORDER BY source_count DESC, packet_count DESC
+        LIMIT {CHAINFP_TOP_DISTINCTIVE}
+    """).fetchall()
+    for chain, src_count, pkt_count, tok_count, ips, ports, ts0, ts1 in distinctive:
+        ip_list = (ips or "").split(",")
+        # Severity heuristic: chain length + which structural tells.
+        # SYN-then-own-RST or RST-without-prior-SYN are stronger
+        # tells than a clean 3-token handshake.
+        sev = "medium"
+        weird = []
+        c = chain or ""
+        if "S*-TCP" in c and ",***R**-TCP" in c:
+            # SYN-then-own-RST: source kernel disowned its own SYN.
+            # Spoofing tell or stack-fingerprint probe.
+            sev = "high"
+            weird.append("SYN-then-own-RST")
+        if c.startswith("***R**-TCP"):
+            # Chain starts with RST from source - no prior SYN.
+            sev = "high"
+            weird.append("RST-without-prior-SYN")
+        if c.count(",") >= 6 and "*A***F-TCP" not in c and "*A*R**-TCP" not in c:
+            # Long chain with no normal teardown - lingering tarpit
+            # probing or banner-grabbing without closing.
+            weird.append("no-teardown")
+        if tok_count >= 8 and "ICMP" in c:
+            # Long ICMP-laced chain - protocol confusion or mapping.
+            weird.append("icmp-mixed")
+
+        out.append(_finding(
+            pattern_id=f"anom_chain_{hashlib.sha256(c.encode()).hexdigest()[:8]}",
+            pattern_title=(f"Anomalous packet-flag chain ({src_count} "
+                           f"sources, {tok_count} tokens)"),
+            severity=sev,
+            category="choreography-anomaly",
+            src_ips=ip_list,
+            key_metrics={
+                "chain":         c[:512],
+                "window":        best_label,
+                "source_count":  int(src_count),
+                "packet_count":  int(pkt_count),
+                "token_count":   int(tok_count),
+                "top_dst_ports": ports,
+                "weird_tells":   weird,
+            },
+            evidence_refs=[{"section": "chainfp",
+                            "label": "Per-IP chain fingerprint"}],
+            report_anchor="#chain-fingerprints-chainfp",
+            first_seen=str(ts0), last_seen=str(ts1),
+        ))
+
+    # Rare-tier chains that nevertheless carry real packet volume.
+    # These are tiny named-IP clusters running a sustained operation
+    # rather than one-off probes.
+    rare = con.execute(f"""
+        SELECT chain, source_count, packet_count, token_count,
+               sample_ips, top_dst_ports, first_seen, last_seen
+        FROM chainfp
+        WHERE window_label = '{best_label}'
+          AND anomaly_tier = 'rare'
+          AND token_count >= {CHAINFP_MIN_TOKENS}
+          AND packet_count >= 200
+          AND chain NOT LIKE 'ICMP/8.0%'
+        ORDER BY packet_count DESC
+        LIMIT {CHAINFP_TOP_RARE_BURST}
+    """).fetchall()
+    for chain, src_count, pkt_count, tok_count, ips, ports, ts0, ts1 in rare:
+        ip_list = (ips or "").split(",")
+        out.append(_finding(
+            pattern_id=f"rare_chain_{hashlib.sha256(chain.encode()).hexdigest()[:8]}",
+            pattern_title=(f"Rare sustained packet-flag chain "
+                           f"({src_count} sources, {pkt_count:,} pkts)"),
+            severity="medium",
+            category="choreography-anomaly",
+            src_ips=ip_list,
+            key_metrics={
+                "chain":         chain[:512],
+                "window":        best_label,
+                "source_count":  int(src_count),
+                "packet_count":  int(pkt_count),
+                "token_count":   int(tok_count),
+                "top_dst_ports": ports,
+                "is_rare":       True,
+            },
+            evidence_refs=[{"section": "chainfp",
+                            "label": "Per-IP chain fingerprint (rare tier)"}],
+            report_anchor="#chain-fingerprints-chainfp",
+            first_seen=str(ts0), last_seen=str(ts1),
+        ))
+
+    return out
+
+
 def pat_critical_persistent_botnet(con) -> list[dict]:
     """Critical-tier IPs with botnet rationale AND long persistence."""
     risk_path = _newest_risk_path()
@@ -962,6 +1111,7 @@ PATTERNS: list[Callable] = [
     pat_global_arrival_burst,
     pat_local_only_vnc_targeting,
     pat_self_mimic_honeypot_aware,
+    pat_anomalous_chain,
     pat_critical_persistent_botnet,
 ]
 
@@ -996,6 +1146,8 @@ def _register_views(con) -> None:
         ("waves",            P / "coordination" / "payload_waves.parquet"),
         ("bursts",           P / "coordination" / "arrival_bursts.parquet"),
         ("chains",           P / "attack_chains" / "patterns.parquet"),
+        ("chainfp",          R / "chainfp" / "chainfp.parquet"),
+        ("chainfp_snr",      R / "chainfp" / "window_snr.parquet"),
     ]
     for view, path in mapping:
         if not path.exists():

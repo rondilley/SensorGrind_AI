@@ -13,11 +13,14 @@ Provides:
 
 from __future__ import annotations
 
+import atexit
 import datetime as _dt
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -51,6 +54,35 @@ PACKETS_GLOB       = str(PARQUET / "packets" / "**" / "*.parquet")
 BLOBS_GLOB         = str(PARQUET / "payload_blobs" / "**" / "*.parquet")
 L7_GLOB            = str(PARQUET / "l7_events" / "**" / "*.parquet")
 IOCS_GLOB          = str(PARQUET / "iocs" / "**" / "*.parquet")
+
+# Derived, ASN/CIDR/IP-clustered packets (built by src/cluster_packets.py):
+# bucketed by hash(asn), sorted by (asn, cidr, src_ip), with asn+cidr columns.
+# Lets per-IP / per-ASN / per-CIDR analyzers read a bounded, prunable window.
+PACKETS_CLUSTERED      = PARQUET / "packets_clustered"
+PACKETS_CLUSTERED_GLOB = str(PACKETS_CLUSTERED / "**" / "*.parquet")
+L7_CLUSTERED           = PARQUET / "l7_events_clustered"
+L7_CLUSTERED_GLOB      = str(L7_CLUSTERED / "**" / "*.parquet")
+IOCS_CLUSTERED         = PARQUET / "iocs_clustered"
+IOCS_CLUSTERED_GLOB    = str(IOCS_CLUSTERED / "**" / "*.parquet")
+
+
+def has_clustered(d: Path) -> bool:
+    """True if a clustered dataset dir has been built (has bkt= partitions)."""
+    return d.exists() and any(d.glob("bkt=*"))
+
+
+def clustered_buckets() -> list[int]:
+    """Bucket numbers present in the clustered packets dataset (empty if it
+    hasn't been built yet).  All clustered tables share these bucket numbers."""
+    if not PACKETS_CLUSTERED.exists():
+        return []
+    out = []
+    for d in PACKETS_CLUSTERED.glob("bkt=*"):
+        try:
+            out.append(int(d.name.split("=", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return sorted(out)
 
 
 # ----------------------------------------------------------------------
@@ -128,18 +160,78 @@ def duck(read_only: bool = False, memory_limit: str | None = None,
     con.execute(f"SET threads={threads}")
     con.execute("SET preserve_insertion_order=false")
     con.execute("SET enable_progress_bar=false")
-    tmp = os.environ.get("SG_DUCK_TMPDIR")
-    if tmp:
+    # Enable out-of-core operation.  Without a temp_directory an in-memory
+    # DuckDB cannot spill hash aggregates / joins to disk, so a large
+    # GROUP BY blows past memory_limit and gets OOM-killed instead of
+    # spilling.
+    #
+    # CRITICAL: every connection gets its OWN spill dir.  Concurrent DuckDB
+    # instances (parallel evolve stages) that share one temp_directory collide
+    # on identically-named temp files and corrupt each other's spill
+    # ("Could not read enough bytes from ... duckdb_temp_storage").  Base dir
+    # via SG_DUCK_TMPDIR; per-connection subdir is unique.
+    base = os.environ.get("SG_DUCK_TMPDIR") or str(OUTPUT_DIR / ".duckdb_tmp")
+    try:
+        Path(base).mkdir(parents=True, exist_ok=True)
+        _prune_stale_tmp(base)
+        tmp = tempfile.mkdtemp(prefix=f"con{os.getpid()}_", dir=base)
         con.execute(f"SET temp_directory='{tmp}'")
+        atexit.register(shutil.rmtree, tmp, True)  # ignore_errors=True
+    except OSError:
+        pass
     return con
 
 
-def register_views(con: duckdb.DuckDBPyConnection) -> None:
-    """Register the four canonical views every analyzer expects."""
-    con.execute(f"CREATE OR REPLACE VIEW packets       AS SELECT * FROM read_parquet('{PACKETS_GLOB}', hive_partitioning=1)")
-    con.execute(f"CREATE OR REPLACE VIEW payload_blobs AS SELECT * FROM read_parquet('{BLOBS_GLOB}',   hive_partitioning=1)")
-    con.execute(f"CREATE OR REPLACE VIEW l7_events     AS SELECT * FROM read_parquet('{L7_GLOB}',      hive_partitioning=1)")
-    con.execute(f"CREATE OR REPLACE VIEW iocs          AS SELECT * FROM read_parquet('{IOCS_GLOB}',    hive_partitioning=1)")
+def _pid_alive(pid: int) -> bool:
+    """True if a process with ``pid`` currently exists.  Errs toward 'alive'
+    so we never delete a spill dir that might still be in use."""
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True            # exists but not signalable (e.g. perms)
+    return True
+
+
+def _prune_stale_tmp(base: str) -> None:
+    """Remove per-connection spill dirs whose owning process is GONE.  Keyed on
+    the pid embedded in the dir name (``con<pid>_<rand>``), so a live
+    connection's dir -- this one or a concurrent stage's -- is never deleted,
+    no matter how long it has been running."""
+    try:
+        for d in Path(base).glob("con*_*"):
+            if not d.is_dir():
+                continue
+            try:
+                pid = int(d.name[3:d.name.index("_", 3)])
+            except ValueError:
+                continue
+            if not _pid_alive(pid):
+                shutil.rmtree(d, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def register_views(con: duckdb.DuckDBPyConnection,
+                   clustered: bool = False) -> None:
+    """Register the four canonical views every analyzer expects.
+
+    With ``clustered=True``, point the ``packets`` view at the ASN/CIDR/IP
+    clustered dataset when it has been built (it carries the same rows plus
+    ``asn``/``cidr`` columns, sorted for row-group pruning).  Falls back to
+    the raw date-partitioned packets otherwise, so callers are safe either
+    way.  Best for per-IP / per-ASN / per-CIDR scans.
+    """
+    pkts = PACKETS_CLUSTERED_GLOB if (clustered and has_clustered(PACKETS_CLUSTERED)) else PACKETS_GLOB
+    l7   = L7_CLUSTERED_GLOB      if (clustered and has_clustered(L7_CLUSTERED))      else L7_GLOB
+    iocs = IOCS_CLUSTERED_GLOB    if (clustered and has_clustered(IOCS_CLUSTERED))    else IOCS_GLOB
+    con.execute(f"CREATE OR REPLACE VIEW packets       AS SELECT * FROM read_parquet('{pkts}', hive_partitioning=1)")
+    con.execute(f"CREATE OR REPLACE VIEW payload_blobs AS SELECT * FROM read_parquet('{BLOBS_GLOB}', hive_partitioning=1)")
+    con.execute(f"CREATE OR REPLACE VIEW l7_events     AS SELECT * FROM read_parquet('{l7}',   hive_partitioning=1)")
+    con.execute(f"CREATE OR REPLACE VIEW iocs          AS SELECT * FROM read_parquet('{iocs}', hive_partitioning=1)")
 
 
 def load_report(con: duckdb.DuckDBPyConnection, path: Path, sql: str) -> list:

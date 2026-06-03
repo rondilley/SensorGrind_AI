@@ -4,21 +4,43 @@ selfmimic - detect attackers mimicking the sensor's own banners and
 infrastructure responses.
 
 Honeypots that respond with realistic banners eventually leak telltale
-strings; sophisticated attackers re-use those exact strings in their own
-ClientHello/User-Agent/HTTP headers to look "internal" or to fingerprint
-us back.  This module scans inbound traffic for echo of our own
-fingerprint.
+strings; sophisticated attackers re-use those exact strings in their
+own ClientHello / User-Agent / HTTP headers to look "internal" or to
+fingerprint us back.  This module scans inbound traffic for echoes of
+our own fingerprint.
+
+**Per-sensor configuration required.**  The matcher is only meaningful
+when ``SELF_BANNERS`` actually contains the strings *this specific
+honeypot* emits.  For an ultra-low-interaction sensor that never
+speaks at layer 7 (like Tom Liston's stateless-TCP design used by
+``honeypi00`` in this project), no L7 banner is ever emitted, so the
+correct value is the empty list and the analyzer becomes a no-op.
+A previous default contained generic banners ("nginx/1.18.0",
+"Microsoft-IIS/10.0", a common Chrome User-Agent string, etc.) which
+produced false positives on any ultra-low-interaction setup: the
+analyzer would flag any inbound packet containing those generic
+strings (e.g. a routine scanner using the Chrome UA) as "echoing the
+sensor's banners," and the downstream LLM-narrated finding would
+hallucinate a counter-honeypot adversary.  See `BLOG_POST.md` for the
+case study.
+
+If you run a high-interaction honeypot, override ``SELF_BANNERS``
+below (or pass ``--banner-file``) with the *actual* banner strings
+your emulator emits.
 
 Inputs:
-  - SELF_BANNERS: hard-coded list of sensor fingerprint strings.  Edit
-    the constant or override via --banner-file (one per line).
-  - iocs.value text (user_agent / http_uri / tls_sni / ssh_banner /
-    http_host) - searched for exact and substring matches.
+  - ``SELF_BANNERS``: per-sensor list of fingerprint strings the
+    honeypot actually emits.  Default is empty (no-op) - safe for
+    ultra-low-interaction sensors.  Override via ``--banner-file``
+    (one per line) for high-interaction honeypots.
+  - ``iocs.value`` text (user_agent / http_uri / tls_sni / ssh_banner /
+    http_host / dns_query) - searched for exact and substring matches.
 
 Outputs:
-  - selfmimic.parquet: per-source-IP echo count, which banners they
-    echoed, and a "mimic_score" 0..1
-  - selfmimic.md: human summary
+  - ``selfmimic.parquet``: per-source-IP echo count, which banners
+    they echoed, and a "mimic_score" 0..1.  Empty when ``SELF_BANNERS``
+    is empty.
+  - ``selfmimic.md``: human summary.
 """
 from __future__ import annotations
 
@@ -45,21 +67,20 @@ RESULT_SCHEMA = pa.schema([
     ("asn_org",      pa.string()),
 ])
 
-# Default sensor self-banners.  These are intentionally generic - update
-# this list to match the actual honeypot you're running.  The matcher
-# does both exact and substring checks.
-SELF_BANNERS = [
-    "SSH-2.0-OpenSSH_7.4",
-    "SSH-2.0-OpenSSH_8.0",
-    "Microsoft-IIS/10.0",
-    "Apache/2.4.41",
-    "nginx/1.18.0",
-    "Server: nginx",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0",
-    "honeypot",
-    "sensorgrind",
-]
+# Default sensor self-banners.  Empty by default — the analyzer only
+# produces a meaningful signal when this list (or --banner-file) is
+# populated with banner strings the specific honeypot actually emits.
+# For ultra-low-interaction sensors that never speak at L7 (the
+# `honeypi00` host shipped with this project, stateless-TCP design),
+# the empty list is correct and turns the analyzer into a no-op rather
+# than producing false-positive "the sensor's banner appeared in
+# inbound traffic" findings against generic scanner UAs.
+#
+# For high-interaction honeypots (Cowrie, Dionaea, T-Pot etc.) replace
+# this with the exact strings your emulator emits — version banners,
+# server headers, default SSH/TLS fingerprints, etc.  Use --banner-file
+# to avoid editing this source.
+SELF_BANNERS: list[str] = []
 
 # Restrict to text-bearing IOC kinds.
 TEXT_IOC_KINDS = ["user_agent", "ssh_banner", "http_uri", "tls_sni",
@@ -83,6 +104,29 @@ def _load_banners(arg_file: str | None) -> list[str]:
 
 def run(args: argparse.Namespace) -> lib.Report:
     banners = _load_banners(args.banner_file)
+    if not banners:
+        # No banners configured = ultra-low-interaction sensor (or
+        # operator hasn't populated SELF_BANNERS yet).  Either way,
+        # nothing to match against; write an empty result rather than
+        # scanning iocs for substring hits against a generic banner
+        # list that would produce false positives.
+        print("[selfmimic] SELF_BANNERS is empty - skipping "
+              "(populate the list with banners THIS sensor actually "
+              "emits, or pass --banner-file).  No-op is the correct "
+              "behaviour for ultra-low-interaction honeypots.",
+              file=sys.stderr)
+        md = (
+            "## Summary\n\n"
+            "_No self-banners configured.  This analyzer requires "
+            "`SELF_BANNERS` (or `--banner-file`) to be populated with "
+            "the exact strings the sensor emits at layer 7.  "
+            "Ultra-low-interaction honeypots that never speak at L7 "
+            "(stateless TCP / SYN-only responders) correctly produce "
+            "no output here._\n"
+        )
+        return lib.Report(name="selfmimic", rows=[],
+                          schema=RESULT_SCHEMA, markdown=md)
+
     print(f"[selfmimic] searching for {len(banners)} self-banners",
           file=sys.stderr)
 

@@ -67,6 +67,50 @@ def write_snapshot(fs: FeatureSet, table: pa.Table, manifest: dict[str, Any] | N
     return out_path
 
 
+def write_snapshot_stream(fs: FeatureSet, schema: pa.Schema,
+                          tables, manifest: dict[str, Any] | None = None
+                          ) -> tuple[Path, int]:
+    """Atomically write a feature snapshot from a stream of tables.
+
+    ``tables`` is any iterable of ``pa.Table`` (or RecordBatch) chunks, each
+    already matching ``schema``.  They are written incrementally so the whole
+    feature set never has to exist in memory at once.  Returns
+    ``(parquet_path, row_count)``.
+    """
+    out_dir = snapshot_dir(fs)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "part-0000.parquet"
+    tmp_path = out_dir / "part-0000.parquet.tmp"
+    row_count = 0
+    writer = pq.ParquetWriter(tmp_path, schema, compression="zstd",
+                              compression_level=3)
+    try:
+        for tbl in tables:
+            if isinstance(tbl, pa.RecordBatch):
+                tbl = pa.Table.from_batches([tbl], schema=schema)
+            if tbl.num_rows == 0:
+                continue
+            writer.write_table(tbl)
+            row_count += tbl.num_rows
+    finally:
+        writer.close()
+    tmp_path.replace(out_path)
+    if manifest is not None:
+        manifest_path = out_dir / "manifest.json"
+        full = {
+            "entity": fs.entity,
+            "version": fs.version,
+            "snapshot_date": fs.snapshot_date.isoformat(),
+            "row_count": row_count,
+            "column_count": len(schema),
+            "columns": [f.name for f in schema],
+            "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            **manifest,
+        }
+        manifest_path.write_text(json.dumps(full, indent=2, default=str))
+    return out_path, row_count
+
+
 def load_snapshot(fs: FeatureSet) -> pa.Table | None:
     p = snapshot_dir(fs) / "part-0000.parquet"
     if not p.exists():

@@ -103,7 +103,7 @@ def run(args: argparse.Namespace) -> int:
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     con = lib.duck(memory_limit="16GB")
-    lib.register_views(con)
+    lib.register_views(con, clustered=True)
 
     # ---- pick threat IPs ----
     print("[actorlink] selecting threat IPs (tier >= medium)...",
@@ -113,7 +113,7 @@ def run(args: argparse.Namespace) -> int:
         FROM read_parquet('{risk_path}') r
         JOIN read_parquet('{feat_path}') f ON r.src_ip = f.src_ip
         WHERE r.risk_tier IN ('critical', 'high', 'medium')
-        ORDER BY r.risk_score DESC
+        ORDER BY r.risk_score DESC, r.src_ip ASC
         LIMIT {args.top_ips}
     """).fetchall()
     if not ips_meta:
@@ -354,7 +354,7 @@ def run(args: argparse.Namespace) -> int:
     print("[actorlink] enriching communities with metadata...",
           file=sys.stderr)
     con = lib.duck(memory_limit="16GB")
-    lib.register_views(con)
+    lib.register_views(con, clustered=True)
 
     node_rows: list[dict] = []
     com_rows: list[dict] = []
@@ -387,7 +387,7 @@ def run(args: argparse.Namespace) -> int:
                 SELECT fp_type || '=' || fingerprint AS tool, count(*) AS n
                 FROM read_parquet('{ja_path}')
                 WHERE src_ip IN {member_csv}
-                GROUP BY tool ORDER BY n DESC LIMIT 3
+                GROUP BY tool ORDER BY n DESC, tool ASC LIMIT 3
             """).fetchall()
         tools = ", ".join(f"{t}({n})" for t, n in tool_rows)
 
@@ -395,7 +395,7 @@ def run(args: argparse.Namespace) -> int:
         port_rows = con.execute(f"""
             SELECT dst_port, count(*) AS n FROM packets
             WHERE src_ip IN {member_csv} AND dst_port IS NOT NULL
-            GROUP BY dst_port ORDER BY n DESC LIMIT 5
+            GROUP BY dst_port ORDER BY n DESC, dst_port ASC LIMIT 5
         """).fetchall()
         ports = ", ".join(f"{p}({n})" for p, n in port_rows)
         targets = ports

@@ -97,7 +97,7 @@ def run(args: argparse.Namespace) -> int:
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     con = lib.duck(memory_limit="16GB")
-    lib.register_views(con)
+    lib.register_views(con, clustered=True)
 
     probesigs_path = lib.REPORTS / "probesigs" / "probesigs.parquet"
     botnet_path = lib.REPORTS / "botnetcls" / "botnetcls.parquet"
@@ -113,8 +113,8 @@ def run(args: argparse.Namespace) -> int:
             WHERE f.asn IS NOT NULL AND f.asn > 0
         )
         SELECT asn,
-               any_value(asn_org)                                         AS asn_org,
-               any_value(country_iso)                                     AS country_iso,
+               min(asn_org)                                               AS asn_org,
+               min(country_iso)                                           AS country_iso,
                count(*)                                                   AS ip_count,
                count(*) FILTER (WHERE risk_tier IN ('critical','high','medium')) AS threat_ip_count,
                sum(pkt_count)                                             AS pkt_total,
@@ -154,7 +154,7 @@ def run(args: argparse.Namespace) -> int:
     port_rows = con.execute("""
         WITH ranked AS (
             SELECT a.asn, p.dst_port, count(*) AS n,
-                   row_number() OVER (PARTITION BY a.asn ORDER BY count(*) DESC) AS rk
+                   row_number() OVER (PARTITION BY a.asn ORDER BY count(*) DESC, p.dst_port ASC) AS rk
             FROM packets p
             JOIN asn_ip a ON p.src_ip = a.src_ip
             WHERE p.dst_port IS NOT NULL
@@ -171,7 +171,7 @@ def run(args: argparse.Namespace) -> int:
         fam_rows = con.execute(f"""
             WITH ranked AS (
                 SELECT a.asn, b.family, count(DISTINCT p.src_ip) AS ips,
-                       row_number() OVER (PARTITION BY a.asn ORDER BY count(DISTINCT p.src_ip) DESC) AS rk
+                       row_number() OVER (PARTITION BY a.asn ORDER BY count(DISTINCT p.src_ip) DESC, b.family ASC) AS rk
                 FROM packets p
                 JOIN asn_ip a ON p.src_ip = a.src_ip
                 JOIN read_parquet('{botnet_path}') b ON p.payload_sha256 = b.payload_sha256
@@ -187,7 +187,7 @@ def run(args: argparse.Namespace) -> int:
         prb_rows = con.execute(f"""
             WITH ranked AS (
                 SELECT a.asn, p.probe_tag, count(DISTINCT i.src_ip) AS ips,
-                       row_number() OVER (PARTITION BY a.asn ORDER BY count(DISTINCT i.src_ip) DESC) AS rk
+                       row_number() OVER (PARTITION BY a.asn ORDER BY count(DISTINCT i.src_ip) DESC, p.probe_tag ASC) AS rk
                 FROM iocs i
                 JOIN asn_ip a ON i.src_ip = a.src_ip
                 JOIN read_parquet('{probesigs_path}') p ON i.value = p.uri

@@ -17,7 +17,7 @@ combination from the preference order:
     2. openai   (openai SDK)            openai.key.txt
     3. xai      (openai SDK, x.ai URL)  xai.key.txt
     4. mistral  (mistralai SDK)         mistral.key.txt
-    5. gemini   (google-generativeai)   gemini.key.txt
+    5. gemini   (google-genai SDK)       gemini.key.txt
 
 If no provider has both a key file AND an installed SDK, the stage
 prints a one-line notice and exits 0 - the rest of the pipeline
@@ -152,14 +152,18 @@ def _call_mistral(api_key, model, prompt):
         raise
 
 
-@_register("gemini", "gemini.key.txt", "gemini-2.5-pro", "google.generativeai")
+@_register("gemini", "gemini.key.txt", "gemini-2.5-pro", "google.genai")
 def _call_gemini(api_key, model, prompt):
-    import google.generativeai as genai
+    # Current SDK (google-genai); the old google-generativeai package is
+    # deprecated/EOL.  Client-based API: construct a client, generate per call.
+    from google import genai
     try:
-        genai.configure(api_key=api_key)
-        gm = genai.GenerativeModel(model)
-        resp = gm.generate_content(prompt,
-            generation_config={"response_mime_type": "application/json"})
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config={"response_mime_type": "application/json"},
+        )
         return _extract_json(resp.text or "")
     except Exception:
         raise

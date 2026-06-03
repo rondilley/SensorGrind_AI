@@ -30,6 +30,8 @@ import datetime as _dt
 import fnmatch
 import hashlib
 import json
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -43,6 +45,9 @@ PY = REPO_ROOT / "venv" / "bin" / "python"
 
 STAGES: dict[str, list[str]] = {
     "analyzers":    [str(SRC / "sgquery.py")],
+    # derived packets layout clustered by source ASN/CIDR/IP (see
+    # cluster_packets.py); built once per parse, consumers read bounded windows
+    "cluster":      [str(SRC / "cluster_packets.py")],
     "features":     [str(SRC / "features" / "build_ip_features.py")],
     "model":        [str(SRC / "models" / "train_threat_classifier.py")],
     "score":        [str(SRC / "models" / "score_threats.py")],
@@ -79,6 +84,8 @@ STAGES: dict[str, list[str]] = {
     "dnstlsintel":   [str(SRC / "dnstlsintel.py")],
     "selfmimic":     [str(SRC / "selfmimic.py")],
     "adversarysim":  [str(SRC / "adversarysim.py")],
+    # --- v2.7 chain-fingerprint (packet choreography) per ListonCon 2023 ---
+    "chainfp":       [str(SRC / "chainfp.py")],
     # --- v2.6 cross-analyzer correlator + AI-written conclusions ---
     "correlate":    [str(SRC / "conclusions" / "correlate.py")],
     "conclude":     [str(SRC / "conclusions" / "synthesize.py")],
@@ -97,6 +104,15 @@ ORDER = list(STAGES.keys())
 # That's the safe default — better to redo work than silently use stale
 # outputs.  Add an entry when you're confident in the I/O contract.
 STAGE_IO: dict[str, dict[str, list[str]]] = {
+    "cluster": {
+        "inputs":  ["output/parquet/packets/**/*.parquet",
+                    "output/parquet/l7_events/**/*.parquet",
+                    "output/parquet/iocs/**/*.parquet",
+                    "src/cluster_packets.py"],
+        "outputs": ["output/parquet/packets_clustered/**/*.parquet",
+                    "output/parquet/l7_events_clustered/**/*.parquet",
+                    "output/parquet/iocs_clustered/**/*.parquet"],
+    },
     "features": {
         "inputs":  ["data/parsed/**/*.parquet", "src/features/**/*.py"],
         "outputs": ["data/features/ip/**/*.parquet"],
@@ -145,7 +161,11 @@ STAGE_IO: dict[str, dict[str, list[str]]] = {
 # requirement.  The DAG planner takes the UNION of these edges and the
 # edges inferred from STAGE_IO glob overlap.
 EXPLICIT_DEPS: dict[str, list[str]] = {
-    "features":     ["analyzers"],
+    # cluster reads raw packets (not analyzer outputs), so this edge is purely
+    # for scheduling: it keeps the two heaviest DuckDB stages from running
+    # concurrently in --parallel mode (memory pressure).
+    "cluster":      ["analyzers"],
+    "features":     ["analyzers", "cluster"],
     "model":        ["features"],
     "score":        ["model"],
     "risk":         ["score"],
@@ -173,22 +193,26 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
     "aipayloaddecode": ["nonipproto"],
     # asnintel and cidrintel join packets against per-IP features AND
     # the risk-scored IP set (risk tier, threat density, ASN/CIDR rollups).
-    "asnintel":        ["analyzers", "features", "risk"],
+    "asnintel":        ["analyzers", "features", "risk", "cluster"],
     "cidrintel":       ["analyzers", "features", "risk"],
     "tooling":         ["analyzers"],
     # actorlink walks the medium+ risk-tier IPs through tooling fingerprints;
     # exits if risk is missing.
-    "actorlink":       ["analyzers", "tooling", "risk"],
+    "actorlink":       ["analyzers", "tooling", "risk", "cluster"],
     "originintel":     ["actorlink"],
     "slowlow":         ["analyzers"],
     "dnstlsintel":     ["analyzers"],
     "selfmimic":       ["analyzers"],
+    # chainfp reads packets parquet directly; the cluster edge is purely for
+    # scheduling -- it keeps chainfp's heavy DuckDB aggregate from running
+    # concurrently with the cluster sort in --parallel mode (memory).
+    "chainfp":         ["analyzers", "cluster"],
     # correlate reads every per-analyzer parquet + the risk snapshot;
     # depend broadly so it runs after everything it might join against.
     "correlate":       ["risk", "nonipproto", "protocolanomaly",
                         "asnintel", "cidrintel", "tooling", "slowlow",
                         "selfmimic", "isc_compare", "coordination",
-                        "chains"],
+                        "chains", "chainfp"],
     "conclude":        ["correlate"],
     # adversarysim consults other analyzers' outputs for coverage scoring;
     # depending on a broad set of stages keeps it last among siblings.
@@ -205,6 +229,7 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
                      "aipayloaddecode", "asnintel", "cidrintel", "tooling",
                      "actorlink", "originintel",
                      "slowlow", "dnstlsintel", "selfmimic",
+                     "chainfp",
                      "correlate", "conclude"],
     "aireview":     ["report"],
 }
@@ -273,6 +298,57 @@ def topological_order(deps: dict[str, set[str]],
 # Where we cache freshness state.
 _FRESH_CACHE = REPO_ROOT / ".evolve" / "freshness.json"
 
+# Per-stage output is tee'd to a clean log file here, so the real error is
+# recoverable even when parallel stages interleave on the console.
+LOG_DIR = REPO_ROOT / ".evolve" / "logs"
+
+# Every run also auto-captures the full combined console output here, so a run
+# is never lost just because it wasn't manually `| tee`'d.
+RUN_LOG_DIR = REPO_ROOT / "output" / "logs"
+
+
+class _Tee:
+    """Duplicate writes to several streams (e.g. real stderr + a run log).
+
+    Used to capture the whole run to a file without the caller having to
+    redirect.  Best-effort: a write that fails on one stream still reaches
+    the others, so a full disk on the log file never crashes the pipeline.
+    """
+
+    def __init__(self, *streams):
+        self._streams = [s for s in streams if s is not None]
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+            except (OSError, ValueError):
+                pass
+        return len(data)
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except (OSError, ValueError):
+                pass
+
+    def isatty(self):
+        # Preserve TTY semantics of the primary (first) stream.
+        return bool(self._streams) and getattr(
+            self._streams[0], "isatty", lambda: False)()
+
+
+def _stage_log(name: str) -> Path:
+    return LOG_DIR / f"{name}.log"
+
+
+def _tail(path: Path, n: int = 20) -> list[str]:
+    try:
+        return path.read_text(errors="replace").splitlines()[-n:]
+    except OSError:
+        return []
+
 
 def _resolve_globs(patterns: list[str]) -> list[Path]:
     found: list[Path] = []
@@ -338,25 +414,208 @@ def is_fresh(name: str, cmd: list[str], cache: dict) -> tuple[bool, str]:
 
 _CACHE_LOCK = threading.Lock()
 
+# --- memory governance (Linux /proc-based; psutil not required) ----------
+# A stage that misbehaves on memory gets stopped gracefully and logged
+# BEFORE the kernel OOM-killer sends an opaque SIGKILL.  Tunable via env:
+#   SG_MEM_GUARD=0        disable the watchdog entirely
+#   SG_MEM_FLOOR_MB       stop a stage when system MemAvailable drops below
+#                         this (default 2048) AND the stage is a memory hog
+#   SG_MEM_BLAME_MB       only blame/stop stages whose own RSS exceeds this
+#                         (default 2048) -- don't kill small stages
+#   SG_MEM_HARD_CAP_MB    hard per-stage RSS ceiling (default 0 = off)
+#   SG_MEM_SAMPLE_SEC     sampling cadence (default 5)
+#   SG_MEM_LOG_SEC        telemetry log cadence (default 30)
+try:
+    _PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024
+except (ValueError, OSError, AttributeError):
+    _PAGE_KB = 4
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _mem_available_mb() -> int | None:
+    """System MemAvailable in MiB, or None if /proc isn't readable."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _proc_rss_mb(pid: int) -> int | None:
+    """Resident set size of ``pid`` in MiB (DuckDB's threads are in-process,
+    so this covers them), or None if the process/proc isn't readable."""
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            resident_pages = int(f.read().split()[1])
+        return resident_pages * _PAGE_KB // 1024
+    except (OSError, ValueError):
+        return None
+
+
+class MemoryWatchdog(threading.Thread):
+    """Samples a stage's RSS + system available memory, logs telemetry, and
+    stops the stage gracefully before it can trigger the OOM-killer."""
+
+    def __init__(self, pid: int, name: str):
+        super().__init__(daemon=True)
+        self.pid = pid
+        self.name = name
+        self.floor_mb = _env_int("SG_MEM_FLOOR_MB", 2048)
+        self.blame_mb = _env_int("SG_MEM_BLAME_MB", 2048)
+        self.hard_cap_mb = _env_int("SG_MEM_HARD_CAP_MB", 0)
+        self.sample_sec = max(1, _env_int("SG_MEM_SAMPLE_SEC", 5))
+        self.log_sec = max(1, _env_int("SG_MEM_LOG_SEC", 30))
+        self._stop_evt = threading.Event()
+        self.killed = False
+        self.reason = ""
+
+    def run(self) -> None:
+        if not Path("/proc").is_dir():
+            return
+        last_log = 0.0
+        while not self._stop_evt.wait(self.sample_sec):
+            rss = _proc_rss_mb(self.pid)
+            avail = _mem_available_mb()
+            if rss is None:
+                continue
+            now = time.monotonic()
+            if now - last_log >= self.log_sec:
+                a = f"{avail/1024:.1f}G" if avail is not None else "?"
+                print(f"[evolve] mem: stage={self.name} "
+                      f"rss={rss/1024:.1f}G sys_avail={a}", file=sys.stderr)
+                last_log = now
+            reason = ""
+            if self.hard_cap_mb and rss > self.hard_cap_mb:
+                reason = (f"stage RSS {rss/1024:.1f}G exceeded hard cap "
+                          f"{self.hard_cap_mb/1024:.1f}G")
+            elif (avail is not None and avail < self.floor_mb
+                  and rss > self.blame_mb):
+                reason = (f"system memory low (avail {avail/1024:.1f}G < floor "
+                          f"{self.floor_mb/1024:.1f}G) while stage holds "
+                          f"{rss/1024:.1f}G")
+            if reason:
+                self.killed = True
+                self.reason = reason
+                print(f"[evolve] MEMORY GUARD: stopping stage '{self.name}' "
+                      f"-- {reason}", file=sys.stderr)
+                try:
+                    os.kill(self.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                # Give it a few seconds to exit cleanly, then SIGKILL.
+                if not self._stop_evt.wait(8):
+                    try:
+                        os.kill(self.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                return
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+
+
+def _terminate(proc: subprocess.Popen, grace: float = 10.0) -> None:
+    """Best-effort graceful stop of a stage's child process.
+
+    On Ctrl+C the child shares our process group and has already received
+    the same SIGINT, so first give it ``grace`` seconds to exit on its own,
+    then escalate SIGTERM -> SIGKILL so nothing is left running.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except (OSError, ValueError):
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except (OSError, ValueError):
+        return
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+
 
 def run_stage(name: str, cache: dict, force: bool,
-              no_cache: bool) -> tuple[bool, bool]:
-    """Run a single stage. Returns (success, skipped)."""
+              no_cache: bool) -> tuple[bool, bool, str]:
+    """Run a single stage. Returns (success, skipped, detail).
+
+    ``detail`` is empty on success/skip and a short failure reason
+    (e.g. ``"exit 1"``) otherwise.  The stage's combined stdout+stderr is
+    tee'd to ``.evolve/logs/<name>.log`` so the real error is recoverable
+    even when parallel stages interleave on the console.
+    """
     cmd = [str(PY)] + STAGES[name]
     if not force:
         fresh, why = is_fresh(name, cmd, cache)
         if fresh:
             print(f"[evolve] STAGE: {name} -- skipped ({why})",
                   file=sys.stderr)
-            return True, True
+            return True, True, ""
     print(f"\n{'='*60}\n[evolve] STAGE: {name}\n{'='*60}", file=sys.stderr)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = _stage_log(name)
     t0 = time.time()
-    r = subprocess.run(cmd, cwd=REPO_ROOT)
+    wd: MemoryWatchdog | None = None
+    try:
+        with open(log_path, "w", buffering=1) as logf:  # line-buffered
+            proc = subprocess.Popen(
+                cmd, cwd=REPO_ROOT,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            if os.environ.get("SG_MEM_GUARD", "1") != "0":
+                wd = MemoryWatchdog(proc.pid, name)
+                wd.start()
+            assert proc.stdout is not None
+            try:
+                for line in proc.stdout:
+                    sys.stderr.write(line)
+                    logf.write(line)
+                proc.wait()
+            except KeyboardInterrupt:
+                # Ctrl+C: stop the child cleanly, then propagate so the
+                # orchestrator can shut the whole run down gracefully.
+                print(f"\n[evolve] {name} interrupted -- stopping child...",
+                      file=sys.stderr)
+                _terminate(proc)
+                logf.flush()
+                raise
+            finally:
+                if wd is not None:
+                    wd.stop()
+                    wd.join(timeout=2)
+        rc = proc.returncode
+    except OSError as e:
+        print(f"[evolve] {name} could not launch: {e}", file=sys.stderr)
+        return False, False, f"launch error: {e}"
     elapsed = time.time() - t0
-    if r.returncode != 0:
-        print(f"[evolve] {name} FAILED (exit {r.returncode}, {elapsed:.1f}s)",
-              file=sys.stderr)
-        return False, False
+    if wd is not None and wd.killed:
+        print(f"[evolve] {name} STOPPED by memory guard ({elapsed:.1f}s) "
+              f"-- {wd.reason} -- full log: {log_path}", file=sys.stderr)
+        return False, False, f"stopped: memory guard ({wd.reason})"
+    if rc != 0:
+        print(f"[evolve] {name} FAILED (exit {rc}, {elapsed:.1f}s) "
+              f"-- full log: {log_path}", file=sys.stderr)
+        return False, False, f"exit {rc}"
     print(f"[evolve] {name} ok ({elapsed:.1f}s)", file=sys.stderr)
     if not no_cache and name in STAGE_IO:
         with _CACHE_LOCK:
@@ -366,13 +625,19 @@ def run_stage(name: str, cache: dict, force: bool,
                 "elapsed_sec": elapsed,
             }
             _save_cache(cache)
-    return True, False
+    return True, False, ""
 
 
 def run_dag(chosen: list[str], deps: dict[str, set[str]],
             cache: dict, force: bool, no_cache: bool,
-            workers: int) -> tuple[int, int, int]:
-    """DAG-aware runner.  Returns (passed, skipped, failed)."""
+            workers: int) -> tuple[int, int, int, set[str],
+                                   dict[str, str], bool]:
+    """DAG-aware runner.
+
+    Returns (passed, skipped, failed, failed_stages, failure_reason,
+    interrupted).  ``failure_reason`` maps each failed stage to a short
+    cause string; ``interrupted`` is True if the run was stopped by Ctrl+C.
+    """
     chosen_set = set(chosen)
     # Filter deps to chosen subset (an excluded parent doesn't block).
     remaining: dict[str, set[str]] = {
@@ -380,24 +645,33 @@ def run_dag(chosen: list[str], deps: dict[str, set[str]],
     }
     passed = skipped = failed = 0
     failed_stages: set[str] = set()
+    failure_reason: dict[str, str] = {}
     in_flight: dict[Future, str] = {}
     completed: set[str] = set()
+    interrupted = False
 
     def can_launch(s: str) -> bool:
-        return (s not in completed and s not in in_flight.values()
-                and not remaining[s])
+        # NOTE: must exclude failed_stages -- otherwise a stage that fails
+        # (and isn't in `completed`) stays launchable and gets relaunched
+        # every loop iteration, looping forever on a deterministic failure.
+        return (s not in completed and s not in failed_stages
+                and s not in in_flight.values() and not remaining[s])
 
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    pool = ProcessPoolExecutor(max_workers=workers)
+    try:
         while len(completed) + len(failed_stages) < len(chosen):
             # Launch every currently-ready stage, up to the pool size.
             ready_now = sorted(s for s in chosen if can_launch(s))
             for s in ready_now:
                 # Skip if any parent failed -> mark as failed without running.
-                parent_fail = bool(set(deps[s]) & failed_stages)
-                if parent_fail:
+                bad_parents = sorted(set(deps[s]) & failed_stages)
+                if bad_parents:
                     print(f"[evolve] STAGE: {s} -- aborted "
-                          f"(upstream failure)", file=sys.stderr)
+                          f"(blocked by failed: {', '.join(bad_parents)})",
+                          file=sys.stderr)
                     failed_stages.add(s)
+                    failure_reason[s] = (
+                        f"upstream failure: {', '.join(bad_parents)}")
                     failed += 1
                     for other in chosen:
                         remaining[other].discard(s)
@@ -412,16 +686,17 @@ def run_dag(chosen: list[str], deps: dict[str, set[str]],
                       file=sys.stderr)
                 for s in missing:
                     failed_stages.add(s)
+                    failure_reason[s] = "DAG deadlock (unsatisfiable deps)"
                     failed += 1
                 break
             done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
             for fut in done:
                 s = in_flight.pop(fut)
                 try:
-                    ok, was_skipped = fut.result()
+                    ok, was_skipped, detail = fut.result()
                 except Exception as e:
                     print(f"[evolve] {s} crashed: {e}", file=sys.stderr)
-                    ok, was_skipped = False, False
+                    ok, was_skipped, detail = False, False, f"crashed: {e}"
                 if ok and was_skipped:
                     skipped += 1
                     completed.add(s)
@@ -431,9 +706,61 @@ def run_dag(chosen: list[str], deps: dict[str, set[str]],
                 else:
                     failed += 1
                     failed_stages.add(s)
+                    failure_reason[s] = detail or "failed"
                 for child in chosen:
                     remaining[child].discard(s)
-    return passed, skipped, failed
+    except KeyboardInterrupt:
+        interrupted = True
+        not_run = [s for s in chosen
+                   if s not in completed and s not in failed_stages]
+        print(f"\n[evolve] interrupted by user (Ctrl+C) -- cancelling "
+              f"{len(not_run)} not-yet-finished stage(s) and stopping "
+              f"workers...", file=sys.stderr)
+        for s in not_run:
+            failed_stages.add(s)
+            failure_reason[s] = "interrupted (not finished)"
+    finally:
+        # Never block waiting on in-flight stages: cancel what's queued and
+        # let the workers (which got the same SIGINT) wind down.
+        pool.shutdown(wait=False, cancel_futures=True)
+    return passed, skipped, failed, failed_stages, failure_reason, interrupted
+
+
+def _print_failure_summary(failed_stages: set[str],
+                           failure_reason: dict[str, str],
+                           deps: dict[str, set[str]]) -> None:
+    """Separate the stage(s) that actually broke from those merely blocked
+    behind them, and show the real error tail for each root cause."""
+    # Stages merely cut short by Ctrl+C aren't real failures; the run's
+    # "(INTERRUPTED)" banner already covers them, so don't list them here.
+    shown = {s for s in failed_stages
+             if not failure_reason.get(s, "").startswith("interrupted")}
+    if not shown:
+        return
+    # A root cause is a failed stage none of whose parents also failed.
+    roots = sorted(s for s in shown
+                   if not (set(deps[s]) & failed_stages))
+    cascaded = sorted(shown - set(roots))
+
+    print(f"\n{'='*60}\n[evolve] FAILURE SUMMARY\n{'='*60}", file=sys.stderr)
+    print("[evolve] root cause(s) -- these stages actually failed:",
+          file=sys.stderr)
+    for s in roots:
+        print(f"  [FAIL] {s}: {failure_reason.get(s, 'failed')}",
+              file=sys.stderr)
+        log_path = _stage_log(s)
+        tail = _tail(log_path)
+        if tail:
+            print(f"      --- last {len(tail)} lines of {log_path} ---",
+                  file=sys.stderr)
+            for ln in tail:
+                print(f"      | {ln}", file=sys.stderr)
+    if cascaded:
+        print("[evolve] not run (blocked by the failure(s) above):",
+              file=sys.stderr)
+        for s in cascaded:
+            bad = sorted(set(deps[s]) & failed_stages)
+            print(f"  - {s}  (waiting on: {', '.join(bad)})", file=sys.stderr)
 
 
 def main() -> int:
@@ -456,6 +783,11 @@ def main() -> int:
                          "EXPLICIT_DEPS.")
     ap.add_argument("--show-dag", action="store_true",
                     help="Print the computed dependency graph and exit.")
+    ap.add_argument("--no-run-log", action="store_true",
+                    help="Do not auto-capture this run to "
+                         "output/logs/evolve_<timestamp>.log. By default "
+                         "every run is logged there in addition to the "
+                         "console, so a run is never lost.")
     args = ap.parse_args()
 
     if args.list:
@@ -472,51 +804,101 @@ def main() -> int:
             print(f"{s} <- {', '.join(parents) if parents else '(none)'}")
         return 0
 
-    chosen = args.stages or ORDER
-    bad = [s for s in chosen if s not in STAGES]
-    if bad:
-        print(f"Unknown stages: {bad}\nKnown: {ORDER}", file=sys.stderr)
-        return 2
+    # --- auto run log: capture the whole run to a timestamped file so a
+    # run is never lost just because it wasn't manually redirected. ---
+    orig_stdout, orig_stderr = sys.stdout, sys.stderr
+    run_log_fh = None
+    if not args.no_run_log:
+        try:
+            RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            run_log_path = RUN_LOG_DIR / f"evolve_{stamp}.log"
+            run_log_fh = open(run_log_path, "w", buffering=1)  # line-buffered
+            sys.stdout = _Tee(orig_stdout, run_log_fh)
+            sys.stderr = _Tee(orig_stderr, run_log_fh)
+            print(f"[evolve] run log: {run_log_path}", file=sys.stderr)
+        except OSError as e:
+            print(f"[evolve] WARNING: could not open run log ({e}); "
+                  f"continuing with console output only", file=sys.stderr)
+            run_log_fh = None
 
-    chosen = [s for s in chosen if s not in args.skip]
-    # Topological order so even sequential runs respect the DAG.
-    deps = build_dependency_graph()
     try:
-        chosen = topological_order(deps, chosen)
-    except RuntimeError as e:
-        print(f"[evolve] {e}", file=sys.stderr)
-        return 2
-    print(f"[evolve] running stages (topo order): {chosen}", file=sys.stderr)
+        chosen = args.stages or ORDER
+        bad = [s for s in chosen if s not in STAGES]
+        if bad:
+            print(f"Unknown stages: {bad}\nKnown: {ORDER}", file=sys.stderr)
+            return 2
 
-    cache = {} if args.no_cache else _load_cache()
-    t0 = time.time()
-    if args.parallel and args.parallel > 1:
-        passed, skipped, failed = run_dag(
-            chosen, deps, cache, args.force, args.no_cache, args.parallel,
-        )
-    else:
+        chosen = [s for s in chosen if s not in args.skip]
+        # Topological order so even sequential runs respect the DAG.
+        deps = build_dependency_graph()
+        try:
+            chosen = topological_order(deps, chosen)
+        except RuntimeError as e:
+            print(f"[evolve] {e}", file=sys.stderr)
+            return 2
+        print(f"[evolve] running stages (topo order): {chosen}",
+              file=sys.stderr)
+
+        cache = {} if args.no_cache else _load_cache()
+        t0 = time.time()
         passed = failed = skipped = 0
         failed_stages: set[str] = set()
-        for s in chosen:
-            if set(deps[s]) & failed_stages:
-                print(f"[evolve] STAGE: {s} -- aborted (upstream failure)",
-                      file=sys.stderr)
-                failed += 1
-                failed_stages.add(s)
-                continue
-            ok, was_skipped = run_stage(s, cache, args.force, args.no_cache)
-            if ok and was_skipped:
-                skipped += 1
-            elif ok:
-                passed += 1
+        failure_reason: dict[str, str] = {}
+        interrupted = False
+        try:
+            if args.parallel and args.parallel > 1:
+                # run_dag handles Ctrl+C internally and reports it back.
+                (passed, skipped, failed, failed_stages,
+                 failure_reason, interrupted) = run_dag(
+                    chosen, deps, cache, args.force, args.no_cache,
+                    args.parallel,
+                )
             else:
-                failed += 1
-                failed_stages.add(s)
-    elapsed = time.time() - t0
-    print(f"\n[evolve] done: {passed} ran, {skipped} skipped, "
-          f"{failed} failed in {elapsed:.0f}s",
-          file=sys.stderr)
-    return 1 if failed else 0
+                for s in chosen:
+                    bad_parents = sorted(set(deps[s]) & failed_stages)
+                    if bad_parents:
+                        print(f"[evolve] STAGE: {s} -- aborted "
+                              f"(blocked by failed: {', '.join(bad_parents)})",
+                              file=sys.stderr)
+                        failed += 1
+                        failed_stages.add(s)
+                        failure_reason[s] = (
+                            f"upstream failure: {', '.join(bad_parents)}")
+                        continue
+                    ok, was_skipped, detail = run_stage(
+                        s, cache, args.force, args.no_cache)
+                    if ok and was_skipped:
+                        skipped += 1
+                    elif ok:
+                        passed += 1
+                    else:
+                        failed += 1
+                        failed_stages.add(s)
+                        failure_reason[s] = detail or "failed"
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\n[evolve] interrupted by user (Ctrl+C) -- stopping "
+                  "after the current stage; partial results kept.",
+                  file=sys.stderr)
+
+        elapsed = time.time() - t0
+        _print_failure_summary(failed_stages, failure_reason, deps)
+        print(f"\n[evolve] done: {passed} ran, {skipped} skipped, "
+              f"{failed} failed in {elapsed:.0f}s"
+              f"{' (INTERRUPTED)' if interrupted else ''}",
+              file=sys.stderr)
+        if interrupted:
+            return 130  # conventional exit code for SIGINT
+        return 1 if failed else 0
+    finally:
+        # Restore the real streams and flush/close the run log.
+        sys.stdout, sys.stderr = orig_stdout, orig_stderr
+        if run_log_fh is not None:
+            try:
+                run_log_fh.close()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

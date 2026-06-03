@@ -818,15 +818,28 @@ BATCH_ROWS_IOCS    = 10000  # iocs are tiny strings
 
 
 class StreamingTableWriter:
-    """Emits one ``part-NNNN.parquet`` file per flush; no persistent
-    ParquetWriter objects so memory is fully released between flushes."""
+    """One Parquet file per (table, day): each flush appends a row group to a
+    persistent ParquetWriter rather than emitting a new file, so a day with
+    millions of rows is one file of many row groups instead of hundreds of
+    tiny part-files.  Memory stays flat -- only one ``batch_rows`` buffer is
+    materialized at a time; the writer just accumulates (small) footer
+    metadata until the day is closed.
 
-    def __init__(self, base: Path, label: str, schema: pa.Schema, batch_rows: int):
+    The merged log is ~time-sorted, so a day's writer is opened on first row
+    and closed (finalized) by ``close_day`` once that day goes idle.  If a
+    finalized day reappears later (clock skew / out-of-order), a fresh
+    ``part-NNNN`` file is started so nothing is clobbered."""
+
+    def __init__(self, base: Path, label: str, schema: pa.Schema,
+                 batch_rows: int, rows_per_part: int = 500_000):
         self.base = base
         self.label = label
         self.schema = schema
-        self.batch_rows = batch_rows
+        self.batch_rows = batch_rows          # row-group size (memory bound)
+        self.rows_per_part = max(batch_rows, rows_per_part)  # file roll size
         self._buffers: dict[str, list[dict]] = {}
+        self._writers: dict[str, pq.ParquetWriter] = {}
+        self._cur_rows: dict[str, int] = {}   # rows in the day's open file
         self._part_no: dict[str, int] = {}
         self._row_counts: dict[str, int] = {}
 
@@ -835,49 +848,66 @@ class StreamingTableWriter:
         buf = self._buffers.setdefault(day, [])
         buf.append(row)
         if len(buf) >= self.batch_rows:
-            self._flush_day(day)
+            self._flush_batch(day)
 
-    def _flush_day(self, day: str) -> None:
-        buf = self._buffers.get(day)
-        if not buf:
-            return
+    def _open(self, day: str) -> pq.ParquetWriter:
         n = self._part_no.get(day, 0)
         out_dir = self.base / self.label / f"dt={day}"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"part-{n:04d}.parquet"
+        w = pq.ParquetWriter(out_path, self.schema,
+                             compression="zstd", compression_level=3)
+        self._writers[day] = w
+        self._cur_rows[day] = 0
+        return w
+
+    def _close(self, day: str) -> None:
+        w = self._writers.pop(day, None)
+        if w is not None:
+            w.close()
+            self._part_no[day] = self._part_no.get(day, 0) + 1
+        self._cur_rows.pop(day, None)
+
+    def _flush_batch(self, day: str) -> None:
+        buf = self._buffers.get(day)
+        if not buf:
+            return
+        writer = self._writers.get(day) or self._open(day)
         table = pa.Table.from_pylist(buf, schema=self.schema)
-        pq.write_table(table, out_path, compression="zstd", compression_level=3)
-        # Drop references so Python can free memory before next batch.
+        writer.write_table(table)  # appends one row group; releases the batch
         del table
+        self._cur_rows[day] += len(buf)
         self._row_counts[day] = self._row_counts.get(day, 0) + len(buf)
-        self._part_no[day]    = n + 1
         buf.clear()
+        # Roll to a fresh part file once this one reaches rows_per_part.
+        if self._cur_rows[day] >= self.rows_per_part:
+            self._close(day)
 
     def close_day(self, day: str) -> None:
-        self._flush_day(day)
+        self._flush_batch(day)
+        self._close(day)
         self._buffers.pop(day, None)
 
     def close_all(self) -> None:
-        for day in list(self._buffers.keys()):
-            self._flush_day(day)
-        self._buffers.clear()
+        for day in list(set(self._buffers) | set(self._writers)):
+            self.close_day(day)
 
     def stats(self) -> dict[str, int]:
         return dict(self._row_counts)
 
 
-def writer_loop(q: mp.Queue, out_base: Path, idle_close_after: int, stats_q: mp.Queue, max_blob_dedup: int = 20_000_000) -> None:
+def writer_loop(q: mp.Queue, out_base: Path, idle_close_after: int, stats_q: mp.Queue, max_blob_dedup: int = 20_000_000, rows_per_part: int = 500_000) -> None:
     import gc
     gc.set_threshold(1000, 10, 10)  # more aggressive GC for the writer
 
     """Consume worker batches from ``q``. One streaming ParquetWriter per
-    (table, day). Closes a day's writers once ``idle_close_after`` consecutive
-    batches arrive containing no rows for that day.
+    (table, day), rolled every ``rows_per_part`` rows. Closes a day's writers
+    once ``idle_close_after`` consecutive batches arrive with no rows for it.
     """
-    packets_w = StreamingTableWriter(out_base, "packets",       PACKETS_SCHEMA, BATCH_ROWS_PACKETS)
-    blobs_w   = StreamingTableWriter(out_base, "payload_blobs", BLOBS_SCHEMA,   BATCH_ROWS_BLOBS)
-    l7_w      = StreamingTableWriter(out_base, "l7_events",     L7_SCHEMA,      BATCH_ROWS_L7)
-    iocs_w    = StreamingTableWriter(out_base, "iocs",          IOCS_SCHEMA,    BATCH_ROWS_IOCS)
+    packets_w = StreamingTableWriter(out_base, "packets",       PACKETS_SCHEMA, BATCH_ROWS_PACKETS, rows_per_part)
+    blobs_w   = StreamingTableWriter(out_base, "payload_blobs", BLOBS_SCHEMA,   BATCH_ROWS_BLOBS,   rows_per_part)
+    l7_w      = StreamingTableWriter(out_base, "l7_events",     L7_SCHEMA,      BATCH_ROWS_L7,      rows_per_part)
+    iocs_w    = StreamingTableWriter(out_base, "iocs",          IOCS_SCHEMA,    BATCH_ROWS_IOCS,    rows_per_part)
 
     # Global blob dedup using truncated 64-bit keys (first 8 bytes of SHA-256).
     # Collision probability with 30M entries in 2^64 space is ~2.4e-8.
@@ -1066,7 +1096,7 @@ def main() -> int:
     stats_q: mp.Queue = mp.Queue()
     writer = mp.Process(target=writer_loop,
                         args=(out_q, out_base, args.idle_close_after, stats_q,
-                              args.max_blob_dedup),
+                              args.max_blob_dedup, args.rows_per_part),
                         daemon=False)
     writer.start()
 

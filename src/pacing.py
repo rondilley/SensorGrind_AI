@@ -23,7 +23,9 @@ the top-N IPs by packet count to keep memory predictable.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pyarrow as pa
@@ -60,37 +62,48 @@ def run(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     top_n = args.top_ips
-    print(f"[pacing] selecting top {top_n:,} IPs by packet count...",
-          file=sys.stderr)
+    # Process the top IPs in hash(src_ip) buckets: the IAT window-sort and the
+    # per-IP median/quantile_cont buffers (non-spillable) over the highest-
+    # volume IPs were holding 40G+ and tripping the memory guard.  Bucketing
+    # bounds each pass to 1/N of the IPs; each IP is wholly in one bucket so
+    # its stats are exact.
+    n_buckets = max(1, int(os.environ.get("SG_PACING_BUCKETS", "8")))
+    print(f"[pacing] selecting top {top_n:,} IPs by packet count "
+          f"({n_buckets} buckets)...", file=sys.stderr)
     con.execute(f"""
         CREATE TEMP TABLE pace_ips AS
-        SELECT src_ip FROM packets
-        GROUP BY src_ip
-        HAVING count(*) >= {args.min_packets}
-        ORDER BY count(*) DESC LIMIT {top_n}
+        SELECT src_ip, (hash(src_ip) % {n_buckets})::INT AS bkt FROM (
+            SELECT src_ip FROM packets
+            GROUP BY src_ip
+            HAVING count(*) >= {args.min_packets}
+            ORDER BY count(*) DESC LIMIT {top_n}
+        )
     """)
 
     print("[pacing] computing per-IP inter-arrival distributions...",
           file=sys.stderr)
-    rows = con.execute(f"""
-        WITH paced AS (
-            SELECT p.src_ip,
-                   EXTRACT(EPOCH FROM p.ts - LAG(p.ts) OVER (
-                       PARTITION BY p.src_ip ORDER BY p.ts)) AS iat
-            FROM packets p
-            SEMI JOIN pace_ips t ON p.src_ip = t.src_ip
-        )
-        SELECT src_ip,
-               count(*) AS pkt_count,
-               median(iat) AS iat_median,
-               quantile_cont(iat, 0.95) AS iat_p95,
-               quantile_cont(iat, 0.99) AS iat_p99,
-               stddev_pop(iat) AS iat_std,
-               avg(iat) AS iat_mean
-        FROM paced
-        WHERE iat IS NOT NULL
-        GROUP BY src_ip
-    """).fetchall()
+    rows = []
+    for k in range(n_buckets):
+        rows += con.execute(f"""
+            WITH paced AS (
+                SELECT p.src_ip,
+                       EXTRACT(EPOCH FROM p.ts - LAG(p.ts) OVER (
+                           PARTITION BY p.src_ip ORDER BY p.ts)) AS iat
+                FROM packets p
+                SEMI JOIN (SELECT src_ip FROM pace_ips WHERE bkt = {k}) t
+                  ON p.src_ip = t.src_ip
+            )
+            SELECT src_ip,
+                   count(*) AS pkt_count,
+                   median(iat) AS iat_median,
+                   quantile_cont(iat, 0.95) AS iat_p95,
+                   quantile_cont(iat, 0.99) AS iat_p99,
+                   stddev_pop(iat) AS iat_std,
+                   avg(iat) AS iat_mean
+            FROM paced
+            WHERE iat IS NOT NULL
+            GROUP BY src_ip
+        """).fetchall()
     print(f"[pacing] {len(rows):,} IPs profiled", file=sys.stderr)
 
     out_rows: list[dict] = []
@@ -120,25 +133,32 @@ def run(args: argparse.Namespace) -> int:
                    compression="zstd", compression_level=3)
 
     print("[pacing] connection-duration distribution...", file=sys.stderr)
-    flow_rows = con.execute("""
-        WITH flows AS (
-            SELECT p.src_ip, p.dst_ip, p.src_port, p.dst_port,
-                   EXTRACT(EPOCH FROM max(p.ts) - min(p.ts)) AS dur
-            FROM packets p
-            SEMI JOIN pace_ips t ON p.src_ip = t.src_ip
-            WHERE p.proto = 6
-            GROUP BY p.src_ip, p.dst_ip, p.src_port, p.dst_port
-        )
-        SELECT
-            CASE WHEN dur < 1 THEN '0-1s'
-                 WHEN dur < 10 THEN '1-10s'
-                 WHEN dur < 60 THEN '10-60s'
-                 WHEN dur < 300 THEN '1-5m'
-                 WHEN dur < 3600 THEN '5-60m'
-                 ELSE '>=1h' END AS dur_bucket,
-            count(*) AS flows
-        FROM flows GROUP BY dur_bucket ORDER BY flows DESC
-    """).fetchall()
+    # Same bucketing: the flows GROUP BY (4-tuple) over the top IPs' TCP packets
+    # is high-cardinality; process per IP-bucket and sum the duration histogram.
+    dur_counts: Counter = Counter()
+    for k in range(n_buckets):
+        for b, n in con.execute(f"""
+            WITH flows AS (
+                SELECT p.src_ip, p.dst_ip, p.src_port, p.dst_port,
+                       EXTRACT(EPOCH FROM max(p.ts) - min(p.ts)) AS dur
+                FROM packets p
+                SEMI JOIN (SELECT src_ip FROM pace_ips WHERE bkt = {k}) t
+                  ON p.src_ip = t.src_ip
+                WHERE p.proto = 6
+                GROUP BY p.src_ip, p.dst_ip, p.src_port, p.dst_port
+            )
+            SELECT
+                CASE WHEN dur < 1 THEN '0-1s'
+                     WHEN dur < 10 THEN '1-10s'
+                     WHEN dur < 60 THEN '10-60s'
+                     WHEN dur < 300 THEN '1-5m'
+                     WHEN dur < 3600 THEN '5-60m'
+                     ELSE '>=1h' END AS dur_bucket,
+                count(*) AS flows
+            FROM flows GROUP BY dur_bucket
+        """).fetchall():
+            dur_counts[b] += n
+    flow_rows = sorted(dur_counts.items(), key=lambda x: -x[1])
     pq.write_table(pa.Table.from_pylist(
         [{"dur_bucket": b, "flows": int(n)} for b, n in flow_rows],
         schema=FLOW_DUR_SCHEMA),
