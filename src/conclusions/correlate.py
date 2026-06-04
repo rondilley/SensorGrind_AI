@@ -152,6 +152,22 @@ CHAINFP_DISTINCTIVE_MAX     = 99
 CHAINFP_MIN_TOKENS          = 3      # 2-token "SYN+RST" is too short to be a fingerprint
 CHAINFP_TOP_DISTINCTIVE     = 15     # finding fan-out cap
 CHAINFP_TOP_RARE_BURST      = 8      # rare chains promoted by burstiness
+# Timed-chain tempo: a distinctive chain whose sources nearly all share ONE
+# timed variant (the same sequence AND the same per-source-normalized inter-
+# token cadence) is a tight mechanical/tooling fingerprint.  Above this share
+# of sources concentrating in the dominant tempo mode we flag it as such.
+CHAINFP_MECHANICAL_TEMPO    = 0.80
+
+# compositeprint rotation thresholds (Phase 3).  A behavioral fingerprint
+# (core_hash) fuses stack+sequence+tempo+app+payload and is independent of
+# infrastructure, so the SAME core_hash seen from many ASNs/CIDRs is one
+# tool/campaign deployed across rotated hosting.  We surface the ones spread
+# widely enough to matter, drop generic ping sweeps, and promote on either a
+# wide spread or a dormancy-then-return with the infrastructure changed.
+COMPOSITE_MIN_ASNS          = 3      # spans >= 3 ASNs to count as "distributed"
+COMPOSITE_HIGH_ASNS         = 8      # wide spread -> high severity
+COMPOSITE_TOP_ROTATION      = 25     # finding fan-out cap
+COMPOSITE_REEMERGE_GAP_H    = 6.0    # dormancy gap (hours) that counts as a return
 
 
 # ----------------------------------------------------------------------
@@ -923,6 +939,69 @@ def pat_recent_tight_campaign(con) -> list[dict]:
     )]
 
 
+def _timed_tempo_map(con, untimed_chains: list[str]) -> dict[str, dict]:
+    """Map each untimed chain to its timed-chain tempo decomposition.
+
+    `chainfp_timed` holds the SAME proto/port choreography as `chainfp`,
+    but with a `~<tempo>` tag appended to every token (the token's inter-
+    arrival gap bucketed against that source's own baseline cadence).
+    Stripping `~[s0-3]` from a timed chain recovers its untimed form,
+    which is how the two tables join.
+
+    For each requested untimed chain we return:
+      - dominant_timed_chain: the most common timed variant
+      - tempo_coherence:      share of that chain's sources whose timing
+                              collapses into that single dominant variant
+      - tempo_modes:          how many distinct timed variants it splits into
+
+    A high coherence with few modes means the sources don't just send the
+    same packets in the same order, they send them on the same clock -- a
+    mechanical/tooling tell that pure sequence can't see.  Long chains may
+    truncate at a different token boundary than their untimed twin (the
+    `~X` tags add width), in which case the join misses and the chain is
+    simply returned without tempo enrichment.
+    """
+    if not _have(con, "chainfp_timed") or not untimed_chains:
+        return {}
+    targets = sorted(set(untimed_chains))
+    con.execute("CREATE OR REPLACE TEMP TABLE _tgt_chains(chain VARCHAR)")
+    con.executemany("INSERT INTO _tgt_chains VALUES (?)",
+                    [(c,) for c in targets])
+    rows = con.execute("""
+        WITH mapped AS (
+            SELECT regexp_replace(chain, '~[s0-3]', '', 'g') AS base_chain,
+                   chain AS timed_chain,
+                   source_count
+            FROM chainfp_timed
+        ),
+        joined AS (
+            SELECT m.base_chain, m.timed_chain, m.source_count
+            FROM mapped m
+            SEMI JOIN _tgt_chains t ON m.base_chain = t.chain
+        ),
+        ranked AS (
+            SELECT base_chain, timed_chain, source_count,
+                   sum(source_count) OVER (PARTITION BY base_chain) AS tot,
+                   count(*)          OVER (PARTITION BY base_chain) AS n_modes,
+                   row_number()      OVER (PARTITION BY base_chain
+                                           ORDER BY source_count DESC,
+                                                    timed_chain ASC) AS rn
+            FROM joined
+        )
+        SELECT base_chain, timed_chain, source_count, tot, n_modes
+        FROM ranked WHERE rn = 1
+    """).fetchall()
+    out: dict[str, dict] = {}
+    for base, timed, sc, tot, n_modes in rows:
+        share = (float(sc) / float(tot)) if tot else 0.0
+        out[base] = {
+            "dominant_timed_chain": timed,
+            "tempo_coherence":      round(share, 3),
+            "tempo_modes":          int(n_modes),
+        }
+    return out
+
+
 def pat_anomalous_chain(con) -> list[dict]:
     """Distinctive per-IP packet-flag chains (from chainfp).
 
@@ -973,6 +1052,7 @@ def pat_anomalous_chain(con) -> list[dict]:
         ORDER BY source_count DESC, packet_count DESC
         LIMIT {CHAINFP_TOP_DISTINCTIVE}
     """).fetchall()
+    tempo = _timed_tempo_map(con, [r[0] for r in distinctive])
     for chain, src_count, pkt_count, tok_count, ips, ports, ts0, ts1 in distinctive:
         ip_list = (ips or "").split(",")
         # Severity heuristic: chain length + which structural tells.
@@ -998,6 +1078,22 @@ def pat_anomalous_chain(con) -> list[dict]:
             # Long ICMP-laced chain - protocol confusion or mapping.
             weird.append("icmp-mixed")
 
+        # Timed-chain enrichment: how tightly the sources sharing this
+        # sequence also share a single cadence.  High coherence over a
+        # multi-token chain is a mechanical/scripted-tooling tell -- the
+        # sources move on the same clock, not just in the same order.
+        tm = tempo.get(c)
+        tempo_metrics: dict = {}
+        if tm:
+            tempo_metrics = {
+                "tempo_coherence":      tm["tempo_coherence"],
+                "tempo_modes":          tm["tempo_modes"],
+                "dominant_tempo_chain": tm["dominant_timed_chain"][:512],
+            }
+            if (tok_count >= CHAINFP_MIN_TOKENS
+                    and tm["tempo_coherence"] >= CHAINFP_MECHANICAL_TEMPO):
+                weird.append("mechanical-tempo")
+
         out.append(_finding(
             pattern_id=f"anom_chain_{hashlib.sha256(c.encode()).hexdigest()[:8]}",
             pattern_title=(f"Anomalous packet-flag chain ({src_count} "
@@ -1013,6 +1109,7 @@ def pat_anomalous_chain(con) -> list[dict]:
                 "token_count":   int(tok_count),
                 "top_dst_ports": ports,
                 "weird_tells":   weird,
+                **tempo_metrics,
             },
             evidence_refs=[{"section": "chainfp",
                             "label": "Per-IP chain fingerprint"}],
@@ -1035,8 +1132,15 @@ def pat_anomalous_chain(con) -> list[dict]:
         ORDER BY packet_count DESC
         LIMIT {CHAINFP_TOP_RARE_BURST}
     """).fetchall()
+    tempo_rare = _timed_tempo_map(con, [r[0] for r in rare])
     for chain, src_count, pkt_count, tok_count, ips, ports, ts0, ts1 in rare:
         ip_list = (ips or "").split(",")
+        tm = tempo_rare.get(chain)
+        tempo_metrics = {
+            "tempo_coherence":      tm["tempo_coherence"],
+            "tempo_modes":          tm["tempo_modes"],
+            "dominant_tempo_chain": tm["dominant_timed_chain"][:512],
+        } if tm else {}
         out.append(_finding(
             pattern_id=f"rare_chain_{hashlib.sha256(chain.encode()).hexdigest()[:8]}",
             pattern_title=(f"Rare sustained packet-flag chain "
@@ -1052,6 +1156,7 @@ def pat_anomalous_chain(con) -> list[dict]:
                 "token_count":   int(tok_count),
                 "top_dst_ports": ports,
                 "is_rare":       True,
+                **tempo_metrics,
             },
             evidence_refs=[{"section": "chainfp",
                             "label": "Per-IP chain fingerprint (rare tier)"}],
@@ -1093,6 +1198,149 @@ def pat_critical_persistent_botnet(con) -> list[dict]:
     )]
 
 
+def _rotation_timeline(con, core_hashes: list[str]) -> dict[str, dict]:
+    """Per core_hash, the dormancy structure of its episode timeline.
+
+    Orders a fingerprint's episodes by time and measures the gaps between
+    consecutive episodes.  A gap beyond COMPOSITE_REEMERGE_GAP_H means the
+    behaviour went quiet and then RESUMED -- a campaign that paused and came
+    back.  Combined with the cluster already spanning multiple ASNs/CIDRs, the
+    return is on different infrastructure.  Returns {core_hash: {max_gap_h,
+    n_dormancies, re_emergent}}.
+    """
+    if not _have(con, "composite_ep") or not core_hashes:
+        return {}
+    con.execute("CREATE OR REPLACE TEMP TABLE _rot_cores(core_hash VARCHAR)")
+    con.executemany("INSERT INTO _rot_cores VALUES (?)",
+                    [(h,) for h in sorted(set(core_hashes))])
+    rows = con.execute(f"""
+        WITH ep AS (
+            SELECT e.core_hash, e.first_seen, e.last_seen
+            FROM composite_ep e SEMI JOIN _rot_cores r ON e.core_hash = r.core_hash
+        ),
+        gaps AS (
+            SELECT core_hash,
+                   (epoch(first_seen) - epoch(lag(last_seen) OVER (
+                        PARTITION BY core_hash ORDER BY first_seen, last_seen)))
+                   / 3600.0 AS gap_h
+            FROM ep
+        )
+        SELECT core_hash,
+               coalesce(max(gap_h), 0.0) AS max_gap_h,
+               count(*) FILTER (WHERE gap_h > {COMPOSITE_REEMERGE_GAP_H}) AS n_dormancies
+        FROM gaps WHERE gap_h IS NOT NULL
+        GROUP BY core_hash
+    """).fetchall()
+    out: dict[str, dict] = {}
+    for core_hash, max_gap_h, n_dormancies in rows:
+        out[core_hash] = {
+            "max_gap_h":    round(float(max_gap_h or 0.0), 1),
+            "n_dormancies": int(n_dormancies or 0),
+            "re_emergent":  bool((n_dormancies or 0) >= 1),
+        }
+    return out
+
+
+def pat_fingerprint_rotation(con) -> list[dict]:
+    """Behavioral fingerprints deployed across rotated infrastructure.
+
+    compositeprint fuses each source's stack + proto/port sequence + timing +
+    app (TLS/HTTP/SSH) + payload into one ``core_hash`` that is deliberately
+    independent of ASN/CIDR/IP.  The SAME core_hash observed from many ASNs is
+    therefore one tool/campaign that has rotated its hosting -- exactly the
+    behaviour-survives-infrastructure signal that per-IP analyzers cannot see.
+
+    This rule surfaces the widely-distributed behavioral clusters (>= N ASNs),
+    drops generic ICMP ping sweeps, and enriches each with the dormancy/
+    re-emergence structure of its episode timeline.  Severity rises with the
+    breadth of the rotation and when the fingerprint carries an app or payload
+    (i.e. is distinctive, not a bare scan).  Distinct from the ML-cluster
+    ``infra_rotation`` longitudinal module: this keys on the exact fused
+    fingerprint, not a statistical actor cluster.
+    """
+    if not _have(con, "composite_clusters"):
+        return []
+    clusters = con.execute(f"""
+        SELECT core_hash, n_ips, n_episodes, n_asns, n_cidrs, n_countries,
+               total_packets, first_seen, last_seen, span_hours, present,
+               dom_proto, rep_port, seq_chain, tempo_chain, sample_ips,
+               sample_asns, tier
+        FROM composite_clusters
+        WHERE cross_infra = TRUE
+          AND n_asns >= {COMPOSITE_MIN_ASNS}
+          AND seq_chain NOT LIKE 'ICMP/8.0%'
+        ORDER BY n_asns DESC, n_ips DESC, total_packets DESC
+        LIMIT {COMPOSITE_TOP_ROTATION}
+    """).fetchall()
+    if not clusters:
+        return []
+
+    timeline = _rotation_timeline(con, [c[0] for c in clusters])
+
+    out: list[dict] = []
+    for (core_hash, n_ips, n_eps, n_asns, n_cidrs, n_countries, pkts, ts0, ts1,
+         span_h, present, dom_proto, rep_port, seq, tempo, sample_ips,
+         sample_asns, tier) in clusters:
+        tl = timeline.get(core_hash, {})
+        re_emergent = tl.get("re_emergent", False)
+        has_app = present and present.startswith("a")
+        has_payload = present and present.endswith("p")
+
+        tells = ["cross-infra"]
+        if n_asns >= COMPOSITE_HIGH_ASNS:
+            tells.append("wide-rotation")
+        if has_app:
+            tells.append("app-bearing")
+        if has_payload:
+            tells.append("payload-bearing")
+        if re_emergent:
+            tells.append("re-emergent")
+
+        sev = "medium"
+        if n_asns >= COMPOSITE_HIGH_ASNS:
+            sev = "high"
+        elif (has_app or has_payload) and n_asns >= 4:
+            sev = "high"
+        elif re_emergent and n_asns >= 4:
+            sev = "high"
+
+        ip_list = [s for s in (sample_ips or "").split(",") if s]
+        asn_list = [a for a in (sample_asns or "").split(",") if a]
+        out.append(_finding(
+            pattern_id=f"fp_rotation_{core_hash[:12]}",
+            pattern_title=(f"Behavioral fingerprint across {int(n_asns)} ASNs "
+                           f"/ {int(n_ips)} IPs ({tier})"),
+            severity=sev,
+            category="infrastructure-rotation",
+            src_ips=ip_list,
+            asns=asn_list,
+            key_metrics={
+                "core_hash":     core_hash,
+                "n_ips":         int(n_ips),
+                "n_asns":        int(n_asns),
+                "n_cidrs":       int(n_cidrs),
+                "n_countries":   int(n_countries or 0),
+                "n_episodes":    int(n_eps or 0),
+                "packet_count":  int(pkts or 0),
+                "span_hours":    round(float(span_h or 0), 1),
+                "present":       present or "",
+                "dom_proto":     dom_proto or "",
+                "rep_port":      int(rep_port or 0),
+                "sequence":      (seq or "")[:256],
+                "tempo":         (tempo or "")[:256],
+                "re_emergent":   bool(re_emergent),
+                "max_gap_hours": tl.get("max_gap_h", 0.0),
+                "dormancies":    tl.get("n_dormancies", 0),
+                "tells":         tells,
+            },
+            evidence_refs=[{"section": "compositeprint",
+                            "label": "Fused multi-dimensional fingerprint"}],
+            report_anchor="#composite-fingerprints-compositeprint",
+            first_seen=str(ts0), last_seen=str(ts1),
+        ))
+    return out
+
+
 PATTERNS: list[Callable] = [
     pat_telco_ss7_recon,
     pat_routing_protocol_on_public_ip,
@@ -1112,6 +1360,7 @@ PATTERNS: list[Callable] = [
     pat_local_only_vnc_targeting,
     pat_self_mimic_honeypot_aware,
     pat_anomalous_chain,
+    pat_fingerprint_rotation,
     pat_critical_persistent_botnet,
 ]
 
@@ -1148,6 +1397,9 @@ def _register_views(con) -> None:
         ("chains",           P / "attack_chains" / "patterns.parquet"),
         ("chainfp",          R / "chainfp" / "chainfp.parquet"),
         ("chainfp_snr",      R / "chainfp" / "window_snr.parquet"),
+        ("chainfp_timed",    R / "chainfp" / "chainfp_timed.parquet"),
+        ("composite_ep",     R / "compositeprint" / "composite.parquet"),
+        ("composite_clusters", R / "compositeprint" / "clusters.parquet"),
     ]
     for view, path in mapping:
         if not path.exists():

@@ -130,6 +130,25 @@ def flags_to_letters(mask: int | None) -> str:
 # DuckDB connection
 # ----------------------------------------------------------------------
 
+def auto_memory_limit(fraction: float = 0.4, min_gb: int = 4) -> str:
+    """A DuckDB ``memory_limit`` sized to THIS host: ``fraction`` of physical
+    RAM, floored at ``min_gb``.
+
+    Heavy stages that run serialized (chainfp, compositeprint) were pinned to a
+    hardcoded 8GB, which OOM'd on a 1.1B-packet corpus even though the box had
+    62GB free.  Sizing to the host lets them use the machine they're on, while
+    the fraction (not the whole box) and the floor keep it safe on small
+    systems and leave headroom for DuckDB's PARTITION_BY write buffers (which
+    are not bounded by memory_limit) plus the OS.
+    """
+    try:
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        gb = max(min_gb, int(total / (1024 ** 3) * fraction))
+    except (ValueError, OSError, AttributeError):
+        gb = min_gb
+    return f"{gb}GB"
+
+
 def duck(read_only: bool = False, memory_limit: str | None = None,
          threads: int | None = None) -> duckdb.DuckDBPyConnection:
     """Return a DuckDB connection tuned for the SensorGrind workload.

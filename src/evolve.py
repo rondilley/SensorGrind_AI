@@ -86,6 +86,8 @@ STAGES: dict[str, list[str]] = {
     "adversarysim":  [str(SRC / "adversarysim.py")],
     # --- v2.7 chain-fingerprint (packet choreography) per ListonCon 2023 ---
     "chainfp":       [str(SRC / "chainfp.py")],
+    # --- v2.8 fused multi-dimensional cluster fingerprint (adaptive episodes) ---
+    "compositeprint": [str(SRC / "compositeprint.py")],
     # --- v2.6 cross-analyzer correlator + AI-written conclusions ---
     "correlate":    [str(SRC / "conclusions" / "correlate.py")],
     "conclude":     [str(SRC / "conclusions" / "synthesize.py")],
@@ -154,6 +156,12 @@ STAGE_IO: dict[str, dict[str, list[str]]] = {
                     "src/models/detect_drift.py"],
         "outputs": ["output/reports/drift/drift.parquet"],
     },
+    "compositeprint": {
+        "inputs":  ["output/parquet/packets/**/*.parquet",
+                    "output/reports/ja4plus/ja4plus.parquet",
+                    "src/compositeprint.py"],
+        "outputs": ["output/reports/compositeprint/composite.parquet"],
+    },
 }
 
 # Explicit dependency overrides — used for stages whose I/O contract is
@@ -198,7 +206,8 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
     "tooling":         ["analyzers"],
     # actorlink walks the medium+ risk-tier IPs through tooling fingerprints;
     # exits if risk is missing.
-    "actorlink":       ["analyzers", "tooling", "risk", "cluster"],
+    "actorlink":       ["analyzers", "tooling", "risk", "cluster",
+                        "compositeprint"],
     "originintel":     ["actorlink"],
     "slowlow":         ["analyzers"],
     "dnstlsintel":     ["analyzers"],
@@ -207,12 +216,16 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
     # scheduling -- it keeps chainfp's heavy DuckDB aggregate from running
     # concurrently with the cluster sort in --parallel mode (memory).
     "chainfp":         ["analyzers", "cluster"],
+    # compositeprint fuses chainfp's adaptive sequence/tempo with the per-IP
+    # stack/app/payload fingerprints; analyzers produces ja4plus, chainfp the
+    # session grammar it reuses, cluster the edge is for scheduling (memory).
+    "compositeprint":  ["analyzers", "cluster", "chainfp"],
     # correlate reads every per-analyzer parquet + the risk snapshot;
     # depend broadly so it runs after everything it might join against.
     "correlate":       ["risk", "nonipproto", "protocolanomaly",
                         "asnintel", "cidrintel", "tooling", "slowlow",
                         "selfmimic", "isc_compare", "coordination",
-                        "chains", "chainfp"],
+                        "chains", "chainfp", "compositeprint"],
     "conclude":        ["correlate"],
     # adversarysim consults other analyzers' outputs for coverage scoring;
     # depending on a broad set of stages keeps it last among siblings.
@@ -229,7 +242,7 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
                      "aipayloaddecode", "asnintel", "cidrintel", "tooling",
                      "actorlink", "originintel",
                      "slowlow", "dnstlsintel", "selfmimic",
-                     "chainfp",
+                     "chainfp", "compositeprint",
                      "correlate", "conclude"],
     "aireview":     ["report"],
 }

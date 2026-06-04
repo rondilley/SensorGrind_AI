@@ -193,24 +193,56 @@ def _window_sql(where: str, win_seconds: int | None,
         gapped AS (
             SELECT *, epoch_us(ts) - epoch_us(lag(ts) OVER w) AS gap_us
             FROM base
-            WINDOW w AS (PARTITION BY src_ip ORDER BY ts)
+            -- (ts, token) is a TOTAL order: packets sharing a microsecond ts
+            -- are ordered deterministically by token, so the chain/tchain
+            -- string_aggs and the session-id running sum are reproducible.
+            -- ORDER BY ts alone left tied-ts packets in engine-dependent order,
+            -- jittering the chain (and thus any fused fingerprint) across runs.
+            WINDOW w AS (PARTITION BY src_ip ORDER BY ts, token)
         ){thr_cte},
         bounded AS (
-            SELECT g.src_ip, g.ts, g.dst_port, g.token,
+            SELECT g.src_ip, g.ts, g.dst_port, g.token, g.gap_us,
+                   -- Tempo gap at TIMESTAMP granularity: every packet sharing a
+                   -- microsecond ts gets the same gap (the gap from the previous
+                   -- distinct ts = the max row-level gap in the ts-group, since
+                   -- the rest are 0).  This makes the tempo tag invariant to the
+                   -- arbitrary order of same-ts packets, so tchain is reproducible.
+                   max(g.gap_us) OVER (PARTITION BY g.src_ip, g.ts) AS tgap_us,
                    CASE WHEN g.gap_us IS NULL OR g.gap_us > {thr_expr}
                         THEN 1 ELSE 0 END AS boundary
             FROM gapped g {thr_join}
         ),
+        -- Per-source tempo baseline = median INTRA-session gap.  Used to
+        -- normalize each gap (gap/baseline) so the tempo bucket reflects this
+        -- source's own pacing shape, not absolute latency -- network RTT scales
+        -- all of a source's gaps ~equally, so the ratio cancels it.  Uses the
+        -- ts-granularity gap so the baseline is reproducible too.
+        srcbase AS (
+            SELECT src_ip, median(tgap_us) AS base_us
+            FROM bounded WHERE boundary = 0 AND tgap_us IS NOT NULL
+            GROUP BY src_ip
+        ),
         tok AS (
-            SELECT src_ip, ts, dst_port, token,
-                   sum(boundary) OVER (PARTITION BY src_ip ORDER BY ts
-                                       ROWS UNBOUNDED PRECEDING) AS sid,
-                   row_number() OVER (PARTITION BY src_ip ORDER BY ts) AS trn_g
-            FROM bounded
+            SELECT b.src_ip, b.ts, b.dst_port, b.token, b.boundary, b.tgap_us,
+                   sb.base_us,
+                   sum(b.boundary) OVER (PARTITION BY b.src_ip ORDER BY b.ts, b.token
+                                         ROWS UNBOUNDED PRECEDING) AS sid
+            FROM bounded b LEFT JOIN srcbase sb USING (src_ip)
         ),
         toks AS (
-            SELECT *, row_number() OVER (PARTITION BY src_ip, sid ORDER BY ts)
-                          AS trn
+            SELECT *,
+                   row_number() OVER (PARTITION BY src_ip, sid ORDER BY ts, token) AS trn,
+                   -- 's' marks the session-start TS-GROUP (every packet at the
+                   -- session's first ts), not the single boundary row, so the
+                   -- tag is invariant to the order of same-ts packets at a
+                   -- session start -- the last source of tchain non-determinism.
+                   CASE WHEN base_us IS NULL OR base_us = 0
+                            OR ts = min(ts) OVER (PARTITION BY src_ip, sid)
+                            THEN 's'                       -- session start
+                        WHEN tgap_us < 0.5  * base_us THEN '0'  -- faster than norm
+                        WHEN tgap_us < 2.0  * base_us THEN '1'  -- typical
+                        WHEN tgap_us < 10.0 * base_us THEN '2'  -- slower
+                        ELSE '3' END AS tgb                -- much slower
             FROM tok
         ),
         pc AS (
@@ -228,7 +260,10 @@ def _window_sql(where: str, win_seconds: int | None,
         sess AS (
             SELECT src_ip, sid,
                    string_agg(CASE WHEN trn <= {int(max_tokens)} THEN token END,
-                              ',' ORDER BY ts) AS chain,
+                              ',' ORDER BY ts, token) AS chain,
+                   string_agg(CASE WHEN trn <= {int(max_tokens)}
+                                   THEN token || '~' || tgb END,
+                              ',' ORDER BY ts, token) AS tchain,
                    count(*)::UINTEGER                       AS pkt_count,
                    least(count(DISTINCT dst_port), 65535)::USMALLINT AS port_count,
                    min(ts) AS first_ts,
@@ -237,7 +272,7 @@ def _window_sql(where: str, win_seconds: int | None,
             GROUP BY src_ip, sid
             HAVING count(*) >= 2
         )
-        SELECT s.src_ip, s.chain, s.pkt_count, s.port_count,
+        SELECT s.src_ip, s.chain, s.tchain, s.pkt_count, s.port_count,
                s.first_ts, s.last_ts, coalesce(tp.top_ports, '') AS top_ports
         FROM sess s LEFT JOIN tp USING (src_ip, sid)
     """
@@ -260,7 +295,7 @@ def _stream_sessions(con, since, until, spill_dir: Path,
     sessions are exact.
     """
     where = lib.date_predicate("ts", since, until)
-    n = max(1, int(os.environ.get("SG_CHAINFP_BUCKETS", "64")))
+    n = max(1, int(os.environ.get("SG_CHAINFP_BUCKETS", "256")))
 
     # Pass 1: partition the windowed packets evenly by hash(src_ip) -> spill.
     ipb = spill_dir / "ip_buckets"
@@ -307,15 +342,19 @@ def _stream_sessions(con, since, until, spill_dir: Path,
 # ----------------------------------------------------------------------
 
 def _aggregate_window(con, label: str, sess_path: Path,
-                      max_chain_chars: int) -> tuple[list[dict], dict]:
-    """Aggregate the streamed per-session parquet into one row per
-    chain.  Uses DuckDB - the group-by-chain-string here is small
-    (a few million distinct chains at most), not the hundreds of
-    millions of (src_ip, session_id) pairs the old approach hit.
+                      max_chain_chars: int,
+                      chain_col: str = "chain") -> tuple[list[dict], dict]:
+    """Aggregate the streamed per-session parquet into one row per chain.
+
+    ``chain_col`` selects which session column to roll up: "chain" (the
+    untimed proto/port choreography) or "tchain" (the timed chain -- same
+    sequence with each token annotated by its per-source-normalized inter-
+    token gap bucket).  Output schema is identical either way (the rolled-up
+    value lands in the "chain" field).  Bucketed by hash to bound memory.
 
     Returns (chain_rows, snr_row).
     """
-    print(f"[chainfp] aggregating chains ({label})...", file=sys.stderr)
+    print(f"[chainfp] aggregating {chain_col} ({label})...", file=sys.stderr)
     con.execute(f"""
         CREATE OR REPLACE VIEW sess_{label} AS
         SELECT * FROM read_parquet('{sess_path.as_posix()}/*.parquet')
@@ -332,9 +371,9 @@ def _aggregate_window(con, label: str, sess_path: Path,
         rows += con.execute(f"""
             WITH truncated AS (
                 SELECT
-                  CASE WHEN length(chain) > {max_chain_chars}
-                       THEN substring(chain, 1, {max_chain_chars}) || ',...'
-                       ELSE chain
+                  CASE WHEN length({chain_col}) > {max_chain_chars}
+                       THEN substring({chain_col}, 1, {max_chain_chars}) || ',...'
+                       ELSE {chain_col}
                   END AS chain,
                   src_ip, pkt_count, first_ts, last_ts, top_ports
                 FROM sess_{label}
@@ -523,7 +562,19 @@ def run(args: argparse.Namespace) -> int:
     spill_dir.mkdir(parents=True, exist_ok=True)
     print(f"[chainfp] spill directory: {spill_dir}", file=sys.stderr)
 
-    con = lib.duck(memory_limit=args.memory_limit)
+    # Size memory to the host (this stage runs serialized) instead of a fixed
+    # 8GB that OOM'd the 1.1B-packet session build; --memory-limit overrides.
+    mem = args.memory_limit or lib.auto_memory_limit(0.4)
+    con = lib.duck(memory_limit=mem)
+    # The session build runs TWO ordered string_aggs per group (chain + the
+    # timed tchain) plus a per-source median; those ordered/holistic aggregates
+    # buffer per-thread and are not fully bounded by memory_limit (DuckDB's own
+    # first OOM hint is "reduce threads").  Cap threads so the concurrent
+    # aggregate buffers stay within the limit.  Env SG_CHAINFP_THREADS overrides.
+    _cap = int(os.environ.get("SG_CHAINFP_THREADS", "4"))
+    con.execute(f"SET threads={max(2, min(_cap, (os.cpu_count() or 4) // 2))}")
+    print(f"[chainfp] memory_limit={mem}, buckets={os.environ.get('SG_CHAINFP_BUCKETS', '256')}",
+          file=sys.stderr)
     lib.register_views(con)
     since = lib.parse_date_arg(args.since)
     until = lib.parse_date_arg(args.until)
@@ -577,6 +628,22 @@ def run(args: argparse.Namespace) -> int:
           f"{best['distinct_chains']:,} distinct chains)",
           file=sys.stderr)
 
+    # Timed chains: roll up ONLY the best-SNR window's sessions by `tchain`
+    # (the same proto/port choreography, with each token tagged by its
+    # per-source-normalized inter-token gap bucket).  We compute this for the
+    # winning window only -- it's the one the correlator consumes, and the
+    # timed variant is strictly finer-grained, so its entropy/SNR is reported
+    # in its own snr row rather than competing in the window sweep.
+    timed_rows: list[dict] = []
+    timed_snr: dict | None = None
+    best_path = dict(sess_paths).get(best_label)
+    if best_path is not None and best_path.exists():
+        timed_rows, timed_snr = _aggregate_window(
+            con, best_label, best_path, args.max_chain_chars,
+            chain_col="tchain")
+        timed_snr["window_seconds"] = window_seconds[best_label]
+        timed_snr["is_best"] = True
+
     con.close()
 
     pq.write_table(pa.Table.from_pylist(all_chain_rows,
@@ -594,6 +661,18 @@ def run(args: argparse.Namespace) -> int:
     print(f"[chainfp] wrote {out_dir/'window_snr.parquet'}",
           file=sys.stderr)
     print(f"[chainfp] wrote {out_dir/'chainfp.md'}", file=sys.stderr)
+
+    if timed_rows:
+        pq.write_table(pa.Table.from_pylist(timed_rows, schema=CHAIN_SCHEMA),
+                       out_dir / "chainfp_timed.parquet",
+                       compression="zstd", compression_level=3)
+        pq.write_table(pa.Table.from_pylist([timed_snr],
+                                            schema=WINDOW_SNR_SCHEMA),
+                       out_dir / "window_snr_timed.parquet",
+                       compression="zstd", compression_level=3)
+        print(f"[chainfp] wrote {out_dir/'chainfp_timed.parquet'} "
+              f"({len(timed_rows):,} timed chains, "
+              f"{timed_snr['entropy_bits']:.2f} bits)", file=sys.stderr)
     return 0
 
 
@@ -615,10 +694,9 @@ def main() -> int:
     ap.add_argument("--batch-rows", type=int, default=100_000,
                     help="DuckDB streaming batch size in rows "
                          "(default 100k).")
-    ap.add_argument("--memory-limit", default="8GB",
-                    help="DuckDB memory cap.  The streaming algorithm "
-                         "doesn't need much - this mostly governs the "
-                         "sort buffer for ORDER BY ts.")
+    ap.add_argument("--memory-limit", default=None,
+                    help="DuckDB memory cap (default: auto, ~40%% of host RAM "
+                         "since this stage runs serialized).")
     args = ap.parse_args()
     return run(args)
 

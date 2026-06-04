@@ -540,6 +540,77 @@ def run(args: argparse.Namespace) -> int:
                 "threat_summary": summ, "analysis": analysis, "model": model,
             }
 
+    # ---- v2.7: chainfp - per-IP packet choreography fingerprints ----
+    # Each chain is a per-source-IP sequence of (flag_mask, proto, port) tokens
+    # within one adaptive session (sensorChain.pl grammar).  window_snr scores
+    # each candidate window by chain-frequency entropy and flags the winner.
+    chainfp_best: dict = {}
+    chainfp_snr_rows: list = []
+    chainfp_distinctive: list = []
+    chainfp_path = lib.REPORTS / "chainfp" / "chainfp.parquet"
+    chainfp_snr_path = lib.REPORTS / "chainfp" / "window_snr.parquet"
+    chainfp_timed_path = lib.REPORTS / "chainfp" / "chainfp_timed.parquet"
+    chainfp_best_label = None
+    if chainfp_snr_path.exists():
+        chainfp_snr_rows = con.execute(f"""
+            SELECT window_label, window_seconds, distinct_chains,
+                   total_chain_obs, entropy_bits, is_best
+            FROM read_parquet('{chainfp_snr_path}')
+            ORDER BY entropy_bits DESC
+        """).fetchall()
+        best = [r for r in chainfp_snr_rows if r[5]]
+        if best:
+            b = best[0]
+            chainfp_best_label = b[0]
+            chainfp_best = {"label": b[0], "window_seconds": b[1],
+                            "distinct_chains": b[2], "entropy_bits": b[4]}
+    if chainfp_path.exists() and chainfp_best_label:
+        chainfp_distinctive = con.execute(f"""
+            SELECT chain, source_count, packet_count, token_count,
+                   top_dst_ports, anomaly_tier
+            FROM read_parquet('{chainfp_path}')
+            WHERE window_label = '{chainfp_best_label}'
+              AND anomaly_tier IN ('distinctive', 'rare')
+              AND token_count >= 3
+              AND chain NOT LIKE 'ICMP/8.0,ICMP/8.0,ICMP/8.0%'
+            ORDER BY source_count DESC, packet_count DESC
+            LIMIT 25
+        """).fetchall()
+
+    # ---- v2.8: compositeprint - fused multi-dimensional fingerprints ----
+    # Per (src_ip, adaptive episode) the stack + proto/port sequence + timing +
+    # app + payload are fused into an infra-independent core_hash; clusters.parquet
+    # rolls those up per fingerprint and flags the cross-infrastructure ones.
+    composite_summary: dict = {}
+    composite_cross_rows: list = []
+    comp_clusters_path = lib.REPORTS / "compositeprint" / "clusters.parquet"
+    comp_ep_path = lib.REPORTS / "compositeprint" / "composite.parquet"
+    if comp_ep_path.exists():
+        s = con.execute(f"""
+            SELECT count(*) AS episodes, count(DISTINCT src_ip) AS ips,
+                   count(DISTINCT core_hash) AS cores
+            FROM read_parquet('{comp_ep_path}')
+        """).fetchone()
+        composite_summary = {"episodes": s[0], "ips": s[1], "cores": s[2]}
+    if comp_clusters_path.exists():
+        c = con.execute(f"""
+            SELECT count(*) AS clusters,
+                   count(*) FILTER (WHERE cross_infra) AS cross_infra,
+                   max(n_asns) AS max_asns
+            FROM read_parquet('{comp_clusters_path}')
+        """).fetchone()
+        composite_summary.update(
+            {"clusters": c[0], "cross_infra": c[1], "max_asns": c[2]})
+        composite_cross_rows = con.execute(f"""
+            SELECT core_hash, tier, n_ips, n_asns, n_cidrs, n_countries,
+                   total_packets, span_hours, present, dom_proto, rep_port,
+                   seq_chain, sample_asns
+            FROM read_parquet('{comp_clusters_path}')
+            WHERE cross_infra = TRUE AND seq_chain NOT LIKE 'ICMP/8.0%'
+            ORDER BY n_asns DESC, n_ips DESC, total_packets DESC
+            LIMIT 30
+        """).fetchall()
+
     # ---- cross-signal conclusions ----
     # Produced by conclusions/correlate + conclusions/synthesize.  Each
     # row is one rule-matched pattern + the LLM-written narrative.
@@ -1913,6 +1984,112 @@ def run(args: argparse.Namespace) -> int:
         P("")
         P("> _No nonipproto output yet.  Run `python src/evolve.py "
           "nonipproto` to populate this section._")
+
+    # ---------- 26. Per-IP packet choreography fingerprints (chainfp) ----------
+    # Explicit HTML anchor so the chainfp cross-signal findings' report_anchor
+    # (#chain-fingerprints-chainfp) resolves regardless of heading slugification.
+    md.append('\n<a id="chain-fingerprints-chainfp"></a>')
+    H(2, "26. Per-IP Packet Choreography Fingerprints (chainfp)")
+    P("**What this shows:** the *temporal order* in which a source's packets "
+      "arrive within one session, encoded as a chain of "
+      "`<flag_mask>-<proto>/<port>` tokens (Tom Liston's `sensorChain.pl` "
+      "grammar, ListonCon 2023).  Where every other analyzer aggregates a "
+      "source into counts and sets - erasing order - chains preserve it, so "
+      "`SYN-then-own-RST`, `RST-without-prior-SYN`, and no-teardown sequences "
+      "become visible.  The tool sweeps several session windows and keeps the "
+      "one whose chain-frequency distribution has the highest Shannon entropy "
+      "(best signal-to-noise); the `distinctive` tier (10-99 sources sharing a "
+      "chain) is the toolkit-fingerprint sweet spot.")
+    if chainfp_best:
+        P("")
+        P(f"- **Best-SNR window:** `{chainfp_best['label']}` "
+          f"({chainfp_best['entropy_bits']:.2f} bits over "
+          f"{chainfp_best['distinct_chains']:,} distinct chains)")
+        if chainfp_timed_path.exists():
+            P("- A **timed** variant (`chainfp_timed.parquet`) annotates each "
+              "token with its per-source-normalized inter-arrival cadence, "
+              "splitting look-alike sequences that move on different clocks.")
+    if chainfp_snr_rows:
+        H(3, "Window signal-to-noise comparison")
+        P("_Higher entropy = the window separates distinct behaviours better.  "
+          "The flagged window is used for the findings above._")
+        P("")
+        P("| window | seconds | distinct_chains | total_obs | entropy_bits | best |")
+        P("| --- | --- | --- | --- | --- | --- |")
+        for wl, ws, dc, obs, ent, is_best in chainfp_snr_rows:
+            P(f"| {wl} | {ws:,} | {dc:,} | {obs:,} | {ent:.2f} "
+              f"| {'**YES**' if is_best else ''} |")
+    if chainfp_distinctive:
+        H(3, "Top distinctive / rare chains (best-SNR window)")
+        P("_Cohesive small-cluster choreographies - rare enough to be a "
+          "toolkit signature, not internet-background noise.  ICMP-echo-only "
+          "ping floods are excluded._")
+        P("")
+        P("| sources | packets | tokens | tier | dst_ports | chain |")
+        P("| --- | --- | --- | --- | --- | --- |")
+        for chain, sc, pk, tok, ports, tier in chainfp_distinctive:
+            chain_disp = (chain or "")[:64].replace("|", "\\|")
+            ports_disp = (ports or "")[:24].replace("|", "\\|")
+            P(f"| {sc:,} | {int(pk or 0):,} | {tok} | {tier} | {ports_disp} "
+              f"| `{chain_disp}` |")
+    if not (chainfp_best or chainfp_distinctive):
+        P("")
+        P("> _No chainfp output yet.  Run `python src/evolve.py chainfp` to "
+          "populate this section._")
+
+    # ---------- 27. Behavioral fingerprint rotation (compositeprint) ----------
+    # Explicit HTML anchor so the cross-signal findings' report_anchor
+    # (#composite-fingerprints-compositeprint) resolves regardless of how a
+    # given markdown renderer slugifies the numbered heading.
+    md.append('\n<a id="composite-fingerprints-compositeprint"></a>')
+    H(2, "27. Behavioral Fingerprint Rotation (compositeprint)")
+    P("**What this shows:** every source's behaviour in an *adaptive activity "
+      "episode* is fused into one `core_hash` over five dimensions - the TCP/IP "
+      "stack (TTL/window/proto-mix), the proto/port **sequence** (chainfp "
+      "choreography), the inter-packet **timing** (per-source-normalized "
+      "cadence), the **app** client (JA4/JA4H/JA4SSH), and the **payload**.  "
+      "The hash deliberately excludes ASN/CIDR/IP, so the *same* `core_hash` "
+      "seen from many networks is **one tool/campaign that rotated its "
+      "infrastructure** - the behaviour-survives-hosting signal that per-IP "
+      "analyzers cannot see.  A cluster spanning >= 2 ASNs or CIDRs is flagged "
+      "`cross_infra`.")
+    if composite_summary.get("episodes"):
+        P("")
+        P(f"- **{composite_summary['episodes']:,}** episodes across "
+          f"**{composite_summary['ips']:,}** source IPs")
+        P(f"- **{composite_summary['cores']:,}** distinct behavioral "
+          f"fingerprints (core_hash)")
+        if "clusters" in composite_summary:
+            P(f"- **{composite_summary['clusters']:,}** fingerprints shared by "
+              f">= 2 IPs; **{composite_summary['cross_infra']:,}** of those span "
+              f"multiple ASNs/CIDRs (widest: "
+              f"{composite_summary.get('max_asns', 0)} ASNs)")
+    if composite_cross_rows:
+        H(3, "Top cross-infrastructure behavioral fingerprints")
+        P("_Each row is one fused fingerprint deployed across multiple networks.  "
+          "`present` = a(pp)/p(ayload) channels carried; bare scans show `--`.  "
+          "Generic ICMP ping sweeps are excluded._")
+        P("")
+        P("| core_hash | tier | IPs | ASNs | CIDRs | countries | pkts | span_h | present | dst_port | sequence |")
+        P("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        for (core_hash, tier, n_ips, n_asns, n_cidrs, n_ctry, pkts, span_h,
+             present, dom_proto, rep_port, seq, sample_asns) in composite_cross_rows:
+            seq_disp = (seq or "")[:54].replace("|", "\\|")
+            P(f"| `{core_hash[:12]}` | {tier} | {n_ips} | {n_asns} | {n_cidrs} "
+              f"| {n_ctry} | {int(pkts or 0):,} | {span_h:.1f} | {present} "
+              f"| {rep_port} | {seq_disp} |")
+        P("")
+        P("_The cross-signal findings above (section 0.5, "
+          "`infrastructure-rotation`) promote the widest-spread and "
+          "re-emergent fingerprints to ranked findings with severity._")
+    elif comp_ep_path.exists():
+        P("")
+        P("_No multi-IP behavioral clusters this run (every fingerprint was "
+          "unique to one source)._")
+    else:
+        P("")
+        P("> _No compositeprint output yet.  Run `python src/evolve.py "
+          "compositeprint` to populate this section._")
 
     # ---------- Appendix ----------
     H(2, "Appendix A. Per-analyzer data coverage")

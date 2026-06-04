@@ -20,6 +20,16 @@ share any of:
   - the same RDP mstshash cookie                      weight 3.0
   - very similar pacing (median IAT within 10%)       weight 1.5
   - first-seen within 60s (synchronized arrival)      weight 1.0
+  - the same compositeprint core_hash (full fused fp) weight 5.0
+  - the same compositeprint seq choreography          weight 2.0
+  - the same compositeprint tempo (timed choreography) weight 1.5
+
+The compositeprint signals are the "exact core_hash, then graph" layer: a shared
+core_hash means two IPs match on stack+sequence+tempo+app+payload at once (the
+strongest possible edge), while shared seq/tempo alone link IPs that agree on
+some-but-not-all dimensions -- the fuzzy >= k-dimension neighbours.  Generic
+choreographies (e.g. a bare telnet SYN/ACK) are shared by too many IPs and are
+dropped by the same --max-group-size guard as every other signal.
 
 Edge weights are summed across signals.  We then run Louvain community
 detection (python-louvain) and report communities with >= MIN_MEMBERS
@@ -86,6 +96,10 @@ SIGNAL_WEIGHTS = {
     "mstshash":     3.0,
     "pacing_close": 1.5,
     "first_seen_close": 1.0,
+    # compositeprint fused-fingerprint signals (Phase 2b)
+    "composite_core":  5.0,   # full stack+seq+tempo+app+payload match
+    "composite_seq":   2.0,   # shared proto/port choreography (chainfp chain)
+    "composite_tempo": 1.5,   # shared per-source-normalized cadence (tchain)
 }
 
 
@@ -219,6 +233,43 @@ def run(args: argparse.Namespace) -> int:
         ja4t_groups = [list(r[1]) for r in rows]
     print(f"[actorlink]   JA4T groups: {len(ja4t_groups):,}", file=sys.stderr)
 
+    # ---- compositeprint fused-fingerprint signals (Phase 2b) ----
+    # Group threat IPs that share a compositeprint dimension.  core_hash is the
+    # full fused fingerprint (strongest edge); seq/tempo link IPs that agree on
+    # the choreography / cadence but maybe not the whole fingerprint -- the
+    # fuzzy >= k-dimension neighbours.  An IP may have several episodes, so we
+    # group on DISTINCT src_ip per dimension value.
+    comp_core_groups: list = []
+    comp_seq_groups: list = []
+    comp_tempo_groups: list = []
+    if not args.skip_composite:
+        comp_path = lib.REPORTS / "compositeprint" / "composite.parquet"
+        if comp_path.exists():
+            print("[actorlink] gathering compositeprint fingerprint signals...",
+                  file=sys.stderr)
+
+            def _comp_groups(col: str) -> list:
+                rows = con.execute(f"""
+                    SELECT {col}, list(DISTINCT c.src_ip)
+                    FROM read_parquet('{comp_path.as_posix()}') c
+                    SEMI JOIN al_ips t ON c.src_ip = t.ip
+                    WHERE {col} IS NOT NULL AND {col} <> ''
+                    GROUP BY {col}
+                    HAVING count(DISTINCT c.src_ip)
+                           BETWEEN 2 AND {args.max_group_size}
+                """).fetchall()
+                return [list(r[1]) for r in rows]
+
+            comp_core_groups  = _comp_groups("core_hash")
+            comp_seq_groups   = _comp_groups("seq_chain")
+            comp_tempo_groups = _comp_groups("tempo_chain")
+            print(f"[actorlink]   composite groups: core={len(comp_core_groups):,}, "
+                  f"seq={len(comp_seq_groups):,}, tempo={len(comp_tempo_groups):,}",
+                  file=sys.stderr)
+        else:
+            print("[actorlink]   no compositeprint output - skipping composite "
+                  "signals", file=sys.stderr)
+
     # ---- synchronized arrival ----
     arrival_groups: list = []
     if not args.skip_arrival:
@@ -285,9 +336,13 @@ def run(args: argparse.Namespace) -> int:
     n_pr = _add_edges(probe_groups, "probe_tag")
     n_j = _add_edges(ja4t_groups, "ja4t")
     n_a = _add_edges(arrival_groups, "first_seen_close")
+    n_cc = _add_edges(comp_core_groups, "composite_core")
+    n_cs = _add_edges(comp_seq_groups, "composite_seq")
+    n_ct = _add_edges(comp_tempo_groups, "composite_tempo")
     print(f"[actorlink]   ops: payload={n_p:,}, ua={n_u:,}, "
           f"msts={n_m:,}, probe={n_pr:,}, ja4t={n_j:,}, "
-          f"arrival={n_a:,}; distinct edges={len(edges):,}",
+          f"arrival={n_a:,}, comp_core={n_cc:,}, comp_seq={n_cs:,}, "
+          f"comp_tempo={n_ct:,}; distinct edges={len(edges):,}",
           file=sys.stderr)
 
     if not edges:
@@ -444,8 +499,9 @@ def run(args: argparse.Namespace) -> int:
         f"_Built a weighted IP-IP graph over the top "
         f"{len(ip_meta):,} threat IPs.  Edges are added for shared "
         f"payload SHA-256, shared user-agent, shared JA4T fingerprint, "
-        f"shared probe-tag, shared mstshash, and synchronized arrival.  "
-        f"Louvain community detection produced "
+        f"shared probe-tag, shared mstshash, synchronized arrival, and "
+        f"shared compositeprint fingerprints (core_hash / sequence / tempo).  "
+        f"Community detection produced "
         f"{len(communities):,} groups; **{len(com_rows):,}** have "
         f">= {args.min_members} members and are reported here._",
         "",
@@ -483,6 +539,10 @@ def main() -> int:
     ap.add_argument("--skip-payload", action="store_true",
                     help="Skip payload-sha signal (otherwise reads from "
                          "the existing campaign output if available)")
+    ap.add_argument("--skip-composite", action="store_true",
+                    help="Skip compositeprint fused-fingerprint signals "
+                         "(core_hash / seq / tempo); otherwise reads from the "
+                         "compositeprint output if available)")
     ap.add_argument("--resolution", type=float, default=1.0,
                     help="Leiden resolution parameter (>1 = more, smaller "
                          "communities; <1 = fewer, larger).  Default 1.0.")
