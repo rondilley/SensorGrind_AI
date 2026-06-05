@@ -169,6 +169,14 @@ COMPOSITE_HIGH_ASNS         = 8      # wide spread -> high severity
 COMPOSITE_TOP_ROTATION      = 25     # finding fan-out cap
 COMPOSITE_REEMERGE_GAP_H    = 6.0    # dormancy gap (hours) that counts as a return
 
+# Bulletproof ASN cluster: connected groups in the campaignmigration
+# ISP-collaboration graph (ASNs sharing the same migrating campaign
+# fingerprints) that also carry asnintel bulletproof / coordination signals.
+BP_CLUSTER_MIN_EDGE         = 3      # cohost edge weight (shared campaigns) to link two ASNs
+BP_CLUSTER_MIN_ASNS         = 3      # min ASNs in a cluster to report
+BP_CLUSTER_COOP_HIGH        = 0.5    # mean asnintel cooperation_score -> coordinated
+BP_CLUSTER_TOP              = 20     # finding fan-out cap
+
 
 # ----------------------------------------------------------------------
 # Pattern rules
@@ -1341,6 +1349,157 @@ def pat_fingerprint_rotation(con) -> list[dict]:
     return out
 
 
+def _asn_communities(edge_list: list[tuple[int, int, int]]) -> list[set]:
+    """Partition the weighted ASN co-host graph into communities.
+
+    Louvain (python-louvain, weighted by shared campaigns) when available --
+    deterministic via a fixed seed -- so a few hub ASNs don't transitively
+    fuse the whole graph into one blob.  Falls back to connected components
+    (union-find) when the graph libs aren't installed.
+    """
+    try:
+        import networkx as nx
+        import community as community_louvain
+        g = nx.Graph()
+        for a, b, w in edge_list:
+            g.add_edge(a, b, weight=w)
+        part = community_louvain.best_partition(g, weight="weight",
+                                                random_state=42)
+        comms: dict[int, set] = {}
+        for node, cid in part.items():
+            comms.setdefault(cid, set()).add(node)
+        return list(comms.values())
+    except Exception:
+        parent: dict[int, int] = {}
+
+        def find(x: int) -> int:
+            parent.setdefault(x, x)
+            root = x
+            while parent[root] != root:
+                root = parent[root]
+            while parent[x] != root:
+                parent[x], x = root, parent[x]
+            return root
+
+        for a, b, _w in edge_list:
+            parent[find(a)] = find(b)
+        comps: dict[int, set] = {}
+        for a, b, _w in edge_list:
+            comps.setdefault(find(a), set()).update((a, b))
+        return list(comps.values())
+
+
+def pat_bulletproof_asn_cluster(con) -> list[dict]:
+    """Communities of ASNs that host the SAME migrating campaign fingerprints
+    AND carry bulletproof signals.
+
+    campaignmigration's ISP-collaboration graph links two ASNs when they
+    co-host the same compositeprint ``core_hash`` (a behaviour, independent of
+    infrastructure).  Louvain communities of that graph are candidate
+    operator-aligned network groups.  This rule keeps the communities that also
+    light up asnintel's per-ASN signals -- a ``bulletproof_flag`` or a
+    block-grade ``risk_grade`` (block_asn / monitor_block) -- i.e. the
+    complicit / bulletproof hosting cluster a campaign rotates through to evade
+    filtering.  (A high mean ``cooperation_score`` is reported as a tell but is
+    NOT a trigger on its own -- benign synchronized scanners score high there.)
+    Per-ASN flags come from asnintel; the *cluster* (which ASNs act together)
+    is the new signal this rule adds on top.
+    """
+    if not _have(con, "isp_collab") or not _have(con, "asnintel"):
+        return []
+    raw = con.execute(f"""
+        SELECT src_asn, dst_asn, shared_campaigns
+        FROM isp_collab
+        WHERE kind = 'cohost' AND shared_campaigns >= {BP_CLUSTER_MIN_EDGE}
+    """).fetchall()
+    if not raw:
+        return []
+    edge_list = [(int(a), int(b), int(w)) for a, b, w in raw]
+
+    # Partition the collaboration graph into COMMUNITIES (Louvain, weighted by
+    # shared campaigns) rather than raw connected components: a few hub ASNs
+    # (big hosters) otherwise transitively fuse everything into one giant blob.
+    # Communities carve out the tight operator-aligned sub-clusters.  Falls back
+    # to connected components if python-louvain/networkx are unavailable.
+    groups = _asn_communities(edge_list)
+
+    all_asns = {a for a, _b, _w in edge_list} | {b for _a, b, _w in edge_list}
+    info: dict[int, dict] = {}
+    ph = ",".join(str(a) for a in all_asns)
+    for asn, org, ctry, bp, coop, grade, dens in con.execute(f"""
+        SELECT asn, asn_org, country_iso, bulletproof_flag,
+               cooperation_score, risk_grade, threat_density
+        FROM asnintel WHERE asn IN ({ph})
+    """).fetchall():
+        info[int(asn)] = {
+            "org": org or "", "country": ctry or "",
+            "bp": bool(bp), "coop": float(coop or 0.0),
+            "grade": grade or "", "density": float(dens or 0.0)}
+
+    out: list[dict] = []
+    for asn_set in groups:
+        asns = sorted(asn_set)
+        if len(asns) < BP_CLUSTER_MIN_ASNS:
+            continue
+        infos = [info.get(a, {}) for a in asns]
+        bp_asns = [a for a in asns if info.get(a, {}).get("bp")]
+        block_asns = [a for a in asns
+                      if info.get(a, {}).get("grade") in ("block_asn", "monitor_block")]
+        coops = [i["coop"] for i in infos if i]
+        mean_coop = sum(coops) / len(coops) if coops else 0.0
+        # TRIGGER on actual bulletproof hosting: a bulletproof_flag or a
+        # block-grade ASN in the cluster.  High coordination ALONE is not
+        # enough -- benign synchronized scanners (Censys, Shadowserver) also
+        # score high there; it's kept only as an enrichment tell.
+        if not (bp_asns or block_asns):
+            continue
+        links_w = sum(w for a, b, w in edge_list
+                      if a in asn_set and b in asn_set)
+
+        countries = sorted({i.get("country", "") for i in infos if i.get("country")})
+        tells = []
+        if bp_asns:
+            tells.append(f"{len(bp_asns)}-bulletproof")
+        if block_asns:
+            tells.append(f"{len(block_asns)}-block-grade")
+        if mean_coop >= BP_CLUSTER_COOP_HIGH:
+            tells.append("high-coordination")
+        sev = "high" if (bp_asns or len(block_asns) >= 2 or len(asns) >= 6) else "medium"
+        labels = ", ".join(f"AS{a}({info.get(a, {}).get('org', '')[:14]})"
+                           for a in asns[:12])
+
+        out.append(_finding(
+            pattern_id=f"bp_asn_cluster_{hashlib.sha256(str(asns).encode()).hexdigest()[:8]}",
+            pattern_title=(f"Bulletproof ASN cluster: {len(asns)} networks "
+                           f"sharing {links_w} campaign links"),
+            severity=sev,
+            category="bulletproof-hosting",
+            src_ips=[],
+            asns=[f"AS{a}" for a in asns],
+            countries=countries,
+            key_metrics={
+                "n_asns":                len(asns),
+                "asns":                  [f"AS{a}" for a in asns],
+                "asn_labels":            labels,
+                "shared_campaign_links": links_w,
+                "bulletproof_asns":      [f"AS{a}" for a in bp_asns],
+                "block_grade_asns":      [f"AS{a}" for a in block_asns],
+                "mean_cooperation_score": round(mean_coop, 3),
+                "countries":             countries,
+                "tells":                 tells,
+            },
+            evidence_refs=[
+                {"section": "campaignmigration",
+                 "label": "ISP-collaboration graph (shared campaign fingerprints)"},
+                {"section": "asnintel",
+                 "label": "Per-ASN bulletproof / cooperation signals"}],
+            report_anchor="#28-campaign-migration-across-infrastructure-campaignmigration",
+            first_seen="", last_seen="",
+        ))
+    out.sort(key=lambda f: -json.loads(f["key_metrics"])["n_asns"])
+    return out[:BP_CLUSTER_TOP]
+
+
 PATTERNS: list[Callable] = [
     pat_telco_ss7_recon,
     pat_routing_protocol_on_public_ip,
@@ -1361,6 +1520,7 @@ PATTERNS: list[Callable] = [
     pat_self_mimic_honeypot_aware,
     pat_anomalous_chain,
     pat_fingerprint_rotation,
+    pat_bulletproof_asn_cluster,
     pat_critical_persistent_botnet,
 ]
 
@@ -1400,6 +1560,7 @@ def _register_views(con) -> None:
         ("chainfp_timed",    R / "chainfp" / "chainfp_timed.parquet"),
         ("composite_ep",     R / "compositeprint" / "composite.parquet"),
         ("composite_clusters", R / "compositeprint" / "clusters.parquet"),
+        ("isp_collab",       R / "campaignmigration" / "isp_collab.parquet"),
     ]
     for view, path in mapping:
         if not path.exists():

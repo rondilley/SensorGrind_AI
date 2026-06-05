@@ -48,22 +48,71 @@ PUPPETEER_CONFIG = os.environ.get(
 # Mermaid blocks
 # ----------------------------------------------------------------------
 
+def mm_text(s) -> str:
+    """Sanitize free text for use inside a Mermaid label so it parses the
+    same across every renderer we target: browser mermaid (HTML, v10),
+    mmdc/Puppeteer (PDF pre-render, v11) and GitHub / VS Code preview.
+
+    The browser renderer with securityLevel:'loose' is the most forgiving,
+    which is why a chart can look fine in the HTML yet throw a syntax error
+    in the PDF or in a Markdown preview.  The offenders:
+      - `"` collides with the surrounding ["..."] quoting -> single quote
+      - `&` is the flowchart node-conjunction operator and trips stricter
+        parsers even inside quotes -> spell it out
+      - `|` delimits edge labels (`-->|lbl|`) -> slash
+      - newlines break single-line statements
+    """
+    s = str(s).replace('"', "'").replace('&', ' and ')
+    # Commas delimit fields in sankey-beta CSV and trip stricter flowchart /
+    # gantt parsers (GitHub / VS Code preview), so drop them entirely.
+    s = s.replace(',', ' ')
+    s = s.replace('|', '/').replace('\n', ' ').replace('\r', ' ')
+    s = re.sub(r'\s+', ' ', s).strip()
+    # Strip stray leading/trailing punctuation left behind when a caller
+    # truncates an org name mid-token (e.g. "AT&T Enterprises, " -> trailing ',').
+    return s.strip(" ,.;:-_/")
+
+
+def mm_trunc(text, maxlen: int = 22) -> str:
+    """Truncate label text to <=maxlen on a word boundary so node labels never
+    cut mid-word (which reads as a broken label).  Falls back to a hard cut
+    only when the first word alone already exceeds maxlen."""
+    t = str(text).strip()
+    if len(t) <= maxlen:
+        return t
+    cut = t[:maxlen].rsplit(" ", 1)[0]
+    return cut if cut else t[:maxlen]
+
+
+def mm_id(s) -> str:
+    """Make a Mermaid-safe node/participant identifier (alphanumerics +
+    underscore only).  Labels carry the human-readable text."""
+    return re.sub(r'[^A-Za-z0-9_]', '_', str(s)) or "n"
+
+
+def mm_csv_field(s) -> str:
+    """Quote a sankey-beta CSV field.  sankey-beta is comma-delimited, so a
+    label like `AT&T Enterprises, LLC` silently shifts every column unless
+    the field is double-quoted (RFC-4180).  This was the bug that made the
+    campaign-migration hand-off Sankey render in HTML but fail in the PDF."""
+    return '"' + mm_text(s).replace('"', "'") + '"'
+
+
 def mermaid_pie(title: str, data: list[tuple[str, float]]) -> str:
-    lines = ["```mermaid", "pie showData", f'    title {title}']
+    lines = ["```mermaid", "pie showData", f'    title {mm_text(title)}']
     for label, value in data:
-        safe = str(label).replace('"', "'")
-        lines.append(f'    "{safe}" : {value}')
+        lines.append(f'    "{mm_text(label)}" : {value}')
     lines.append("```")
     return "\n".join(lines)
 
 
 def mermaid_xychart_bar(title: str, x_labels: list[str], y_values: list[float],
                         x_title: str = "", y_title: str = "") -> str:
-    safe = [str(x).replace('"', "'") for x in x_labels]
+    safe = [mm_text(x) for x in x_labels]
     x = ", ".join(f'"{s}"' for s in safe)
     y = ", ".join(f"{v:.0f}" for v in y_values)
     lines = ["```mermaid", "xychart-beta",
-             f'    title "{title}"',
+             f'    title "{mm_text(title)}"',
              f'    x-axis [{x}]',
              f'    y-axis "{y_title}"' if y_title else '    y-axis "count"',
              f"    bar [{y}]",
@@ -73,13 +122,13 @@ def mermaid_xychart_bar(title: str, x_labels: list[str], y_values: list[float],
 
 def mermaid_xychart_line(title: str, x_labels: list[str], y_values: list[float],
                          y_title: str = "value") -> str:
-    safe = [str(x).replace('"', "'") for x in x_labels]
+    safe = [mm_text(x) for x in x_labels]
     x = ", ".join(f'"{s}"' for s in safe)
     y = ", ".join(f"{v:.0f}" for v in y_values)
     lines = ["```mermaid", "xychart-beta",
-             f'    title "{title}"',
+             f'    title "{mm_text(title)}"',
              f'    x-axis [{x}]',
-             f'    y-axis "{y_title}"',
+             f'    y-axis "{mm_text(y_title)}"',
              f"    line [{y}]",
              "```"]
     return "\n".join(lines)
@@ -89,12 +138,9 @@ def mermaid_sequence(actors: list[str],
                      messages: list[tuple[str, str, str]]) -> str:
     lines = ["```mermaid", "sequenceDiagram"]
     for a in actors:
-        safe = a.replace(' ', '_')
-        lines.append(f'    participant {safe} as {a}')
+        lines.append(f'    participant {mm_id(a)} as {mm_text(a)}')
     for src, dst, msg in messages:
-        s = src.replace(' ', '_')
-        d = dst.replace(' ', '_')
-        lines.append(f'    {s}->>{d}: {msg}')
+        lines.append(f'    {mm_id(src)}->>{mm_id(dst)}: {mm_text(msg)}')
     lines.append("```")
     return "\n".join(lines)
 
@@ -103,20 +149,52 @@ def mermaid_flowchart(direction: str, nodes: list[tuple[str, str]],
                       edges: list[tuple[str, str, str]]) -> str:
     lines = ["```mermaid", f"flowchart {direction}"]
     for nid, lbl in nodes:
-        lines.append(f'    {nid}["{lbl}"]')
+        lines.append(f'    {mm_id(nid)}["{mm_text(lbl)}"]')
     for src, dst, lbl in edges:
         if lbl:
-            lines.append(f'    {src} -->|{lbl}| {dst}')
+            lines.append(f'    {mm_id(src)} -->|{mm_text(lbl)}| {mm_id(dst)}')
         else:
-            lines.append(f'    {src} --> {dst}')
+            lines.append(f'    {mm_id(src)} --> {mm_id(dst)}')
     lines.append("```")
     return "\n".join(lines)
 
 
+def _sankey_acyclic(rows: list[tuple[str, str, float]]
+                    ) -> list[tuple[str, str, float]]:
+    """sankey-beta rejects directed cycles ('Error: circular link') and
+    self-loops, so keep edges greedily by descending weight, skipping any
+    that would close a cycle.  The heaviest flows survive; this is what makes
+    the campaign-migration hand-off Sankey (which legitimately has A->B and
+    B->A pairs) renderable instead of erroring out."""
+    adj: dict[str, set] = {}
+
+    def reaches(a: str, b: str) -> bool:
+        seen, stack = set(), [a]
+        while stack:
+            cur = stack.pop()
+            if cur == b:
+                return True
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(adj.get(cur, ()))
+        return False
+
+    kept = []
+    for s, t, v in sorted(rows, key=lambda r: r[2], reverse=True):
+        if s == t:                      # self-loop
+            continue
+        if reaches(t, s):               # adding s->t would close a cycle
+            continue
+        adj.setdefault(s, set()).add(t)
+        kept.append((s, t, v))
+    return kept
+
+
 def mermaid_sankey(rows: list[tuple[str, str, float]]) -> str:
     lines = ["```mermaid", "sankey-beta", ""]
-    for s, t, v in rows:
-        lines.append(f"{s},{t},{int(v)}")
+    for s, t, v in _sankey_acyclic(rows):
+        lines.append(f"{mm_csv_field(s)},{mm_csv_field(t)},{int(v)}")
     lines.append("```")
     return "\n".join(lines)
 
@@ -150,16 +228,19 @@ def mermaid_gantt(title: str,
 
     lines = ["```mermaid", "gantt",
              "    dateFormat YYYY-MM-DD",
-             f"    title {title}",
+             f"    title {mm_text(title)}",
              f"    axisFormat {axis_format}",
              f"    tickInterval {tick_interval}",
              "    weekday monday"]
     cur_section = None
     for section, task, start, end in items:
-        if section != cur_section:
-            lines.append(f"    section {section}")
-            cur_section = section
-        clean_task = task.replace(":", "-")
+        clean_section = mm_text(section).replace(":", "-").replace(",", " ")
+        if clean_section != cur_section:
+            lines.append(f"    section {clean_section}")
+            cur_section = clean_section
+        # Gantt task metadata after the ':' is comma-delimited, so the task
+        # name must not contain ':' or ',' or it shifts the start/end fields.
+        clean_task = mm_text(task).replace(":", "-").replace(",", " ")
         lines.append(f"    {clean_task} :{start}, {end}")
     lines.append("```")
     return "\n".join(lines)
@@ -552,14 +633,29 @@ def svg_heatmap(matrix: list[list[float]], row_labels: list[str],
 _MERMAID_BLOCK = re.compile(r"```mermaid\n(.*?)\n```", re.DOTALL)
 
 
+# Mermaid renders flowchart labels as HTML inside <foreignObject> by default
+# (htmlLabels:true).  WeasyPrint (our PDF engine) cannot render foreignObject,
+# so flowchart text silently disappears in the PDF while shapes/edges remain.
+# Force native SVG <text> labels for the PDF pre-render path only -- the HTML
+# report uses live mermaid.js where foreignObject is fine.
+_MMDC_CONFIG = (
+    '{"flowchart":{"htmlLabels":false,"useMaxWidth":false},'
+    '"htmlLabels":false}'
+)
+
+
 def render_mermaid_to_svg(mmd_src: str, out_path: Path) -> bool:
     if not Path(MMDC).exists():
         return False
     with tempfile.NamedTemporaryFile("w", suffix=".mmd", delete=False) as f:
         f.write(mmd_src)
         tmp = f.name
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as cf:
+        cf.write(_MMDC_CONFIG)
+        cfg = cf.name
     try:
-        cmd = [MMDC, "-i", tmp, "-o", str(out_path), "-b", "white"]
+        cmd = [MMDC, "-i", tmp, "-o", str(out_path), "-b", "white",
+               "-c", cfg]
         if Path(PUPPETEER_CONFIG).exists():
             cmd.extend(["-p", PUPPETEER_CONFIG])
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -568,10 +664,11 @@ def render_mermaid_to_svg(mmd_src: str, out_path: Path) -> bool:
         print(f"[report] mmdc failed: {e}", file=sys.stderr)
         return False
     finally:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
+        for p in (tmp, cfg):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
 
 def md_to_html_body(md_text: str) -> str:

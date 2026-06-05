@@ -44,6 +44,7 @@ from report.render import (
     MMDC, PUPPETEER_CONFIG,
     mermaid_pie, mermaid_xychart_bar, mermaid_xychart_line,
     mermaid_sequence, mermaid_flowchart, mermaid_sankey, mermaid_gantt,
+    mm_trunc,
     svg_bar_chart, svg_line_chart, svg_gantt_chart, smart_bar, smart_line,
     mermaid_histogram, percentile_table, svg_heatmap,
     render_mermaid_to_svg, md_to_html_body, write_html,
@@ -609,6 +610,47 @@ def run(args: argparse.Namespace) -> int:
             WHERE cross_infra = TRUE AND seq_chain NOT LIKE 'ICMP/8.0%'
             ORDER BY n_asns DESC, n_ips DESC, total_packets DESC
             LIMIT 30
+        """).fetchall()
+
+    # ---- v2.9: campaignmigration - fingerprint rotation across infrastructure ----
+    migration_summary: dict = {}
+    migration_cohost: list = []
+    migration_handoff: list = []
+    migration_hosts: list = []
+    mig_dir = lib.REPORTS / "campaignmigration"
+    mig_collab_path = mig_dir / "isp_collab.parquet"
+    mig_hosts_path = mig_dir / "compromised_hosts.parquet"
+    mig_path = mig_dir / "migration.parquet"
+    if mig_path.exists():
+        s = con.execute(f"""
+            SELECT count(DISTINCT core_hash) AS campaigns,
+                   count(DISTINCT asn) AS asns
+            FROM read_parquet('{mig_path}')
+        """).fetchone()
+        migration_summary = {"campaigns": s[0], "asns": s[1]}
+    if mig_hosts_path.exists():
+        for cls, n in con.execute(f"""
+            SELECT host_class, count(*) FROM read_parquet('{mig_hosts_path}')
+            GROUP BY host_class
+        """).fetchall():
+            migration_summary[f"host_{cls}"] = n
+        migration_hosts = con.execute(f"""
+            SELECT src_ip, host_class, n_campaigns, active_days, packets,
+                   asn, country_iso
+            FROM read_parquet('{mig_hosts_path}')
+            ORDER BY n_campaigns DESC, active_days DESC, packets DESC
+            LIMIT 25
+        """).fetchall()
+    if mig_collab_path.exists():
+        migration_cohost = con.execute(f"""
+            SELECT src_asn, src_org, dst_asn, dst_org, shared_campaigns
+            FROM read_parquet('{mig_collab_path}') WHERE kind = 'cohost'
+            ORDER BY shared_campaigns DESC LIMIT 30
+        """).fetchall()
+        migration_handoff = con.execute(f"""
+            SELECT src_asn, src_org, dst_asn, dst_org, shared_campaigns
+            FROM read_parquet('{mig_collab_path}') WHERE kind = 'handoff'
+            ORDER BY shared_campaigns DESC LIMIT 25
         """).fetchall()
 
     # ---- cross-signal conclusions ----
@@ -1992,7 +2034,7 @@ def run(args: argparse.Namespace) -> int:
     H(2, "26. Per-IP Packet Choreography Fingerprints (chainfp)")
     P("**What this shows:** the *temporal order* in which a source's packets "
       "arrive within one session, encoded as a chain of "
-      "`<flag_mask>-<proto>/<port>` tokens (Tom Liston's `sensorChain.pl` "
+      "`<flag_mask>-<proto>/<port>` tokens (Ron Dilley's `sensorChain.pl` "
       "grammar, ListonCon 2023).  Where every other analyzer aggregates a "
       "source into counts and sets - erasing order - chains preserve it, so "
       "`SYN-then-own-RST`, `RST-without-prior-SYN`, and no-teardown sequences "
@@ -2090,6 +2132,121 @@ def run(args: argparse.Namespace) -> int:
         P("")
         P("> _No compositeprint output yet.  Run `python src/evolve.py "
           "compositeprint` to populate this section._")
+
+    # ---------- 28. Campaign migration across infrastructure ----------
+    md.append('\n<a id="campaign-migration-campaignmigration"></a>')
+    H(2, "28. Campaign Migration Across Infrastructure (campaignmigration)")
+    P("**What this shows:** how each campaign fingerprint (a compositeprint "
+      "`core_hash`) **rotates across ASNs/CIDRs/IPs over time** to dodge "
+      "blocklists.  Two intelligence products fall out of the migration "
+      "pattern: an **ISP-collaboration graph** (networks linked by hosting the "
+      "*same* fingerprints -- the complicit / bulletproof / persistently-"
+      "compromised cluster) and **compromised-host churn** (source IPs reused "
+      "across campaigns or kept alive for days -- candidate cycled relays).  "
+      "Per-campaign migration timelines (Gantt) are in "
+      "`reports/campaignmigration/migration.md`.")
+    if migration_summary.get("campaigns"):
+        P("")
+        P(f"- **{migration_summary['campaigns']:,}** migrating campaigns across "
+          f"**{migration_summary['asns']:,}** ASNs")
+        P(f"- compromised hosts: **{migration_summary.get('host_cycled', 0):,}** "
+          f"cycled (reused across >= 2 campaigns), "
+          f"**{migration_summary.get('host_persistent', 0):,}** persistent "
+          f"relays, **{migration_summary.get('host_transient', 0):,}** transient")
+    if migration_cohost:
+        H(3, "ISP collaboration - ASNs hosting the same campaigns")
+        P("_Edge weight = number of distinct campaign fingerprints shared._")
+        P("")
+        nodes = {}
+        edges = []
+        for sa, so, da, do, n in migration_cohost:
+            nodes[f"AS{sa}"] = f"AS{sa} {mm_trunc(so or '', 22)}".strip()
+            nodes[f"AS{da}"] = f"AS{da} {mm_trunc(do or '', 22)}".strip()
+            edges.append((f"AS{sa}", f"AS{da}", str(n)))
+        P(mermaid_flowchart("LR", list(nodes.items()), edges))
+        P("")
+    if migration_handoff:
+        H(3, "Migration hand-offs (campaign moved AS-A -> AS-B)")
+        P("")
+        P(mermaid_sankey([(f"AS{sa} {mm_trunc(so or '', 18)}".strip(),
+                           f"AS{da} {mm_trunc(do or '', 18)}".strip(), n)
+                          for sa, so, da, do, n in migration_handoff]))
+        P("")
+    if migration_hosts:
+        H(3, "Top cycled / persistent source hosts")
+        P("_Candidate compromised relays reused across campaigns or kept "
+          "alive across days._")
+        P("")
+        P("| src_ip | class | campaigns | active_days | packets | asn | country |")
+        P("| --- | --- | --- | --- | --- | --- | --- |")
+        for ip, cls, ncamp, adays, pkts, asn, ciso in migration_hosts:
+            P(f"| {ip} | {cls} | {ncamp} | {adays} | {int(pkts or 0):,} "
+              f"| AS{asn} | {ciso or ''} |")
+    if not migration_summary.get("campaigns"):
+        P("")
+        P("> _No campaignmigration output yet.  Run `python src/evolve.py "
+          "campaignmigration` to populate this section._")
+
+    # ---------- 29. MITRE ATT&CK coverage ----------
+    H(2, "29. MITRE ATT&CK Technique Coverage (attackmap)")
+    P("**What this shows:** observed honeypot behaviors mapped to MITRE "
+      "ATT&CK technique IDs (rule-based, derived from portscans, rdpbrute, "
+      "probesigs, droppers, botnetcls, and tlsintel).  `evidence_count` is "
+      "the number of supporting analyzer rows -- a relative volume signal, "
+      "not a severity ranking.")
+    _con_atk = lib.duck()
+    atk_rows = safe_read_table(_con_atk,
+                               lib.REPORTS / "attackmap" / "attackmap.parquet")
+    _con_atk.close()
+    if atk_rows:
+        atk_rows = sorted(atk_rows, key=lambda r: (r[1] or 0), reverse=True)
+        P("")
+        P(f"**{len(atk_rows)}** distinct techniques observed.")
+        P("")
+        P("| technique | evidence_count | sources |")
+        P("| --- | --- | --- |")
+        for tech, cnt, sources in atk_rows:
+            P(f"| {tech} | {int(cnt or 0):,} | {sources or ''} |")
+    else:
+        P("")
+        P("> _No attackmap output yet.  It runs under the `analyzers` stage; "
+          "run `python src/evolve.py analyzers` to populate this section._")
+
+    # ---------- 30. HTTP request templates ----------
+    H(2, "30. HTTP Request Templates (httppatterns)")
+    P("**What this shows:** HTTP attack requests clustered by structural "
+      "(character n-gram) similarity into reusable templates, recovering the "
+      "underlying campaigns that exact/prefix methods miss (attack requests "
+      "embed unique tokens, so most are byte-distinct). Volume is total "
+      "occurrences across the corpus; the dominant tool User-Agent is shown "
+      "where one exists.")
+    hp_summary = lib.REPORTS / "http_patterns" / "summary.json"
+    if hp_summary.exists():
+        import json as _json
+        s = _json.loads(hp_summary.read_text())
+        cov = s.get("coverage_estimate")
+        P("")
+        P(f"- **{s.get('distinct_payloads', 0):,}** distinct HTTP payloads → "
+          f"**{s.get('clusters', 0):,}** templates")
+        if cov is not None:
+            P(f"- coverage estimate: **{cov*100:.1f}%** of HTTP requests fall "
+              f"into a recurring template (rest are one-off)")
+    _con_hp = lib.duck()
+    hp_rows = safe_read_table(_con_hp,
+                              lib.REPORTS / "http_patterns" / "http_patterns.parquet")
+    _con_hp.close()
+    if hp_rows:
+        hp_rows = sorted(hp_rows, key=lambda r: (r[3] or 0), reverse=True)[:25]
+        P("")
+        P("| template | distinct | volume |")
+        P("| --- | --- | --- |")
+        for cid, tmpl, distinct, vol, share, sample in hp_rows:
+            safe = str(tmpl).replace("|", "\\|")[:90]
+            P(f"| `{safe}` | {int(distinct or 0):,} | {int(vol or 0):,} |")
+    else:
+        P("")
+        P("> _No httppatterns output yet.  Run `python src/evolve.py "
+          "httppatterns` to populate this section._")
 
     # ---------- Appendix ----------
     H(2, "Appendix A. Per-analyzer data coverage")

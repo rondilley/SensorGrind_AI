@@ -23,6 +23,7 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -75,6 +76,14 @@ def extract_X(table: pa.Table) -> np.ndarray:
         if name in LOG_FEATURES:
             X[:, i] = np.log1p(np.maximum(X[:, i], 0))
     return X
+
+
+def as_frame(X: np.ndarray) -> pd.DataFrame:
+    """Wrap a feature matrix as a named DataFrame so LightGBM stores and
+    aligns features by name (not position).  Fit and predict must both go
+    through this, otherwise sklearn warns about missing feature names and
+    silently falls back to positional matching."""
+    return pd.DataFrame(X, columns=NUMERIC_FEATURES)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -146,10 +155,10 @@ def run(args: argparse.Namespace) -> int:
         min_child_samples=50, subsample=0.8, colsample_bytree=0.8,
         n_jobs=-1, random_state=42, verbose=-1,
     )
-    model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
+    model.fit(as_frame(X_tr), y_tr, eval_set=[(as_frame(X_va), y_va)],
               callbacks=[lgb.early_stopping(30, verbose=False)])
 
-    p_va = model.predict_proba(X_va)[:, 1]
+    p_va = model.predict_proba(as_frame(X_va))[:, 1]
     auc = float(roc_auc_score(y_va, p_va))
     ap = float(average_precision_score(y_va, p_va))
     # Brier score is the reliability metric the multi-AI methodology
@@ -160,7 +169,7 @@ def run(args: argparse.Namespace) -> int:
     # distribution to BENIGN and THREAT - a sanity check for PU-style
     # label-noise propagation.
     if (~labeled).any():
-        p_unl = model.predict_proba(X[~labeled])[:, 1]
+        p_unl = model.predict_proba(as_frame(X[~labeled]))[:, 1]
         unl_pos_frac = float((p_unl >= 0.5).mean())
     else:
         unl_pos_frac = 0.0
@@ -185,7 +194,7 @@ def run(args: argparse.Namespace) -> int:
         rng = np.random.default_rng(42)
         sample_idx = rng.choice(len(X_va), size=sample_n, replace=False)
         shap_explainer = shap.TreeExplainer(model)
-        sv = shap_explainer.shap_values(X_va[sample_idx])
+        sv = shap_explainer.shap_values(as_frame(X_va[sample_idx]))
         # LightGBM binary returns list[2] in legacy shap; positive class is [1].
         if isinstance(sv, list):
             sv = sv[1]

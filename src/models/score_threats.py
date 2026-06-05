@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -54,10 +55,19 @@ def main() -> int:
     print(f"[score_threats] scoring {table.num_rows:,} IPs...", file=sys.stderr)
 
     # local import to keep module-load light
-    from models.train_threat_classifier import extract_X, bootstrap_label
+    from models.train_threat_classifier import extract_X, bootstrap_label, as_frame
 
     X = extract_X(table)
-    probs = model.predict_proba(X)[:, 1]
+    # Align by name to whatever names the model was fitted with.  Newer
+    # models carry the real feature names; legacy models carry LightGBM's
+    # positional placeholders (Column_0..).  extract_X always emits columns
+    # in NUMERIC_FEATURES order, which matches both, so naming the columns
+    # after the model both silences the "no valid feature names" warning and
+    # makes scoring robust to feature-list reordering.
+    feat_names = getattr(model, "feature_names_in_", None)
+    X_in = (pd.DataFrame(X, columns=list(feat_names))
+            if feat_names is not None else as_frame(X))
+    probs = model.predict_proba(X_in)[:, 1]
     rows = table.to_pylist()
     labels = np.array([bootstrap_label(r) for r in rows], dtype=np.int8)
 

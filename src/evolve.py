@@ -88,12 +88,18 @@ STAGES: dict[str, list[str]] = {
     "chainfp":       [str(SRC / "chainfp.py")],
     # --- v2.8 fused multi-dimensional cluster fingerprint (adaptive episodes) ---
     "compositeprint": [str(SRC / "compositeprint.py")],
+    # --- v2.9 campaign migration map (fingerprint rotation across ASN/CIDR/IP) ---
+    "campaignmigration": [str(SRC / "campaignmigration.py")],
+    # --- v3.1 representation-based HTTP payload templates (Track B) ---
+    "httppatterns": [str(SRC / "httppatterns.py")],
     # --- v2.6 cross-analyzer correlator + AI-written conclusions ---
     "correlate":    [str(SRC / "conclusions" / "correlate.py")],
     "conclude":     [str(SRC / "conclusions" / "synthesize.py")],
     "report":       [str(SRC / "report" / "comprehensive_report.py")],
     # --- v2.4 cross-AI review of the tool itself ---
     "aireview":     [str(SRC / "aireview.py")],
+    # --- v3.0 quantitative baseline metrics (coverage/health + precision) ---
+    "metrics":      [str(SRC / "bench" / "compute_metrics.py")],
 }
 ORDER = list(STAGES.keys())
 
@@ -116,51 +122,65 @@ STAGE_IO: dict[str, dict[str, list[str]]] = {
                     "output/parquet/iocs_clustered/**/*.parquet"],
     },
     "features": {
-        "inputs":  ["data/parsed/**/*.parquet", "src/features/**/*.py"],
-        "outputs": ["data/features/ip/**/*.parquet"],
+        "inputs":  ["output/parquet/packets/**/*.parquet",
+                    "output/parquet/l7_events/**/*.parquet",
+                    "output/parquet/iocs/**/*.parquet",
+                    "src/features/**/*.py"],
+        "outputs": ["output/features/ip/**/*.parquet"],
     },
     "model": {
-        "inputs":  ["data/features/ip/**/*.parquet",
+        "inputs":  ["output/features/ip/**/*.parquet",
                     "src/models/train_threat_classifier.py"],
         "outputs": ["output/models/threat_classifier/**/model.joblib"],
     },
     "score": {
         "inputs":  ["output/models/threat_classifier/**/model.joblib",
-                    "data/features/ip/**/*.parquet",
+                    "output/features/ip/**/*.parquet",
                     "src/models/score_threats.py"],
-        "outputs": ["output/reports/threat_scores/threat_scores.parquet"],
+        "outputs": ["output/risk/threat_scores/scores_*.parquet"],
     },
     "risk": {
-        "inputs":  ["output/reports/threat_scores/threat_scores.parquet",
+        "inputs":  ["output/risk/threat_scores/scores_*.parquet",
                     "src/risk/compute_risk_score.py"],
-        "outputs": ["output/reports/risk_scores/risk_scores.parquet"],
+        "outputs": ["output/risk/ip_risk/**/risk.parquet"],
     },
     "actors": {
-        "inputs":  ["data/features/ip/**/*.parquet",
+        "inputs":  ["output/features/ip/**/*.parquet",
                     "src/models/train_actor_clusterer.py"],
         "outputs": ["output/models/actor_clusterer/**/model.joblib",
                     "output/patterns/actor_clusters/assignments.parquet"],
     },
     "mining": {
-        "inputs":  ["data/parsed/**/*.parquet",
+        "inputs":  ["output/parquet/packets/**/*.parquet",
                     "src/mining/mine_itemsets.py"],
         "outputs": ["output/patterns/itemsets.parquet"],
     },
     "longitudinal": {
-        "inputs":  ["data/parsed/**/*.parquet",
+        "inputs":  ["output/parquet/packets/**/*.parquet",
                     "src/longitudinal/detect_changepoints.py"],
         "outputs": ["output/patterns/changepoints/ip_changepoints.parquet"],
     },
     "drift": {
-        "inputs":  ["data/features/ip/**/*.parquet",
+        "inputs":  ["output/features/ip/**/*.parquet",
                     "src/models/detect_drift.py"],
-        "outputs": ["output/reports/drift/drift.parquet"],
+        "outputs": ["output/patterns/drift/drift.parquet"],
     },
     "compositeprint": {
         "inputs":  ["output/parquet/packets/**/*.parquet",
                     "output/reports/ja4plus/ja4plus.parquet",
                     "src/compositeprint.py"],
         "outputs": ["output/reports/compositeprint/composite.parquet"],
+    },
+    "campaignmigration": {
+        "inputs":  ["output/reports/compositeprint/composite.parquet",
+                    "output/reports/compositeprint/clusters.parquet",
+                    "src/campaignmigration.py"],
+        "outputs": ["output/reports/campaignmigration/migration.parquet"],
+    },
+    "httppatterns": {
+        "inputs":  ["output/parquet/payload_blobs/**/*.parquet",
+                    "src/httppatterns.py"],
+        "outputs": ["output/reports/http_patterns/http_patterns.parquet"],
     },
 }
 
@@ -220,12 +240,19 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
     # stack/app/payload fingerprints; analyzers produces ja4plus, chainfp the
     # session grammar it reuses, cluster the edge is for scheduling (memory).
     "compositeprint":  ["analyzers", "cluster", "chainfp"],
+    # campaignmigration maps compositeprint fingerprints rotating across ASNs
+    # over time; asnintel supplies ASN org labels for the collaboration graph.
+    "campaignmigration": ["compositeprint", "asnintel"],
+    # httppatterns clusters raw HTTP payload_blobs; the analyzers edge is for
+    # scheduling (keep its sklearn/hdbscan job off the heaviest DuckDB stages).
+    "httppatterns":    ["analyzers"],
     # correlate reads every per-analyzer parquet + the risk snapshot;
     # depend broadly so it runs after everything it might join against.
     "correlate":       ["risk", "nonipproto", "protocolanomaly",
                         "asnintel", "cidrintel", "tooling", "slowlow",
                         "selfmimic", "isc_compare", "coordination",
-                        "chains", "chainfp", "compositeprint"],
+                        "chains", "chainfp", "compositeprint",
+                        "campaignmigration"],
     "conclude":        ["correlate"],
     # adversarysim consults other analyzers' outputs for coverage scoring;
     # depending on a broad set of stages keeps it last among siblings.
@@ -242,9 +269,12 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
                      "aipayloaddecode", "asnintel", "cidrintel", "tooling",
                      "actorlink", "originintel",
                      "slowlow", "dnstlsintel", "selfmimic",
-                     "chainfp", "compositeprint",
-                     "correlate", "conclude"],
+                     "chainfp", "compositeprint", "campaignmigration",
+                     "httppatterns", "correlate", "conclude"],
     "aireview":     ["report"],
+    # metrics reads findings (conclude), risk, and analyzer reports
+    # (trafficprint, attackmap, httppatterns); depend on producers so it runs last.
+    "metrics":      ["conclude", "risk", "analyzers", "httppatterns"],
 }
 
 
