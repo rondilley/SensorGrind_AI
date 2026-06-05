@@ -94,6 +94,8 @@ STAGES: dict[str, list[str]] = {
     "httppatterns": [str(SRC / "httppatterns.py")],
     # --- v2.6 cross-analyzer correlator + AI-written conclusions ---
     "correlate":    [str(SRC / "conclusions" / "correlate.py")],
+    # --- v3.2 KG-lite: fuse findings into threat storylines (Track C) ---
+    "kg":           [str(SRC / "conclusions" / "graph.py")],
     "conclude":     [str(SRC / "conclusions" / "synthesize.py")],
     "report":       [str(SRC / "report" / "comprehensive_report.py")],
     # --- v2.4 cross-AI review of the tool itself ---
@@ -182,6 +184,11 @@ STAGE_IO: dict[str, dict[str, list[str]]] = {
                     "src/httppatterns.py"],
         "outputs": ["output/reports/http_patterns/http_patterns.parquet"],
     },
+    "kg": {
+        "inputs":  ["output/conclusions/findings.parquet",
+                    "src/conclusions/graph.py"],
+        "outputs": ["output/conclusions/storylines/storylines.parquet"],
+    },
 }
 
 # Explicit dependency overrides — used for stages whose I/O contract is
@@ -253,7 +260,10 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
                         "selfmimic", "isc_compare", "coordination",
                         "chains", "chainfp", "compositeprint",
                         "campaignmigration"],
-    "conclude":        ["correlate"],
+    # kg fuses the correlator's findings into storylines; conclude then narrates
+    # both the per-finding cards and the multi-finding storylines.
+    "kg":              ["correlate"],
+    "conclude":        ["correlate", "kg"],
     # adversarysim consults other analyzers' outputs for coverage scoring;
     # depending on a broad set of stages keeps it last among siblings.
     "adversarysim":    ["slowlow", "dnstlsintel", "selfmimic",
@@ -270,11 +280,11 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
                      "actorlink", "originintel",
                      "slowlow", "dnstlsintel", "selfmimic",
                      "chainfp", "compositeprint", "campaignmigration",
-                     "httppatterns", "correlate", "conclude"],
+                     "httppatterns", "correlate", "kg", "conclude"],
     "aireview":     ["report"],
-    # metrics reads findings (conclude), risk, and analyzer reports
-    # (trafficprint, attackmap, httppatterns); depend on producers so it runs last.
-    "metrics":      ["conclude", "risk", "analyzers", "httppatterns"],
+    # metrics reads findings (conclude), storylines (kg), risk, and analyzer
+    # reports (trafficprint, attackmap, httppatterns); depend on producers.
+    "metrics":      ["conclude", "kg", "risk", "analyzers", "httppatterns"],
 }
 
 

@@ -19,17 +19,22 @@ import pyarrow as pa
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from sg import lib
 
+# Family-name markers are wrapped in \b word boundaries: a bare substring like
+# "MOZI" matches inside "Mozilla" (the case-insensitive bug that mislabeled
+# 356K browser/zgrab User-Agents as the Mozi botnet). "\bMozi\b" still matches
+# the "Mozi.m"/"Mozi.a" dropper filenames and standalone binary markers but NOT
+# "Mozilla". Same fix applied to the other bare family names.
 FAMILY_SIGS: list[tuple[str, str, str]] = [
     (r"ECCHI", "mirai", "Mirai ECCHI variant marker"),
     (r"/bin/busybox\s", "mirai", "Mirai busybox command chain"),
     (r"enable\r\nshell\r\nsh\r\n", "mirai", "Mirai telnet enable sequence"),
     (r"cd /tmp", "mirai_dropper", "Mirai dropper stage (cd /tmp)"),
     (r"/dev/null 2>&1", "mirai_dropper", "Mirai shell redirection"),
-    (r"HAJIME", "hajime", "Hajime marker"),
-    (r"MOZI", "mozi", "Mozi P2P botnet"),
-    (r"LZRD", "lzrd", "LZRD botnet variant"),
-    (r"SATORI", "satori", "Satori/Okiru variant"),
-    (r"TSUNAMI", "tsunami", "Tsunami/Kaiten IRC bot"),
+    (r"\bHAJIME\b", "hajime", "Hajime marker"),
+    (r"\bMozi\b", "mozi", "Mozi P2P botnet (Mozi.m/Mozi.a dropper or binary marker)"),
+    (r"\bLZRD\b", "lzrd", "LZRD botnet variant"),
+    (r"\bSATORI\b", "satori", "Satori/Okiru variant"),
+    (r"\bTSUNAMI\b", "tsunami", "Tsunami/Kaiten IRC bot"),
     (r"PRIVMSG", "irc_bot", "IRC bot PRIVMSG command"),
     (r"NICK\s", "irc_bot", "IRC bot NICK registration"),
     (r"GET /shell\?", "rce_scanner", "RCE probe via GET /shell"),

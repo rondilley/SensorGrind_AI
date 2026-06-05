@@ -10,6 +10,7 @@ the honeypot data.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from collections import defaultdict
 
@@ -45,6 +46,23 @@ RESULT_SCHEMA = pa.schema([
     ("evidence_count", pa.uint32()),
     ("sources",      pa.string()),
 ])
+
+# HTTP request templates (from httppatterns) → ATT&CK technique. Ordered;
+# first match wins. Technique strings reuse the ATTACK_RULES values where they
+# overlap so counts merge into one row. Regexes match against the template text.
+HTTP_TEMPLATE_RULES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"formLogin|wp-login|/login|signin|phpmyadmin|tomcat|/admin\b", re.I),
+     "T1110.001 — Brute Force: Password Guessing"),
+    (re.compile(r"\.env|/\.git|/\.aws|aws.?cred|/credential", re.I),
+     "T1552.001 — Unsecured Credentials: Files"),
+    (re.compile(r"wget|curl|busybox|tftp|/bin/|\bsh\b", re.I),
+     "T1105 — Ingress Tool Transfer"),
+    (re.compile(r"\.php|cgi-bin|boaform|\+CSCOE\+|/vendor/|/actuator|think.?app|"
+                r"/shell|phpunit|eval\(|/api/|\.cgi", re.I),
+     "T1190 — Exploit Public-Facing Application"),
+    (re.compile(r"sip:|moduleInformation|/favicon|^[A-Z]+ /\s*$", re.I),
+     "T1595 — Active Scanning"),
+]
 
 
 def run(args: argparse.Namespace) -> lib.Report:
@@ -106,6 +124,18 @@ def run(args: argparse.Namespace) -> lib.Report:
         if n > 0:
             technique_evidence["T1583.005 — Acquire Infrastructure: Botnet"]["count"] += n
             technique_evidence["T1583.005 — Acquire Infrastructure: Botnet"]["sources"].add("botnetcls")
+
+    # HTTP request templates (httppatterns) → techniques, weighted by volume.
+    path = lib.REPORTS / "http_patterns" / "http_patterns.parquet"
+    if path.exists() and path.stat().st_size > 0:
+        tmpls = con.execute(
+            f"SELECT template, volume FROM read_parquet('{path}')").fetchall()
+        for tmpl, vol in tmpls:
+            for rx, tech in HTTP_TEMPLATE_RULES:
+                if rx.search(tmpl or ""):
+                    technique_evidence[tech]["count"] += int(vol or 0)
+                    technique_evidence[tech]["sources"].add("httppatterns")
+                    break  # first match wins (avoid double-counting one template)
 
     con.close()
 

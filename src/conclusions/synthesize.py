@@ -30,6 +30,7 @@ import aipayloaddecode as aipd
 
 
 OUT_DIR = lib.OUTPUT_DIR / "conclusions"
+STORY_DIR = OUT_DIR / "storylines"
 CACHE = lib.OUTPUT_DIR / "ai_cache"
 
 
@@ -162,10 +163,10 @@ def _pretty_metrics(j: str) -> str:
     return json.dumps(obj, indent=2, default=str)[:6000]
 
 
-def _cache_key(provider: str, model: str, prompt: str) -> Path:
+def _cache_key(provider: str, model: str, prompt: str, stem: str = "conclude") -> Path:
     sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     safe_model = model.replace("/", "_").replace(":", "_")
-    return CACHE / f"conclude_{provider}_{safe_model}_{sha}.json"
+    return CACHE / f"{stem}_{provider}_{safe_model}_{sha}.json"
 
 
 def _bullets(v) -> str:
@@ -174,6 +175,187 @@ def _bullets(v) -> str:
     if isinstance(v, str):
         return v
     return ""
+
+
+# ----------------------------------------------------------------------
+# Storyline (KG-lite) synthesis — a campaign-level narrative over a GROUP of
+# findings the graph stage fused by a shared entity.  This is the cross-finding
+# pass: the per-finding prompt above sees one card; this one sees the whole
+# operator story and explains how the pieces connect.
+# ----------------------------------------------------------------------
+STORYLINE_CONCLUSION_SCHEMA = pa.schema([
+    ("storyline_id",      pa.string()),
+    ("finding_count",     pa.uint32()),
+    ("pattern_ids",       pa.string()),
+    ("severity",          pa.string()),
+    ("src_ip_count",      pa.uint32()),
+    ("src_ips_sample",    pa.string()),
+    ("asns_sample",       pa.string()),
+    ("linking_entities",  pa.string()),
+    ("first_seen",        pa.string()),
+    ("last_seen",         pa.string()),
+    ("provider",          pa.string()),
+    ("model",             pa.string()),
+    ("ai_title",          pa.string()),
+    ("ai_campaign_summary", pa.string()),
+    ("ai_why_connected",  pa.string()),
+    ("ai_actor_assessment", pa.string()),
+    ("ai_recommended_action", pa.string()),
+    ("ai_confidence",     pa.string()),
+    ("synthesized_at",    pa.timestamp("us", tz="UTC")),
+])
+
+# Human-readable meaning of the entity types the graph stage links on, so the
+# prompt can tell the model WHY these findings were grouped.
+_LINK_GLOSS = {
+    "core_hash": "an identical compositeprint core_hash (an infrastructure-"
+                 "independent behavioral fingerprint — the strongest single tell "
+                 "that two findings are the same tooling/operator)",
+    "chain":     "an identical packet-choreography chain (same per-connection "
+                 "flag/segment sequence)",
+    "ip":        "one or more shared source IP addresses",
+    "asn":       "shared source ASNs (corroborated — a single shared ASN alone "
+                 "was not enough to link them)",
+}
+
+
+STORYLINE_PROMPT_TEMPLATE = """You are a senior threat-intel analyst.  Several separately-detected findings from a long-running internet honeypot were algorithmically linked into ONE storyline because they share strong entities.  Write a single campaign-level conclusion that explains the connected story — not {n} separate ones.
+
+# Sensor context
+
+{sensor_context}
+
+# Why these findings were linked
+
+They were fused because they share: {link_reason}.
+
+# The member findings ({n} total)
+
+{member_block}
+
+# Your task
+
+Treat these as facets of (potentially) one operator/campaign.  Decide whether the linkage is convincing and tell the connected story.  Be specific and cite the shared entities + metrics above.
+
+Reply with strict JSON (no markdown fences, no prose outside the JSON):
+
+  ai_title              short punchy campaign title (max ~80 chars) for a report heading
+  ai_campaign_summary   2-4 sentences telling the unified story across the member findings (what one operator appears to be doing)
+  ai_why_connected      1-3 sentences on whether the shared entities genuinely imply ONE actor/campaign vs a coincidental overlap; state your reasoning
+  ai_actor_assessment   1-2 sentences characterizing the actor (tooling maturity, infrastructure pattern, likely objective)
+  ai_recommended_action 2-4 short bullets a defender can act on this week, treating the storyline as one campaign.  Each bullet a string in a JSON array.
+  ai_confidence         "high" | "medium" | "low" - confidence that this is one coherent campaign vs unrelated findings that happen to share an entity
+
+Return ONLY the JSON object."""
+
+
+def _story_member_block(members: list[dict]) -> str:
+    """Render the member findings compactly for the storyline prompt."""
+    out = []
+    for i, f in enumerate(members, 1):
+        out.append(
+            f"## Finding {i}: {f['pattern_title']} "
+            f"(`{f['pattern_id']}`, severity {f['severity']}, "
+            f"{f['src_ip_count']} source IPs)\n"
+            f"metrics: {_pretty_metrics(f.get('key_metrics', '{}'))[:1500]}"
+        )
+    return "\n\n".join(out)
+
+
+def _storyline_prompt(story: dict, members: list[dict]) -> str:
+    try:
+        link_counts = json.loads(story.get("linking_entities") or "{}")
+    except (ValueError, TypeError):
+        link_counts = {}
+    reasons = [_LINK_GLOSS.get(k, k) for k in link_counts] or ["a shared entity"]
+    return STORYLINE_PROMPT_TEMPLATE.format(
+        n=len(members),
+        sensor_context=SENSOR_CONTEXT,
+        link_reason="; ".join(reasons),
+        member_block=_story_member_block(members),
+    )
+
+
+def _load_storylines() -> list[dict]:
+    path = STORY_DIR / "storylines.parquet"
+    if not path.exists():
+        return []
+    rows = pq.read_table(path).to_pylist()
+    return [r for r in rows if int(r.get("finding_count") or 0) >= 2]
+
+
+def synthesize_storylines(args, provider, api_key, model,
+                          findings_by_id: dict[str, dict]) -> list[dict]:
+    """Campaign-level narratives for multi-finding storylines.  Returns the
+    written rows (for the markdown roll-up); writes storyline_conclusions.parquet.
+    Singletons are skipped — their per-finding card already covers them."""
+    stories = _load_storylines()
+    out_rows: list[dict] = []
+    n_cached = n_called = n_failed = 0
+    for s in stories:
+        try:
+            member_ids = json.loads(s["finding_ids"])
+        except (ValueError, TypeError):
+            member_ids = []
+        members = [findings_by_id[m] for m in member_ids if m in findings_by_id]
+        if len(members) < 2:
+            continue
+        prompt = _storyline_prompt(s, members)
+        parsed: dict | None = None
+        if provider["name"] != "none":
+            cache_p = _cache_key(provider["name"], model, prompt, stem="storyline")
+            if cache_p.exists() and not args.force:
+                parsed = json.loads(cache_p.read_text())
+                n_cached += 1
+            else:
+                print(f"[conclude] storyline {s['storyline_id']} "
+                      f"({len(members)} findings) -> {provider['name']}/{model}...",
+                      file=sys.stderr)
+                try:
+                    parsed = provider["call"](api_key, model, prompt)
+                except Exception as e:
+                    print(f"[conclude] storyline call failed: {e}", file=sys.stderr)
+                if parsed is None:
+                    n_failed += 1
+                else:
+                    cache_p.write_text(json.dumps(parsed, indent=2))
+                    n_called += 1
+                time.sleep(args.sleep)
+        if parsed is None:
+            parsed = {}
+        out_rows.append({
+            "storyline_id":     s["storyline_id"],
+            "finding_count":    int(s["finding_count"]),
+            "pattern_ids":      s["pattern_ids"],
+            "severity":         s["severity"],
+            "src_ip_count":     int(s["src_ip_count"]),
+            "src_ips_sample":   s["src_ips_sample"],
+            "asns_sample":      s["asns_sample"],
+            "linking_entities": s["linking_entities"],
+            "first_seen":       s["first_seen"],
+            "last_seen":        s["last_seen"],
+            "provider":         provider["name"],
+            "model":            model,
+            "ai_title":              str(parsed.get("ai_title", "")),
+            "ai_campaign_summary":   str(parsed.get("ai_campaign_summary", "")),
+            "ai_why_connected":      str(parsed.get("ai_why_connected", "")),
+            "ai_actor_assessment":   str(parsed.get("ai_actor_assessment", "")),
+            "ai_recommended_action": _bullets(parsed.get("ai_recommended_action", "")),
+            "ai_confidence":         str(parsed.get("ai_confidence", "")),
+            "synthesized_at":   _dt.datetime.now(_dt.timezone.utc),
+        })
+
+    STORY_DIR.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.Table.from_pylist(out_rows, schema=STORYLINE_CONCLUSION_SCHEMA),
+        STORY_DIR / "storyline_conclusions.parquet",
+        compression="zstd", compression_level=3,
+    )
+    if stories:
+        print(f"[conclude] {len(out_rows)} storyline narratives "
+              f"(cache {n_cached}, fresh {n_called}, fail {n_failed})",
+              file=sys.stderr)
+    return out_rows
 
 
 def run(args: argparse.Namespace) -> int:
@@ -283,6 +465,11 @@ def run(args: argparse.Namespace) -> int:
         compression="zstd", compression_level=3,
     )
 
+    # Cross-finding pass: campaign-level narratives over the storylines the kg
+    # stage fused.  Reuses the same provider/cache; writes its own parquet.
+    findings_by_id = {f["finding_id"]: f for f in findings}
+    story_rows = synthesize_storylines(args, provider, api_key, model, findings_by_id)
+
     sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     out_sorted = sorted(out_rows, key=lambda r: sev_order.get(r["severity"], 9))
 
@@ -298,6 +485,40 @@ def run(args: argparse.Namespace) -> int:
           "model*, the *risk* if the same toolkit hit a production target, and "
           "*recommended actions* a defender can take now.",
           ""]
+
+    if story_rows:
+        sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        md += ["## Threat storylines (fused findings)", "",
+               f"_{len(story_rows)} multi-finding storylines — groups of the cards "
+               "below that share a strong entity (compositeprint core_hash, packet "
+               "chain, or source IP) and so read as one operator/campaign._", ""]
+        for sr in sorted(story_rows, key=lambda r: sev_rank.get(r["severity"], 9)):
+            title = sr["ai_title"] or f"storyline {sr['storyline_id']}"
+            md.append(f"### {sr['severity'].upper()} — {title}")
+            md.append("")
+            md.append(f"_`{sr['storyline_id']}` — {sr['finding_count']} findings — "
+                      f"patterns: {sr['pattern_ids']} — confidence: "
+                      f"{sr['ai_confidence'] or 'n/a'}_")
+            md.append("")
+            if sr["ai_campaign_summary"]:
+                md.append(f"**Campaign:** {sr['ai_campaign_summary']}")
+                md.append("")
+            if sr["ai_why_connected"]:
+                md.append(f"**Why these are one story:** {sr['ai_why_connected']}")
+                md.append("")
+            if sr["ai_actor_assessment"]:
+                md.append(f"**Actor:** {sr['ai_actor_assessment']}")
+                md.append("")
+            if sr["ai_recommended_action"]:
+                md.append("**Recommended action:**")
+                md.append("")
+                for line in sr["ai_recommended_action"].split("\n"):
+                    if line.strip():
+                        md.append(line if line.lstrip().startswith("-")
+                                  else f"- {line.strip()}")
+                md.append("")
+            md.append("---")
+            md.append("")
 
     for r in out_sorted:
         title = r["ai_title"] or r["pattern_title"]

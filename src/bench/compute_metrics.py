@@ -47,6 +47,7 @@ CONCLUSIONS = lib.OUTPUT_DIR / "conclusions" / "conclusions.parquet"
 TRAFFICPRINT = lib.REPORTS / "trafficprint" / "trafficprint.parquet"
 ATTACKMAP  = lib.REPORTS / "attackmap" / "attackmap.parquet"
 HTTP_PATTERNS_SUMMARY = lib.REPORTS / "http_patterns" / "summary.json"
+STORYLINES_SUMMARY = lib.OUTPUT_DIR / "conclusions" / "storylines" / "summary.json"
 RISK_GLOB  = lib.OUTPUT_DIR / "risk" / "ip_risk"
 LABEL_QUEUE = EVAL_DIR / "label_queue.csv"
 LABEL_DONE  = EVAL_DIR / "label_queue_labeled.csv"
@@ -146,8 +147,22 @@ def gather_metrics() -> dict:
     # density-clustered fraction, not a nearest-centroid number.
     if HTTP_PATTERNS_SUMMARY.exists():
         s = json.loads(HTTP_PATTERNS_SUMMARY.read_text())
-        m["coverage"]["http_template_coverage"] = s.get("coverage_estimate")
-        m["corpus"]["http_templates"] = s.get("clusters", 0)
+        # coverage is over the INTENT-BEARING HTTP subset (bare GET / excluded).
+        m["coverage"]["http_intent_template_coverage"] = s.get("coverage_estimate")
+        m["corpus"]["http_intent_templates"] = s.get("clusters", 0)
+        m["corpus"]["http_novel_templates"] = s.get("novel_clusters", 0)
+
+    # KG-lite finding fusion (Track C): how much the storyline graph collapses
+    # the raw findings into operator-level campaigns.  Lower consolidation ratio
+    # = more fusion; multi_finding_share = fraction of findings corroborated by
+    # at least one sibling finding via a shared strong entity.
+    if STORYLINES_SUMMARY.exists():
+        s = json.loads(STORYLINES_SUMMARY.read_text())
+        m["coverage"]["finding_consolidation_ratio"] = s.get("finding_consolidation_ratio")
+        m["coverage"]["multi_finding_storyline_share"] = s.get("multi_finding_storyline_share")
+        m["corpus"]["storylines_total"] = s.get("n_storylines", 0)
+        m["corpus"]["storylines_multi_finding"] = s.get("n_multi_finding", 0)
+        m["corpus"]["largest_storyline_findings"] = s.get("largest_storyline_findings", 0)
 
     if LABEL_DONE.exists():
         with open(LABEL_DONE, newline="") as f:
@@ -197,6 +212,8 @@ def _render_md(m: dict) -> str:
         f"| IPs scored | {m['corpus'].get('ips_scored', 0):,} |",
         f"| distinct payloads | {m['corpus'].get('distinct_payloads', 0):,} |",
         f"| payload clusters reported | {m['corpus'].get('payload_clusters_reported', 0):,} |",
+        f"| storylines (multi-finding) | {m['corpus'].get('storylines_total', 0):,} "
+        f"({m['corpus'].get('storylines_multi_finding', 0):,}) |",
         "",
         "## Coverage (label-free health signals)", "",
         "| metric | value |", "| --- | --- |",
@@ -204,8 +221,10 @@ def _render_md(m: dict) -> str:
         f"| finding_narrative_coverage | {pct(c.get('finding_narrative_coverage'))} |",
         f"| risk_tier_coverage | {pct(c.get('risk_tier_coverage'))} |",
         f"| payload_cluster_coverage | {pct(c.get('payload_cluster_coverage'))} |",
-        f"| http_template_coverage | {pct(c.get('http_template_coverage'))} |",
+        f"| http_intent_template_coverage | {pct(c.get('http_intent_template_coverage'))} |",
         f"| attack_technique_count | {c.get('attack_technique_count', 0)} |",
+        f"| finding_consolidation_ratio | {c.get('finding_consolidation_ratio')} |",
+        f"| multi_finding_storyline_share | {pct(c.get('multi_finding_storyline_share'))} |",
         "",
         "_`payload_cluster_coverage` = share of all distinct payloads explained "
         "by trafficprint's top non-singleton clusters; the remainder (singletons "

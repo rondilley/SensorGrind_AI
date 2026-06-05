@@ -11,14 +11,20 @@ text-templatable: ~712k payloads / ~571k DISTINCT with very low exact-skew
 (trafficprint) therefore leaves HTTP mostly un-templated, because attack
 requests embed unique tokens (random params, cache-busters, per-host paths).
 
+Clustering is on the REQUEST LINE only (method + path + query) — NOT headers.
+Header content (User-Agent, Host, ordering) is attacker-controlled, trivially
+spoofed, and is exactly what JA4H already fingerprints; letting it drive these
+clusters just re-derives a client fingerprint. The attack intent lives in the
+request line, so that is what we templatize.
+
 Pipeline (dependency-light: sklearn + hdbscan, no torch / model download — a
 sentence-transformer encoder can be swapped in later, same shape):
 
-    distinct HTTP payloads
+    request lines of intent-bearing HTTP requests
       -> TF-IDF char n-grams (structure survives unique tokens)
       -> TruncatedSVD (dense, denoised)
       -> HDBSCAN (density clusters, noise-aware)
-      -> per-cluster token-alignment template + dominant UA/Host
+      -> per-cluster token-alignment template ("POST /boaform/admin/formLogin")
 
 Outputs (Report contract): output/reports/http_patterns/http_patterns.{parquet,md}
 plus summary.json (headline coverage stats, read by bench/compute_metrics).
@@ -34,6 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sg import lib
@@ -41,8 +48,6 @@ from sg import lib
 HTTP_PROTO = 1
 METHOD_RE = re.compile(rb"^(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH|CONNECT|TRACE)\s",
                        re.IGNORECASE)
-UA_RE = re.compile(r"User-Agent:\s*(.+)", re.IGNORECASE)
-HOST_RE = re.compile(r"Host:\s*(.+)", re.IGNORECASE)
 
 OUT_DIR = lib.REPORTS / "http_patterns"
 
@@ -52,8 +57,21 @@ RESULT_SCHEMA = pa.schema([
     ("distinct_count",  pa.uint32()),   # distinct payloads assigned to cluster
     ("volume",          pa.uint64()),   # total occurrences (weighted)
     ("coverage_share",  pa.float32()),  # share of clustered volume
+    ("novel",           pa.bool_()),    # path NOT matched by any probesigs signature
     ("sample_request",  pa.string()),
 ])
+
+PROBESIGS_PATH = lib.REPORTS / "probesigs" / "probesigs.parquet"
+
+# Per-payload cluster membership — the join key that lets correlate roll HTTP
+# templates up to source IPs (via l7_events.payload_sha256) and lets attackmap
+# map templates to techniques. fixed_size_binary[32] matches payload_blobs /
+# l7_events.payload_sha256 so DuckDB joins cleanly.
+MEMBERSHIP_SCHEMA = pa.schema([
+    ("payload_sha256", pa.binary(32)),
+    ("cluster_id",     pa.int32()),
+])
+MEMBERSHIP_PATH = OUT_DIR / "payload_clusters.parquet"
 
 
 # ---------------------------------------------------------------- pure helpers
@@ -99,19 +117,6 @@ def generalize_requests(lines: list[str], min_share: float = 0.6) -> str:
     return f"{method} {path_tmpl}{'?*' if has_query else ''}"
 
 
-def dominant_header(texts: list[str], regex: re.Pattern,
-                    min_share: float = 0.3) -> str | None:
-    """Most common header value across a cluster's full payloads, if it
-    dominates. Used to distinguish clusters whose request lines are identical
-    (e.g. many 'GET /' probes separated only by their User-Agent / tool)."""
-    vals = [m.group(1).strip().rstrip("\r")
-            for t in texts if (m := regex.search(t))]
-    if not vals:
-        return None
-    val, cnt = Counter(vals).most_common(1)[0]
-    return val if cnt / len(texts) >= min_share else None
-
-
 def _common_prefix(strings: list[str]) -> str:
     if not strings:
         return ""
@@ -124,22 +129,67 @@ def _common_prefix(strings: list[str]) -> str:
 
 # ---------------------------------------------------------------- pipeline
 
-def load_http(con, max_len: int = 512) -> tuple[list[str], np.ndarray]:
-    """Distinct HTTP payloads (text prefix) + occurrence weight."""
+def load_http(con, max_len: int = 512):
+    """Distinct *intent-bearing* HTTP payloads: sha256 + text prefix + weight.
+
+    Excludes EVERY trivial-root request (`METHOD /` — GET/POST/OPTIONS/...),
+    not just `GET /`.  On an ultra-low-interaction sensor these carry no
+    request-line intent; their only discriminator is the client header set,
+    which JA4H already fingerprints.  We keep only requests whose intent is IN
+    the request line — a real path, query, or traversal — which a low-
+    interaction sensor captures in full (the URI/method *is* the one-shot
+    payload)."""
     rows = con.execute(f"""
-        SELECT any_value(bytes[1:{max_len}]) AS b, count(*) AS w
+        SELECT payload_sha256,
+               any_value(bytes[1:{max_len}]) AS b,
+               count(*) AS w
         FROM payload_blobs
         WHERE l7_proto = {HTTP_PROTO} AND payload_len >= 8
+          AND NOT regexp_matches(CAST(bytes[1:160] AS VARCHAR),
+                                 '^[A-Z]{{3,8}} /[ \\r\\n]')
         GROUP BY payload_sha256
     """).fetchall()
-    texts = [bytes(b).decode("latin-1", "ignore") for b, _ in rows]
-    weights = np.array([w for _, w in rows], dtype=np.int64)
-    return texts, weights
+    shas = [bytes(r[0]) for r in rows]
+    texts = [bytes(r[1]).decode("latin-1", "ignore") for r in rows]
+    weights = np.array([r[2] for r in rows], dtype=np.int64)
+    return shas, texts, weights
+
+
+def known_probe_uris() -> set[str]:
+    """probesigs' curated known-bad URI signatures, lowercased. A template
+    whose path matches none of these is a *novel* discovery (probesigs is
+    signature-based and only catches its hardcoded list)."""
+    if not PROBESIGS_PATH.exists() or PROBESIGS_PATH.stat().st_size == 0:
+        return set()
+    uris = pq.read_table(PROBESIGS_PATH, columns=["uri"]).column("uri").to_pylist()
+    return {u.lower() for u in uris if u}
+
+
+def template_path(tmpl: str) -> str:
+    """Extract the path token from a 'METHOD /path  [UA: ...]' template."""
+    body = tmpl.split("  [", 1)[0]
+    parts = body.split(" ", 1)
+    return parts[1] if len(parts) > 1 else body
+
+
+def is_novel(tmpl: str, known: set[str]) -> bool:
+    """True if the template's path matches no probesigs signature."""
+    path = template_path(tmpl).lower()
+    return not any(u in path for u in known)
 
 
 def _write_summary(summary: dict) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / "summary.json").write_text(json.dumps(summary, indent=2))
+
+
+def _write_membership(membership: list[tuple[bytes, int]]) -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    tbl = pa.table({
+        "payload_sha256": pa.array([m[0] for m in membership], pa.binary(32)),
+        "cluster_id":     pa.array([m[1] for m in membership], pa.int32()),
+    }, schema=MEMBERSHIP_SCHEMA)
+    pq.write_table(tbl, MEMBERSHIP_PATH, compression="zstd", compression_level=3)
 
 
 def run(args: argparse.Namespace) -> lib.Report:
@@ -151,32 +201,40 @@ def run(args: argparse.Namespace) -> lib.Report:
     con = lib.duck(memory_limit=lib.auto_memory_limit(fraction=0.4, min_gb=4))
     lib.register_views(con)
     print("[httppatterns] loading distinct HTTP payloads...", file=sys.stderr)
-    texts, weights = load_http(con)
+    shas, texts, weights = load_http(con)
     con.close()
     n_total = len(texts)
-    print(f"[httppatterns] {n_total:,} distinct HTTP payloads", file=sys.stderr)
+    print(f"[httppatterns] {n_total:,} distinct intent-bearing HTTP payloads",
+          file=sys.stderr)
     if n_total < 50:
         rep = lib.Report(name="http_patterns", rows=[], schema=RESULT_SCHEMA,
                          markdown="_Too few HTTP payloads to cluster._\n")
         rep.summary = {"distinct_payloads": n_total, "clusters": 0,
                        "coverage_estimate": None}
+        rep.membership = []
         return rep
+
+    # Cluster on the REQUEST LINE only — headers (UA/Host/ordering) are
+    # attacker-controlled and already covered by JA4H, so they must not drive
+    # these clusters. The request line carries the attack intent.
+    req_lines = [first_line(t) for t in texts]
 
     # Cluster a bounded sample (HDBSCAN cost), then assign the rest by nearest
     # centroid for per-template volume weighting.
     rng = np.random.default_rng(42)
     sample_n = min(args.cluster_sample, n_total)
     sample_idx = rng.choice(n_total, size=sample_n, replace=False)
-    sample_texts = [texts[i] for i in sample_idx]
+    sample_lines = [req_lines[i] for i in sample_idx]
     if sample_n < n_total:
         print(f"[httppatterns] clustering a {sample_n:,} sample of {n_total:,} "
               f"(NOT silently capped — rest assigned by nearest centroid)",
               file=sys.stderr)
 
-    print("[httppatterns] vectorizing (char 3-5 grams) + SVD...", file=sys.stderr)
+    print("[httppatterns] vectorizing request lines (char 3-5 grams) + SVD...",
+          file=sys.stderr)
     vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5),
                           min_df=3, max_features=40000)
-    X_sample = vec.fit_transform(sample_texts)
+    X_sample = vec.fit_transform(sample_lines)
     svd = TruncatedSVD(n_components=args.svd_dims, random_state=42)
     Z_sample = normalize(svd.fit_transform(X_sample))
 
@@ -210,7 +268,7 @@ def run(args: argparse.Namespace) -> lib.Report:
     # from being presented as a coverage number.
     print("[httppatterns] weighting templates by full-corpus volume...",
           file=sys.stderr)
-    Z_all = normalize(svd.transform(vec.transform(texts)))
+    Z_all = normalize(svd.transform(vec.transform(req_lines)))
     if len(centroids):
         sims = Z_all @ centroids.T              # cosine (both normalized)
         best = sims.argmax(axis=1)
@@ -223,24 +281,12 @@ def run(args: argparse.Namespace) -> lib.Report:
 
     total_vol = int(weights.sum())
     covered_vol = int(weights[assigned].sum())
+    known = known_probe_uris()
 
     rows = []
     for cid in cids:
-        members = [sample_texts[i] for i in np.where(labels == cid)[0]]
-        tmpl = generalize_requests([first_line(t) for t in members])
-        # Many clusters share a bare request line ("GET /") and differ only by
-        # headers; surface the dominant UA (always) and Host (when the path is
-        # uninformative) so the template is interpretable.
-        extras = []
-        ua = dominant_header(members, UA_RE, min_share=0.25)
-        if ua:
-            extras.append(f"UA: {ua[:36]}")
-        if tmpl.rstrip().endswith("/"):
-            host = dominant_header(members, HOST_RE, min_share=0.4)
-            if host:
-                extras.append(f"Host: {host[:30]}")
-        if extras:
-            tmpl += "  [" + "; ".join(extras) + "]"
+        members = [sample_lines[i] for i in np.where(labels == cid)[0]]
+        tmpl = generalize_requests(members)  # request lines only — no headers
         mask = assign_cid == cid
         vol = int(weights[mask].sum())
         rows.append({
@@ -249,61 +295,71 @@ def run(args: argparse.Namespace) -> lib.Report:
             "distinct_count": int(mask.sum()),
             "volume": vol,
             "coverage_share": float(vol / covered_vol) if covered_vol else 0.0,
-            "sample_request": first_line(members[0])[:160],
+            "novel": is_novel(tmpl, known),
+            "sample_request": members[0][:160],
         })
     rows.sort(key=lambda r: r["volume"], reverse=True)
+    novel_clusters = sum(1 for r in rows if r["novel"])
+    novel_volume = sum(r["volume"] for r in rows if r["novel"])
 
     md = _render_md(rows, n_total, n_clusters, sample_n, sample_clustered,
-                    coverage_est, covered_vol, total_vol, args)
+                    coverage_est, covered_vol, total_vol, novel_clusters,
+                    novel_volume, args)
     rep = lib.Report(name="http_patterns", rows=rows, schema=RESULT_SCHEMA,
                      markdown=md)
     # Stash headline stats on the Report; main() persists them (run() stays
     # side-effect-free so callers/tests don't clobber real outputs).
     rep.summary = {
+        "scope": "intent_bearing_http",  # bare 'GET /' excluded (see load_http)
         "distinct_payloads": n_total,
         "clusters": n_clusters,
+        "novel_clusters": novel_clusters,        # not matched by any probesigs sig
+        "novel_volume": int(novel_volume),
         "sample_n": sample_n,
         "sample_clustered": sample_clustered,
         "coverage_estimate": round(coverage_est, 4),
         "volume_covered": covered_vol,
         "volume_total": total_vol,
     }
+    # Per-payload membership for downstream join (correlate/attackmap): every
+    # distinct payload assigned to a cluster (>= assign_min_cos).
+    rep.membership = [(shas[i], int(assign_cid[i]))
+                      for i in range(n_total) if assign_cid[i] != -1]
     return rep
 
 
 def _render_md(rows, n_total, n_clusters, sample_n, sample_clustered,
-               coverage_est, covered_vol, total_vol, args) -> str:
+               coverage_est, covered_vol, total_vol, novel_clusters,
+               novel_volume, args) -> str:
     def pct(a, b):
         return f"{a/b*100:.1f}%" if b else "n/a"
     lines = [
         "## HTTP request templates (embedding-style clustering)",
         "",
-        f"- distinct HTTP payloads: **{n_total:,}**",
+        "_Scope: **intent-bearing** HTTP only — the bare `GET /` root probe "
+        "(~75% of HTTP on this ultra-low-interaction sensor) is excluded; its "
+        "only signal is the client header set, already covered by JA4H. We "
+        "cluster requests whose intent is in the request line (exploit URIs, "
+        "non-GET methods, queries, traversal), which a low-interaction sensor "
+        "captures in full._",
+        "",
+        f"- distinct intent-bearing HTTP payloads: **{n_total:,}**",
         f"- clusters found: **{n_clusters}** "
         f"(min_cluster_size={args.min_cluster_size}, char 3-5 grams, "
         f"SVD {args.svd_dims}d)",
-        f"- **HTTP coverage estimate: {pct(sample_clustered, sample_n)}** "
-        f"(density-clustered fraction of a representative {sample_n:,} sample; "
-        f"the rest is HDBSCAN noise = genuinely one-off / unique requests)",
-        f"- template volume weighting covers {pct(covered_vol, total_vol)} of "
-        f"HTTP occurrences (nearest-centroid @cos>={args.assign_min_cos}; "
-        f"used only for ranking, not as a coverage claim)",
-        "",
-        "_Why this matters: exact/prefix methods (trafficprint) leave HTTP "
-        "mostly un-templated — the top-50k of 571k distinct payloads cover only "
-        "~20% of HTTP volume because attack requests embed unique tokens "
-        "(random params, cache-busters, per-host paths). Structural clustering "
-        f"recovers ~{pct(sample_clustered, sample_n)} as {n_clusters} reusable "
-        "templates._",
+        f"- **novel templates** (no `probesigs` signature): **{novel_clusters}** "
+        f"of {n_clusters} — the marginal discovery over hand-written signatures",
+        f"- coverage estimate: {pct(sample_clustered, sample_n)} of the "
+        f"intent-bearing sample falls into a recurring template",
         "",
         "### Top templates by volume", "",
-        "| # | template | distinct | volume | share |",
+        "| # | template | distinct | volume | novel |",
         "| --- | --- | --- | --- | --- |",
     ]
     for i, r in enumerate(rows[:args.limit_templates], 1):
         tmpl = r["template"].replace("|", "\\|")[:80]
         lines.append(f"| {i} | `{tmpl}` | {r['distinct_count']:,} | "
-                     f"{r['volume']:,} | {r['coverage_share']*100:.1f}% |")
+                     f"{r['volume']:,} | {'yes' if r['novel'] else ''} |")
     if len(rows) > args.limit_templates:
         lines.append(f"\n_…{len(rows) - args.limit_templates} more templates._")
     return "\n".join(lines) + "\n"
@@ -325,8 +381,11 @@ def main() -> int:
     report = run(args)
     paths = report.write()
     _write_summary(report.summary)
+    _write_membership(report.membership)
     print(f"[httppatterns] wrote {paths['parquet']}")
     print(f"[httppatterns] wrote {paths['markdown']}")
+    print(f"[httppatterns] wrote {MEMBERSHIP_PATH} "
+          f"({len(report.membership):,} payload assignments)")
     return 0
 
 

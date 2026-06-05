@@ -33,6 +33,8 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import pyarrow.parquet as pq
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sg import features as sf
 from sg import lib
@@ -1360,11 +1362,12 @@ def run(args: argparse.Namespace) -> int:
     P("**What this shows:** distribution of payloads classified into "
       "known IoT-botnet families by `botnetcls` (Mirai, Mozi, Hajime, "
       "Tsunami/Kaiten, LZRD, generic IRC-bot, generic RCE-scanner).  "
-      "The pie almost always shows Mozi-dominance because the Mozi "
-      "P2P network's long tail of pre-infected hosts continues sending "
-      "echo/check-in traffic years after the original infection event.  "
-      "Tied to a payload SHA-256, each row tells you which exact byte "
-      "pattern is the family marker.")
+      "Family markers are matched as word-bounded signatures against payload "
+      "strings — Mozi requires the `Mozi.m`/`Mozi.a` dropper marker, not the "
+      "substring inside `Mozilla` user-agents (a prior signature bug labeled "
+      "~356K browser/zgrab probes as Mozi; now corrected).  Tied to a payload "
+      "SHA-256, each row tells you which exact byte pattern is the family "
+      "marker.")
     if fam_rows:
         H(3, "Family distribution (classified payload blobs)")
         P("_Distinct payload blob count per family, not packet count.  "
@@ -2214,23 +2217,25 @@ def run(args: argparse.Namespace) -> int:
 
     # ---------- 30. HTTP request templates ----------
     H(2, "30. HTTP Request Templates (httppatterns)")
-    P("**What this shows:** HTTP attack requests clustered by structural "
-      "(character n-gram) similarity into reusable templates, recovering the "
-      "underlying campaigns that exact/prefix methods miss (attack requests "
-      "embed unique tokens, so most are byte-distinct). Volume is total "
-      "occurrences across the corpus; the dominant tool User-Agent is shown "
-      "where one exists.")
+    P("**What this shows:** **intent-bearing** HTTP attack requests (exploit "
+      "URIs, non-GET methods, queries, traversal) clustered by structural "
+      "similarity into reusable templates.  The bare `GET /` root probe (~75% "
+      "of HTTP on this ultra-low-interaction sensor) is excluded — its only "
+      "signal is the client header set, already covered by JA4H.  `novel` marks "
+      "templates with no `probesigs` signature (the marginal discovery over "
+      "hand-written rules).")
     hp_summary = lib.REPORTS / "http_patterns" / "summary.json"
     if hp_summary.exists():
         import json as _json
         s = _json.loads(hp_summary.read_text())
         cov = s.get("coverage_estimate")
         P("")
-        P(f"- **{s.get('distinct_payloads', 0):,}** distinct HTTP payloads → "
-          f"**{s.get('clusters', 0):,}** templates")
+        P(f"- **{s.get('distinct_payloads', 0):,}** distinct intent-bearing HTTP "
+          f"payloads → **{s.get('clusters', 0):,}** templates "
+          f"(**{s.get('novel_clusters', 0):,}** novel vs probesigs)")
         if cov is not None:
-            P(f"- coverage estimate: **{cov*100:.1f}%** of HTTP requests fall "
-              f"into a recurring template (rest are one-off)")
+            P(f"- coverage estimate: **{cov*100:.1f}%** of intent-bearing "
+              f"requests fall into a recurring template (rest are one-off)")
     _con_hp = lib.duck()
     hp_rows = safe_read_table(_con_hp,
                               lib.REPORTS / "http_patterns" / "http_patterns.parquet")
@@ -2238,15 +2243,74 @@ def run(args: argparse.Namespace) -> int:
     if hp_rows:
         hp_rows = sorted(hp_rows, key=lambda r: (r[3] or 0), reverse=True)[:25]
         P("")
-        P("| template | distinct | volume |")
-        P("| --- | --- | --- |")
-        for cid, tmpl, distinct, vol, share, sample in hp_rows:
+        P("| template | distinct | volume | novel |")
+        P("| --- | --- | --- | --- |")
+        for cid, tmpl, distinct, vol, share, novel, sample in hp_rows:
             safe = str(tmpl).replace("|", "\\|")[:90]
-            P(f"| `{safe}` | {int(distinct or 0):,} | {int(vol or 0):,} |")
+            P(f"| `{safe}` | {int(distinct or 0):,} | {int(vol or 0):,} "
+              f"| {'yes' if novel else ''} |")
     else:
         P("")
         P("> _No httppatterns output yet.  Run `python src/evolve.py "
           "httppatterns` to populate this section._")
+
+    # ---------- Threat storylines (KG-lite finding fusion) ----------
+    H(2, "31. Threat Storylines (KG-lite finding fusion)")
+    P("**What this shows:** the cross-signal findings (sections above) fused "
+      "into operator-level **storylines**.  `conclusions/graph.py` links any two "
+      "findings that share a strong entity — a compositeprint `core_hash` "
+      "(infrastructure-independent fingerprint), a packet-choreography chain, or "
+      "source IPs (a single shared ASN alone is below the bar, so a hub network "
+      "can't fuse unrelated findings) — then groups the connected findings.  A "
+      "storyline reads as one campaign instead of N disconnected cards.")
+    _story_summary = lib.OUTPUT_DIR / "conclusions" / "storylines" / "summary.json"
+    if _story_summary.exists():
+        import json as _json
+        ss = _json.loads(_story_summary.read_text())
+        ratio = ss.get("finding_consolidation_ratio")
+        P("")
+        P(f"- **{ss.get('n_findings', 0):,}** findings → "
+          f"**{ss.get('n_storylines', 0):,}** storylines "
+          f"(**{ss.get('n_multi_finding', 0):,}** multi-finding); "
+          f"largest groups **{ss.get('largest_storyline_findings', 0)}** findings")
+        if ratio is not None:
+            P(f"- consolidation ratio **{ratio:.2f}** "
+              f"(1.0 = nothing fused; lower = more campaigns collapsed)")
+    _story_concl = (lib.OUTPUT_DIR / "conclusions" / "storylines"
+                    / "storyline_conclusions.parquet")
+    story_rows: list[dict] = []
+    if _story_concl.exists():
+        try:
+            story_rows = pq.read_table(_story_concl).to_pylist()
+        except Exception as e:
+            print(f"[report] could not read storyline_conclusions: {e}",
+                  file=sys.stderr)
+    if story_rows:
+        sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        story_rows.sort(key=lambda r: sev_rank.get(str(r.get("severity")), 9))
+        for sr in story_rows:
+            title = sr.get("ai_title") or f"storyline {sr.get('storyline_id')}"
+            H(3, f"{str(sr.get('severity','')).upper()} — {title}")
+            P(f"_`{sr.get('storyline_id')}` — {sr.get('finding_count')} findings — "
+              f"patterns: {sr.get('pattern_ids')} — bound by "
+              f"{sr.get('linking_entities')} — {sr.get('src_ip_count')} source IPs — "
+              f"confidence: {sr.get('ai_confidence') or 'n/a'}_")
+            if sr.get("ai_campaign_summary"):
+                P(f"**Campaign:** {sr['ai_campaign_summary']}")
+            if sr.get("ai_why_connected"):
+                P(f"**Why these are one story:** {sr['ai_why_connected']}")
+            if sr.get("ai_actor_assessment"):
+                P(f"**Actor:** {sr['ai_actor_assessment']}")
+            if sr.get("ai_recommended_action"):
+                P("**Recommended action:**")
+                for line in str(sr["ai_recommended_action"]).split("\n"):
+                    if line.strip():
+                        P(line if line.lstrip().startswith("-")
+                          else f"- {line.strip()}")
+    else:
+        P("")
+        P("> _No multi-finding storylines yet.  Run `python src/evolve.py kg` "
+          "then `conclude` to populate this section._")
 
     # ---------- Appendix ----------
     H(2, "Appendix A. Per-analyzer data coverage")

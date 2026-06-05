@@ -56,6 +56,14 @@ FINDING_SCHEMA = pa.schema([
     ("detected_at",      pa.timestamp("us", tz="UTC")),
 ])
 
+# finding_id -> one row per FULL source IP (untruncated).  This is the join key
+# conclusions/graph uses to fuse findings on complete membership rather than the
+# 25-IP display sample carried in findings.parquet.
+MEMBERS_SCHEMA = pa.schema([
+    ("finding_id", pa.string()),
+    ("src_ip",     pa.string()),
+])
+
 
 def _newest_risk_path() -> Path | None:
     base = lib.OUTPUT_DIR / "risk" / "ip_risk"
@@ -75,6 +83,11 @@ def _short_id(pattern_id: str, src_ips: list[str]) -> str:
     return f"{pattern_id}_{h[:10]}"
 
 
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    return [v for v in values if v and not (v in seen or seen.add(v))]
+
+
 def _finding(
     pattern_id: str,
     pattern_title: str,
@@ -88,8 +101,15 @@ def _finding(
     report_anchor: str = "",
     first_seen: str = "",
     last_seen: str = "",
+    members: list[str] | None = None,
 ) -> dict:
-    src_ips = [s for s in src_ips if s][:25]
+    # `src_ips` is the bounded DISPLAY sample (drives src_ips_sample + the
+    # finding_id hash, both intentionally stable at <=25).  `members` is the FULL
+    # source-IP set for this finding, persisted separately to finding_members so
+    # downstream fusion (conclusions/graph) links on complete membership, not the
+    # sample.  Defaults to src_ips when a pattern's full set is what it passed.
+    full_members = _dedupe(members if members is not None else src_ips)
+    src_ips = _dedupe(src_ips)[:25]
     asns = [a for a in (asns or []) if a][:10]
     countries = [c for c in (countries or []) if c][:10]
     return {
@@ -108,6 +128,7 @@ def _finding(
         "first_seen":       first_seen,
         "last_seen":        last_seen,
         "detected_at":      _dt.datetime.now(_dt.timezone.utc),
+        "_members":         full_members,
     }
 
 
@@ -176,6 +197,15 @@ BP_CLUSTER_MIN_EDGE         = 3      # cohost edge weight (shared campaigns) to 
 BP_CLUSTER_MIN_ASNS         = 3      # min ASNs in a cluster to report
 BP_CLUSTER_COOP_HIGH        = 0.5    # mean asnintel cooperation_score -> coordinated
 BP_CLUSTER_TOP              = 20     # finding fan-out cap
+
+# Coordinated HTTP campaign: one httppatterns template (a tool/campaign
+# fingerprint) sent by many distinct source IPs spread across many /16s. The
+# spread is the coordination signal — each request is byte-distinct, so only the
+# structural cluster reveals that they're one campaign.
+MIN_HTTP_CAMPAIGN_IPS       = 50
+MIN_HTTP_CAMPAIGN_SUBNETS   = 10     # distinct /16s the sources span
+HTTP_CAMPAIGN_HIGH_IPS      = 200    # promote to high severity
+TOP_HTTP_CAMPAIGNS          = 15     # finding fan-out cap
 
 
 # ----------------------------------------------------------------------
@@ -401,7 +431,7 @@ def pat_covert_tunnel_setup(con) -> list[dict]:
     sample_ips = [r[0] for r in con.execute("""
         SELECT DISTINCT src_ip FROM nonip_per_ip
         WHERE proto_num IN (4, 41, 47, 97)
-        ORDER BY src_ip LIMIT 25
+        ORDER BY src_ip
     """).fetchall()]
     return [_finding(
         pattern_id="covert_tunnel_setup",
@@ -857,7 +887,7 @@ def pat_synchronized_campaign_burst(con) -> list[dict]:
             ),
             severity="critical",
             category="coordinated-push",
-            src_ips=uniq_ips[:25],
+            src_ips=uniq_ips,
             key_metrics={
                 "peak_day":                str(d)[:10],
                 "distinct_campaigns":      int(n_camps),
@@ -901,18 +931,12 @@ def pat_recent_tight_campaign(con) -> list[dict]:
     """).fetchall()
     if not rows:
         return []
-    sample_ips: list[str] = []
-    for r in rows:
-        s = r[9]
-        if s:
-            for ip in s.split(","):
-                ip = ip.strip()
-                if ip and ip not in sample_ips:
-                    sample_ips.append(ip)
-                    if len(sample_ips) >= 25:
-                        break
-        if len(sample_ips) >= 25:
-            break
+    # Full union of the per-campaign IP samples carried by the waves table.
+    # (waves.sample_ips is itself an upstream sample, so this is as complete as
+    # the coordination stage exposes without re-joining raw events.)
+    seen_ips: set[str] = set()
+    sample_ips = [s for r in rows for ip in (r[9] or "").split(",")
+                  if (s := ip.strip()) and not (s in seen_ips or seen_ips.add(s))]
     return [_finding(
         pattern_id="recent_tight_campaign",
         pattern_title=(
@@ -1500,6 +1524,64 @@ def pat_bulletproof_asn_cluster(con) -> list[dict]:
     return out[:BP_CLUSTER_TOP]
 
 
+def pat_coordinated_http_campaign(con) -> list[dict]:
+    """One HTTP request template (httppatterns cluster) sent by many distinct
+    source IPs spread across many /16 subnets = a distributed HTTP campaign.
+
+    Each request is byte-distinct (random params/cache-busters), so exact/prefix
+    methods can't see the campaign; the structural cluster does.  Membership
+    (payload_sha256 → cluster_id) joins to source IPs via l7_events."""
+    out: list[dict] = []
+    if not (_have(con, "http_clusters") and _have(con, "http_templates")
+            and _have(con, "l7_events")):
+        return out
+    rows = con.execute(f"""
+        WITH m AS (
+            SELECT e.src_ip, c.cluster_id, e.ts
+            FROM http_clusters c
+            JOIN l7_events e USING (payload_sha256)
+            WHERE e.l7_proto = 1
+        )
+        SELECT m.cluster_id,
+               any_value(t.template) AS template,
+               count(DISTINCT m.src_ip) AS ips,
+               count(DISTINCT split_part(m.src_ip, '.', 1)
+                             || '.' || split_part(m.src_ip, '.', 2)) AS subnets,
+               count(*) AS events,
+               min(m.ts) AS first_seen, max(m.ts) AS last_seen,
+               array_slice(array_agg(DISTINCT m.src_ip), 1, 25) AS sample_ips,
+               array_agg(DISTINCT m.src_ip) AS all_ips
+        FROM m JOIN http_templates t ON t.cluster_id = m.cluster_id
+        GROUP BY m.cluster_id
+        HAVING ips >= {MIN_HTTP_CAMPAIGN_IPS}
+           AND subnets >= {MIN_HTTP_CAMPAIGN_SUBNETS}
+        ORDER BY ips DESC
+        LIMIT {TOP_HTTP_CAMPAIGNS}
+    """).fetchall()
+    for cid, template, ips, subnets, events, fseen, lseen, sample_ips, all_ips in rows:
+        tmpl = (template or "").strip()
+        sev = "high" if ips >= HTTP_CAMPAIGN_HIGH_IPS else "medium"
+        out.append(_finding(
+            pattern_id=f"coordinated_http_campaign_{cid}",
+            pattern_title=(f"Distributed HTTP campaign: '{tmpl[:60]}' "
+                           f"from {ips:,} IPs across {subnets} /16s"),
+            severity=sev,
+            category="coordinated_campaign",
+            src_ips=list(sample_ips or []),
+            members=list(all_ips or []),
+            key_metrics={
+                "template": tmpl, "cluster_id": int(cid),
+                "src_ip_count": int(ips), "subnet16_spread": int(subnets),
+                "http_events": int(events),
+            },
+            evidence_refs=[{"section": "httppatterns",
+                            "label": f"HTTP template cluster {cid}"}],
+            report_anchor="#30-http-request-templates-httppatterns",
+            first_seen=str(fseen or ""), last_seen=str(lseen or ""),
+        ))
+    return out
+
+
 PATTERNS: list[Callable] = [
     pat_telco_ss7_recon,
     pat_routing_protocol_on_public_ip,
@@ -1522,6 +1604,7 @@ PATTERNS: list[Callable] = [
     pat_fingerprint_rotation,
     pat_bulletproof_asn_cluster,
     pat_critical_persistent_botnet,
+    pat_coordinated_http_campaign,
 ]
 
 
@@ -1561,6 +1644,8 @@ def _register_views(con) -> None:
         ("composite_ep",     R / "compositeprint" / "composite.parquet"),
         ("composite_clusters", R / "compositeprint" / "clusters.parquet"),
         ("isp_collab",       R / "campaignmigration" / "isp_collab.parquet"),
+        ("http_clusters",    R / "http_patterns" / "payload_clusters.parquet"),
+        ("http_templates",   R / "http_patterns" / "http_patterns.parquet"),
     ]
     for view, path in mapping:
         if not path.exists():
@@ -1576,6 +1661,10 @@ def _register_views(con) -> None:
         con.execute("SELECT 1 FROM packets LIMIT 1").fetchone()
         con.execute("CREATE OR REPLACE VIEW pkt_view AS SELECT * FROM packets")
         _REGISTERED.add("pkt_view")
+        # l7_events (src_ip ↔ payload_sha256) joins HTTP cluster membership
+        # back to source IPs for pat_coordinated_http_campaign.
+        con.execute("SELECT 1 FROM l7_events LIMIT 1").fetchone()
+        _REGISTERED.add("l7_events")
     except Exception:
         pass
 
@@ -1597,11 +1686,22 @@ def run(args: argparse.Namespace) -> int:
             findings.append(r)
         print(f"[correlate] {fn.__name__}: {len(res)} finding(s)", file=sys.stderr)
 
+    # Split the full per-finding membership out of the finding dicts before the
+    # schema write (findings.parquet keeps only the bounded sample).
+    member_rows = [{"finding_id": f["finding_id"], "src_ip": ip}
+                   for f in findings for ip in f.pop("_members", [])]
     pq.write_table(
         pa.Table.from_pylist(findings, schema=FINDING_SCHEMA),
         OUT_DIR / "findings.parquet",
         compression="zstd", compression_level=3,
     )
+    pq.write_table(
+        pa.Table.from_pylist(member_rows, schema=MEMBERS_SCHEMA),
+        OUT_DIR / "finding_members.parquet",
+        compression="zstd", compression_level=3,
+    )
+    print(f"[correlate] wrote {len(member_rows)} finding-member IPs to "
+          f"{OUT_DIR/'finding_members.parquet'}", file=sys.stderr)
 
     sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     findings_sorted = sorted(findings, key=lambda f: sev_order.get(f["severity"], 9))
