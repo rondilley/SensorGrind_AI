@@ -97,6 +97,8 @@ out-of-DAG stage:
   corrected wallclock time.  Outputs:
     `~/temp/sensor_logs/consolidated/{merged.log.gz, manifest.tsv}`
     `output/reports/clock_skew/clock_skew.{md,parquet}`
+    `output/reports/clock_skew/clock_runs.parquet` (one row per clock
+    run: corrected start, offset, line count)
 
 The orchestrator (`src/evolve.py`) builds the dependency graph from:
 
@@ -143,7 +145,25 @@ stages to a `ProcessPoolExecutor`.
 - `dnstlsintel` -- TLS SNI + DNS qname intel with DGA-entropy and
   brand-mimic flags
 - `selfmimic` -- detects inbound echo of the sensor's own banners
-- `adversarysim` -- synthetic-archetype regression harness
+- `adversarysim` -- synthetic-archetype regression harness.  With
+  `--inject NAME --day D` it instead writes full `packets`-schema rows
+  for one background day to `output/eval/inject/NAME/` (plus
+  `truth.parquet`); `sg.lib.register_eval_views(con, NAME)` overlays them
+  on the real corpus as one `packets` view.  Operator-run, not a DAG step.
+
+**Sensor mask + baselines (v3.3, Phase 0 of the neuromorphic plan)**
+- `sensormask` -- intervals that stateful detectors must drop from fit
+  windows and reset state at: `gap` (>= 30 silent minutes, from packets)
+  and `run_boundary` (+/- 5 s around each clock-skew run start, from
+  `clock_runs.parquet`).  Read via `sg.lib.load_sensor_mask()` or the SQL
+  fragment `sg.lib.mask_predicate('ts')`.
+- `bench/baselines.py --eval NAME` (operator-run) -- source-level
+  (random, pkt_count, n_ports, new_port_24, IForest, ECOD) and
+  global-minute (random, hour-of-day z, STL residual z, per-port hourly z)
+  detectors, fit on the 7 recorded days before the injection day.
+  Reports recall@k with its chance level, no point adjustment.  Any new
+  detector must beat these numbers on the same injection set.
+  See section 9 for the full plan and the data contracts.
 
 **Cross-signal conclusions (v2.6, added 2026-05-29)**
 - `correlate` -- runs 18 hand-coded cross-analyzer rules over every
@@ -364,3 +384,151 @@ CLI arguments override defaults; see each stage's `--help`.
 - **`data/`** is for SOURCE input -- do not write outputs to it.
 - **Sensitive data**: `*.key.txt` are gitignored. The honeypot log is large
   and operator-specific; do not commit it.
+
+## 9. Neuromorphic detection plan
+
+The plan comes from `reports/Neuromorphic anomaly detection for honeypi.md`.
+The research notes are in `research_notes/Neuromorphic anomaly detection for honeypi/`.
+
+The research found no published result where an SNN, HDC, reservoir, or
+HTM model is better than isolation forest or ECOD on network anomaly data.
+Also, no study used honeypot, darknet, or telescope data. Thus the plan does
+not try to get a better accuracy number. It adds three signals that the
+current batch, per-IP, threshold pipeline cannot calculate:
+
+| Signal | Primitive | Current module that it extends |
+| --- | --- | --- |
+| Graded similarity between session chains | HDC (MAP or BSC) on `chainfp` tokens | `chainfp`, `compositeprint` |
+| Adaptive baseline for the global arrival series | ESN or NG-RC, with the HTM anomaly-likelihood layer | `detect_coordination` (5x tail-median rule) |
+| Timing surprise for each event of a source | Event-driven LIF or ALIF | `pacing` (full-history IAT quantiles) |
+
+### 9.1 Phases and exit gates
+
+Each phase has an exit gate. Do not start the next phase until the current
+phase passes its gate.
+
+| Phase | Build | Status | Exit gate |
+| --- | --- | --- | --- |
+| 0. Prerequisites | `sensormask`, `clock_runs.parquet`, `adversarysim --inject`, `bench/baselines.py` | Built (v3.3) | The baselines give numbers on injected archetypes |
+| 1. HDC choreography novelty | n-gram session vectors from `chainfp` tokens and tempo, `k` sub-prototypes for each day, fast and slow actor prototypes | Not started | Better than string rarity and the RFF baseline on `chain_mutation`. The top-k is stable across seeds. |
+| 2. Global arrival detector | ESN or NG-RC on vectors for each minute, residual into the HTM likelihood layer (`W` of 2 to 8 weeks, Benjamini-Hochberg across series) | Not started | Flags the three known events. Fewer incorrect alarms each year than the 5x tail-median rule and `stl_z`. |
+| 3. Timing for each source | Event-driven LIF or ALIF with some different `tau` values, only for sources with 20 or more packets | Not started | Better than `pacing` and an untrained LIF on `jittered_beacon` and `rhythm_change` |
+| 4. Feature and risk inputs | Score columns in `build_ip_features`, then a capped risk term | Not started | Operator precision@k increases. Balance the tier counts again. |
+| 5. Optional research | WTA-STDP port-retina prototypes, Akida demonstration on a Pi 5 | Not started | Only if Phases 1 to 3 show value |
+
+The three known events for Phase 2 are:
+
+1. The 2024-06-24 burst from 07:30 to 07:50 PDT.
+2. The SSH campaign from 2026-04-27 to 2026-05-01.
+3. The coordinated push on 2026-05-19.
+
+### 9.2 Phase 0 data contracts
+
+**`output/reports/clock_skew/clock_runs.parquet`** (written by
+`scripts/consolidate_logs.py`, one row for each clock run that has lines)
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `src` | string | Source log file |
+| `run_idx` | uint32 | Run number in the file |
+| `run_start_ts` | timestamp UTC | Corrected start of the run |
+| `orig_pt` | timestamp UTC | PacketTime before the correction |
+| `offset_s` | float64 | Offset that the consolidator applied |
+| `anchor_kind` | string | `anchor` or `filename` |
+| `lines` | uint64 | Sensor lines in the run |
+
+This file exists only after a consolidator run with the v3.3 code. If the
+file is not there, `sensormask` writes `gap` intervals only.
+
+**`output/reports/sensormask/sensormask.parquet`** (`lib.SENSORMASK_SCHEMA`)
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `start_ts` | timestamp UTC | Start of the interval in the mask |
+| `end_ts` | timestamp UTC | End of the interval in the mask (not included) |
+| `kind` | string | `gap` or `run_boundary` |
+| `duration_s` | float64 | Interval length |
+| `source` | string | Origin of the interval |
+
+A `gap` is 30 or more minutes, one after the other, with zero packets
+(`--gap-minutes`). A `run_boundary` is 5 s before and after each clock-run
+start (`--boundary-pad-seconds`). The 2025-11-12 to 2026-01-28 outage is a
+`gap` interval.
+
+**`output/eval/inject/<NAME>/`** (written by `adversarysim.py --inject NAME --day D`)
+
+- `packets/dt=D/*.parquet` has the `packets` columns. The header fields
+  come from samples of the recorded SYN traffic of day D.
+- The injected sources are new routable addresses that are not in the
+  corpus.
+- `truth.parquet` has one row for each injected archetype instance:
+  `archetype`, `level` (`source` or `global`), `src_ip` (NULL for
+  `global`), `start_ts`, `end_ts`, `n_packets`, `is_control`, `note`.
+
+The inject archetypes are `fast_scanner`, `slow_scanner`,
+`distributed_brute`, `jittered_beacon`, `lockstep_24`, `rhythm_change`,
+`chain_mutation`, `burst_replay` (global), and `control_replay`. The
+`control_replay` rows are copies of ordinary sources from the corpus, with
+new addresses.
+A good detector does not flag them.
+
+**`output/reports/baselines/baselines_<NAME>.parquet`** (written by
+`bench/baselines.py --eval NAME`)
+
+| Column | Meaning |
+| --- | --- |
+| `eval_name`, `level`, `detector`, `archetype`, `is_control` | Row key |
+| `n_truth`, `k`, `hits`, `recall` | Recall at a fixed alert budget `k` |
+| `chance` | Recall that a random score gets at the same `k` |
+| `median_rank` | Median rank of the archetype sources (source level) |
+| `ttd_s` | Time to detection in seconds (global level) |
+
+The baselines fit on the 7 recorded days before D (`--fit-days`), without the
+intervals in the mask. The default budgets are `k` = 10, 100, 1000 for
+sources and `k` = 10, 60 for minutes. The harness skips global windows
+longer than 120 minutes (`--max-global-window-min`), because a random
+detector can hit a long window.
+
+### 9.3 Rules for each detector that keeps state
+
+1. Remove the time in the mask from fit windows. Use `lib.mask_predicate('ts')` in
+   SQL, or `lib.load_sensor_mask()` in Python. Both give "no mask" when
+   the `sensormask` stage did not run.
+2. Reset the state for each entity at each `end_ts` of the mask. If you do
+   not do this, the detector learns the outage as usual quiet time and
+   flags the restart as a large burst.
+3. Keep the state file out of the `STAGE_IO` outputs glob. If not, the
+   skip-if-fresh cache gives incorrect results.
+4. Keep the `neuro` stage upstream of `features`. Read
+   `benignfilter.parquet` directly. If `features` joins `neuro.parquet` and
+   `neuro` reads the feature snapshot, the DAG has a cycle.
+5. Do not put a neuromorphic score into `bootstrap_label`. Those labels come
+   from the same features that LightGBM uses. Thus the result is circular.
+6. Do not use `truth.parquet` as operator labels. Injected rows do not go
+   into `label_queue`.
+7. Compare each new detector with `bench/baselines.py` and with an untrained
+   copy of the same model, on the same injection set. Do not use
+   point-adjusted F1.
+
+### 9.4 Planned `neuro` stage
+
+The `neuro` stage follows the `chainfp` precedent:
+
+```python
+STAGES["neuro"] = [str(SRC / "neuro.py")]
+EXPLICIT_DEPS["neuro"] = ["analyzers", "cluster", "chainfp", "sensormask"]
+STAGE_IO["neuro"] = {
+  "inputs":  ["output/parquet/packets/**/*.parquet", "src/neuro.py"],
+  "outputs": ["output/reports/neuro/neuro.parquet",
+              "output/models/neuro_detector/**/model.joblib"]}
+```
+
+Use this toolchain:
+
+1. Write numba kernels for LIF, ALIF, and HDC. A local benchmark gave
+   74.8M LIF events/s and 21.6M HDC packets/s on the workstation CPU.
+2. Use NumPy for the ESN and NG-RC ridge readouts and for the HTM
+   likelihood layer.
+3. Do not use Lava or lava-dl. Intel archived them in May 2026.
+4. Do not use htm.core. It has the AGPL-3.0 license and had no release
+   since 2021.

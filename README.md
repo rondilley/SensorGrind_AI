@@ -98,6 +98,16 @@ Force a stage to rerun even if its inputs are unchanged:
 venv/bin/python src/evolve.py --force mining
 ```
 
+Score the baseline detectors against injected archetypes (operator-run,
+not part of the DAG; the corpus on disk is never modified):
+
+```bash
+venv/bin/python src/sensormask.py                       # sensor-off mask
+venv/bin/python src/adversarysim.py --inject phase0 --day 2026-05-10
+venv/bin/python src/bench/baselines.py --eval phase0
+# -> output/reports/baselines/baselines_phase0.md
+```
+
 ## AI provider setup (optional)
 
 Several stages (`originintel`, `aipayloaddecode`, `aireview`) call hosted
@@ -166,6 +176,10 @@ src/                                  # all working code lives here
   dnstlsintel.py                      # DNS qname + TLS SNI intel (DGA, mimic)
   selfmimic.py                        # sensor self-banner echo detection
   adversarysim.py                     # synthetic adversary coverage harness
+                                      #   (--inject: full-schema eval overlay)
+  sensormask.py                       # sensor-off gaps + clock-run boundaries
+  bench/baselines.py                  # baseline detectors vs injected
+                                      #   archetypes (recall@k, chance)
 scripts/                              # source-data preprocessing (NOT analyzers)
   consolidate_logs.py                 # rotated syslog -> merged.log.gz with
                                       #   per-file clock-skew correction
@@ -181,6 +195,8 @@ output/                               # ALL pipeline output goes here
   risk/                               # risk scores
 docs/
   ARCHITECTURE.md                     # data model, DAG, model contracts
+reports/                              # research reports (neuromorphic plan)
+research_notes/                       # source notes for those reports
 VIBE_HISTORY.md                       # session log
 .evolve/freshness.json                # skip-if-fresh cache
 ```
@@ -201,6 +217,7 @@ each stage's declared inputs and outputs.
 Top of the graph (text-only, no box-drawing characters):
 
 - analyzers (no parent)
+- sensormask (no parent; reads packets + clock_runs)
 - features  parent: analyzers
 - model     parent: features
 - score     parents: features, model
@@ -300,6 +317,48 @@ consensus. The substantive ones:
 
 See `docs/ARCHITECTURE.md` for the full data + model contracts and
 `VIBE_HISTORY.md` for how the pipeline got here.
+
+## Neuromorphic detection plan (v3.3, Phase 0 built)
+
+The research report `reports/Neuromorphic anomaly detection for honeypi.md`
+examined SNN, HDC, reservoir, and HTM methods for the honeypi data. No
+published result shows that these methods find network anomalies better than
+isolation forest or ECOD. Thus the plan uses them for three new signals, not
+for a better accuracy number:
+
+1. Graded similarity between session chains (HDC on `chainfp` tokens).
+2. An adaptive baseline for the global arrival series (ESN or NG-RC with the
+   HTM anomaly-likelihood layer).
+3. A timing surprise for each event of a source (event-driven LIF).
+
+Phase 0 gives the data and the yardstick that each subsequent phase must
+have:
+
+- `sensormask` (DAG stage) writes the sensor-off intervals. A `gap` interval
+  is 30 or more minutes with no packets. The 2025-11-12 to 2026-01-28 outage
+  is one `gap` interval. A `run_boundary` interval is 5 s before and after a
+  clock-run start.
+- `scripts/consolidate_logs.py` writes
+  `output/reports/clock_skew/clock_runs.parquet`. Run the consolidator again
+  to get this file.
+- `adversarysim.py --inject NAME --day D` writes nine archetypes as full
+  `packets` rows into `output/eval/inject/NAME/`. The corpus on disk does not
+  change.
+- `bench/baselines.py --eval NAME` scores random, count, z-score, STL,
+  IForest, and ECOD detectors on those archetypes. It gives recall@k with the
+  chance level, and no point adjustment.
+
+Phases 1 to 5 (HDC choreography novelty, global arrival detector, timing for
+each source, feature and risk inputs, optional research) did not start. Each
+phase has an exit gate. A new detector must be better than the baselines and
+than an untrained copy of itself on the same injection set.
+
+The first test used a slice of 25 days (2024-01-13 to 2024-05-10). All
+baselines missed `lockstep_24` at k = 100 or less, and `port_hour_z` found
+nothing. Phases 1 to 3 must find this archetype.
+
+See `docs/ARCHITECTURE.md` section 9 for the phase table, the data
+contracts, and the rules for each detector that keeps state.
 
 ## Performance pass (2026-05-30)
 

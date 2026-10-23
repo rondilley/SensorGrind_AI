@@ -48,6 +48,8 @@ STAGES: dict[str, list[str]] = {
     # derived packets layout clustered by source ASN/CIDR/IP (see
     # cluster_packets.py); built once per parse, consumers read bounded windows
     "cluster":      [str(SRC / "cluster_packets.py")],
+    # --- v3.3 sensor-off + clock-run mask for stateful detectors ---
+    "sensormask":   [str(SRC / "sensormask.py")],
     "features":     [str(SRC / "features" / "build_ip_features.py")],
     "model":        [str(SRC / "models" / "train_threat_classifier.py")],
     "score":        [str(SRC / "models" / "score_threats.py")],
@@ -122,6 +124,12 @@ STAGE_IO: dict[str, dict[str, list[str]]] = {
         "outputs": ["output/parquet/packets_clustered/**/*.parquet",
                     "output/parquet/l7_events_clustered/**/*.parquet",
                     "output/parquet/iocs_clustered/**/*.parquet"],
+    },
+    "sensormask": {
+        "inputs":  ["output/parquet/packets/**/*.parquet",
+                    "output/reports/clock_skew/clock_runs.parquet",
+                    "src/sensormask.py"],
+        "outputs": ["output/reports/sensormask/sensormask.parquet"],
     },
     "features": {
         "inputs":  ["output/parquet/packets/**/*.parquet",

@@ -524,6 +524,95 @@ def _md_cell(v: Any) -> str:
 
 
 # ----------------------------------------------------------------------
+# Sensor-off mask (built by src/sensormask.py)
+# ----------------------------------------------------------------------
+
+SENSORMASK_PATH = REPORTS / "sensormask" / "sensormask.parquet"
+# Per-run clock-skew offsets, emitted by scripts/consolidate_logs.py.
+CLOCK_RUNS_PATH = REPORTS / "clock_skew" / "clock_runs.parquet"
+
+SENSORMASK_SCHEMA = pa.schema([
+    ("start_ts",   pa.timestamp("us", tz="UTC")),
+    ("end_ts",     pa.timestamp("us", tz="UTC")),
+    ("kind",       pa.string()),      # gap | run_boundary
+    ("duration_s", pa.float64()),
+    ("source",     pa.string()),
+])
+
+
+def load_sensor_mask(kinds: Iterable[str] = ("gap", "run_boundary")
+                     ) -> list[tuple[_dt.datetime, _dt.datetime, str]]:
+    """Masked ``(start_ts, end_ts, kind)`` intervals, sorted by start.
+
+    Returns ``[]`` when the sensormask stage has not run, so callers work
+    (unmasked) on a fresh checkout.  Stateful detectors should drop masked
+    time from fit windows and reset per-entity state at each ``end_ts``.
+    """
+    if not SENSORMASK_PATH.exists() or SENSORMASK_PATH.stat().st_size == 0:
+        return []
+    t = pq.read_table(SENSORMASK_PATH, columns=["start_ts", "end_ts", "kind"])
+    want = set(kinds)
+    out = [(s, e, k) for s, e, k in zip(t["start_ts"].to_pylist(),
+                                        t["end_ts"].to_pylist(),
+                                        t["kind"].to_pylist()) if k in want]
+    return sorted(out)
+
+
+def mask_predicate(col: str = "ts",
+                   kinds: Iterable[str] = ("gap", "run_boundary")) -> str:
+    """SQL fragment that is TRUE for rows *outside* every masked interval.
+
+    Uses a NOT EXISTS against the mask parquet so it scales to any number of
+    intervals; ``TRUE`` when no mask has been built.
+    """
+    if not SENSORMASK_PATH.exists() or SENSORMASK_PATH.stat().st_size == 0:
+        return "TRUE"
+    kind_list = ", ".join(f"'{k}'" for k in kinds)
+    return (f"NOT EXISTS (SELECT 1 FROM read_parquet('{SENSORMASK_PATH}') sm "
+            f"WHERE sm.kind IN ({kind_list}) "
+            f"AND {col} >= sm.start_ts AND {col} < sm.end_ts)")
+
+
+# ----------------------------------------------------------------------
+# Evaluation views (synthetic injection, kept OUT of the corpus)
+# ----------------------------------------------------------------------
+
+EVAL_DIR = OUTPUT_DIR / "eval"
+
+
+def eval_inject_dir(name: str) -> Path:
+    """Where ``adversarysim --inject`` writes one named injection set."""
+    return EVAL_DIR / "inject" / name
+
+
+def register_eval_views(con: duckdb.DuckDBPyConnection, name: str) -> None:
+    """Register the canonical views, then overlay one injection set.
+
+    ``packets`` becomes the real corpus UNION ALL the injected rows (same
+    schema, same ``dt`` hive partition column), and ``eval_truth`` lists the
+    injected archetypes.  The parquet corpus on disk is never modified, and
+    injected rows never reach ``label_queue`` (project no-synthetic-labels
+    rule): the truth table is a detector test fixture, not a label set.
+    """
+    d = eval_inject_dir(name)
+    inj = d / "packets"
+    truth = d / "truth.parquet"
+    if not truth.exists() or not any(inj.glob("dt=*/*.parquet")):
+        raise FileNotFoundError(f"no injection set at {d} "
+                                "(run adversarysim.py --inject first)")
+    register_views(con)
+    con.execute(f"""
+        CREATE OR REPLACE VIEW packets AS
+        SELECT * FROM read_parquet('{PACKETS_GLOB}', hive_partitioning=1)
+        UNION ALL BY NAME
+        SELECT * FROM read_parquet('{inj / '**' / '*.parquet'}',
+                                   hive_partitioning=1)
+    """)
+    con.execute(f"CREATE OR REPLACE VIEW eval_truth AS "
+                f"SELECT * FROM read_parquet('{truth}')")
+
+
+# ----------------------------------------------------------------------
 # Time-window helpers
 # ----------------------------------------------------------------------
 

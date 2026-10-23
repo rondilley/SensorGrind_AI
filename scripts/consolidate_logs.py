@@ -154,6 +154,11 @@ def extract_one(args):
     run_offset = timedelta(0)
     run_offset_set = False
 
+    # One entry per clock run: where it starts in corrected time and the
+    # offset applied.  Detectors that keep state mask these boundaries,
+    # because inter-arrival times that straddle two runs mix two offsets.
+    runs: list[dict] = []
+
     sensor_count = 0
     anchor_count = 0
     run_count = 0
@@ -262,6 +267,16 @@ def extract_one(args):
                     skew_sec = abs(run_offset.total_seconds())
                     if skew_sec > max_skew_seconds:
                         max_skew_seconds = skew_sec
+                    runs.append({
+                        "src":          str(src),
+                        "run_idx":      run_count,
+                        "run_start_ts": packet_time + run_offset,
+                        "orig_pt":      packet_time,
+                        "offset_s":     run_offset.total_seconds(),
+                        "anchor_kind":  ("anchor" if last_anchor_ts is not None
+                                         else "filename"),
+                        "lines":        0,
+                    })
 
                 if not run_offset_set:
                     last_packet_time = packet_time
@@ -301,6 +316,7 @@ def extract_one(args):
                     last_orig_pt = orig_iso
 
                 sensor_count += 1
+                runs[-1]["lines"] += 1
                 last_packet_time = packet_time
     finally:
         try:
@@ -336,6 +352,7 @@ def extract_one(args):
                             if first_anchor_ts else ""),
         "fallback_ref":    (fallback_ref.strftime("%Y-%m-%dT%H:%M:%SZ")
                             if fallback_ref else ""),
+        "runs":            runs if sensor_count else [],
     }
 
 
@@ -521,6 +538,42 @@ def write_clock_skew_report(rows: list[dict]) -> None:
           file=sys.stderr)
 
 
+def write_clock_runs(rows: list[dict]) -> None:
+    """One row per clock run, for src/sensormask.py run-boundary masking.
+
+    Output:
+      ~/git/SensorGrind_AI/output/reports/clock_skew/clock_runs.parquet
+    """
+    out_dir = (Path.home() / "git" / "SensorGrind_AI"
+               / "output" / "reports" / "clock_skew")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        print("[skew] pyarrow not available; skipping clock_runs emit",
+              file=sys.stderr)
+        return
+    schema = pa.schema([
+        ("src",          pa.string()),
+        ("run_idx",      pa.uint32()),
+        ("run_start_ts", pa.timestamp("us", tz="UTC")),
+        ("orig_pt",      pa.timestamp("us", tz="UTC")),
+        ("offset_s",     pa.float64()),
+        ("anchor_kind",  pa.string()),
+        ("lines",        pa.uint64()),
+    ])
+    runs = sorted((run for r in rows for run in r.get("runs", [])
+                   if run["lines"] > 0),
+                  key=lambda run: run["run_start_ts"])
+    tmp = out_dir / "clock_runs.parquet.tmp"
+    pq.write_table(pa.Table.from_pylist(runs, schema=schema), tmp,
+                   compression="zstd", compression_level=3)
+    tmp.replace(out_dir / "clock_runs.parquet")
+    print(f"[skew] wrote {out_dir}/clock_runs.parquet ({len(runs):,} runs)",
+          file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -666,6 +719,7 @@ def main():
 
     # Emit clock-skew report from the per-file manifest rows.
     write_clock_skew_report(manifest_rows)
+    write_clock_runs(manifest_rows)
 
     if args.skip_merge:
         print("[info] --skip-merge set; stopping after extraction.")
