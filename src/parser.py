@@ -2,8 +2,13 @@
 """
 parser.py — Stage A+B: streaming parser for the honeypot merged log.
 
-Reads ~/git/SensorGrind_AI/data/merged.log.gz, where each line is
-``<ISO_UTC>\\t<raw syslog line containing PacketTime: ... Packetdata:<base64>>``.
+Usage:  parser.py INPUT [--output DIR] [...]
+
+INPUT is a gzip file, a plain ASCII file, or a folder of either (see
+sg/sensorlog.py).  Each line is a raw syslog line containing
+``PacketTime: ... Packetdata:<base64>``, such as honeypi_logs.py's sorted,
+clock-corrected honeypi_sensor.log.  The legacy merged.log.gz
+``<ISO_UTC>\\t`` line prefix is stripped when present.
 
 For every line we:
     1. Parse the text fields (timestamp, src/dst, ports, TCP flags, TTL, ...).
@@ -24,7 +29,7 @@ Outputs four daily-partitioned Parquet datasets under
 
 Architecture
 ------------
-Single reader (``zcat`` subprocess) -> multiprocessing.Pool decoder workers
+Single reader (sg.sensorlog) -> multiprocessing.Pool decoder workers
 (text+binary parsing, IOC extraction) -> single writer process that buckets
 rows by UTC day and rolls a new Parquet file per ``--rows-per-part`` rows.
 
@@ -39,9 +44,10 @@ import base64
 import hashlib
 import multiprocessing as mp
 import os
+import queue
 import re
+import shutil
 import struct
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -51,6 +57,9 @@ from typing import Any, Iterable
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sg import lib, sensorlog
 
 
 # ----------------------------------------------------------------------
@@ -1013,34 +1022,6 @@ def writer_loop(q: mp.Queue, out_base: Path, idle_close_after: int, stats_q: mp.
 # Main entry
 # ----------------------------------------------------------------------
 
-def stream_input(path: Path, max_lines: int) -> Iterable[bytes]:
-    """Yield raw bytes lines (without the ISO_UTC\\t prefix we added, but with the
-    raw syslog content)."""
-    p = subprocess.Popen(["zcat", str(path)], stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL, bufsize=1 << 22)
-    n = 0
-    try:
-        for raw in p.stdout:
-            # Each line is "<ISO>\t<rest>\n"; we only need the rest.
-            tab = raw.find(b"\t")
-            if tab == -1:
-                continue
-            yield raw[tab + 1: -1] if raw.endswith(b"\n") else raw[tab + 1:]
-            n += 1
-            if max_lines and n >= max_lines:
-                break
-    finally:
-        try:
-            p.stdout.close()
-        except Exception:
-            pass
-        p.terminate()
-        try:
-            p.wait(timeout=5)
-        except Exception:
-            p.kill()
-
-
 def chunks(it: Iterable[bytes], size: int) -> Iterable[list[bytes]]:
     buf = []
     for x in it:
@@ -1054,8 +1035,15 @@ def chunks(it: Iterable[bytes], size: int) -> Iterable[list[bytes]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--input", default=str(Path.home() / "git/SensorGrind_AI/data/merged.log.gz"))
-    ap.add_argument("--output", default=str(Path.home() / "git/SensorGrind_AI/output/parquet"))
+    ap.add_argument("input", nargs="?",
+                    help="Sensor log: gzip file, plain ASCII file, or a folder of them.")
+    ap.add_argument("--input", dest="input_opt", metavar="INPUT",
+                    help="Same as the positional INPUT (kept for older scripts).")
+    ap.add_argument("--output", default=str(lib.PARQUET),
+                    help="Parquet root (default: lib.PARQUET).  An existing root is "
+                         "replaced only after a successful parse: the run writes "
+                         "<output>.partial, then the old root becomes <output>.prev "
+                         "(the one before that is deleted).")
     # Worker default was capped at 6 to dodge an OOM in the writer process
     # (writer accumulated full Pool result cache when it couldn't keep up).
     # That bug was fixed 2026-05-27 by switching to explicit Process workers
@@ -1077,17 +1065,27 @@ def main() -> int:
                          "the set is cleared and refilled from that point forward "
                          "(some cross-batch duplicates may be written).")
     args = ap.parse_args()
+    if not (args.input or args.input_opt):
+        ap.error("an INPUT file or folder is required")
 
-    in_path = Path(args.input)
-    out_base = Path(args.output)
-    out_base.mkdir(parents=True, exist_ok=True)
+    in_path = Path(args.input or args.input_opt).expanduser()
+    final_out = Path(args.output).expanduser()
 
     if not in_path.exists():
         print(f"input not found: {in_path}", file=sys.stderr)
         return 2
 
-    print(f"[info] input:  {in_path}  ({in_path.stat().st_size/1e9:.2f} GB)")
-    print(f"[info] output: {out_base}")
+    # Never write into a populated root: day files left from an older parse
+    # would mix with the new one.  Build beside it and swap on success.
+    replacing = final_out.exists() and any(final_out.iterdir())
+    out_base = final_out.with_name(final_out.name + ".partial") if replacing else final_out
+    if replacing and out_base.exists():
+        print(f"[info] removing leftover {out_base} from an unfinished parse")
+        shutil.rmtree(out_base)
+    out_base.mkdir(parents=True, exist_ok=True)
+
+    print(f"[info] input:  {sensorlog.describe(in_path)}")
+    print(f"[info] output: {final_out}" + (f"  (building in {out_base})" if replacing else ""))
     print(f"[info] workers={args.workers}  chunk={args.chunk_lines}  "
           f"idle_close_after={args.idle_close_after}  max_lines={args.max_lines or 'all'}")
 
@@ -1107,21 +1105,57 @@ def main() -> int:
         workers.append(w)
 
     t0 = time.time()
-    line_iter = stream_input(in_path, args.max_lines)
+    line_iter = sensorlog.iter_lines(in_path, args.max_lines)
+
+    def put_task(item) -> bool:
+        """Bounded put: if the writer dies, workers block on the full out_q
+        and a plain put() here would hang forever.  False = writer died."""
+        while writer.is_alive():
+            try:
+                task_q.put(item, timeout=1)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    writer_dead = False
     for chunk in chunks(line_iter, args.chunk_lines):
-        task_q.put(chunk)
-        if not writer.is_alive():
+        if not put_task(chunk):
+            writer_dead = True
             print("[error] writer process died, aborting", file=sys.stderr)
             break
 
-    for _ in workers:
-        task_q.put(None)
-    for w in workers:
-        w.join()
-
-    out_q.put(None)
-    writer.join()
+    if writer_dead or not all(put_task(None) for _ in workers):
+        for w in workers:
+            w.terminate()
+        # Buffered items can never be flushed now; don't block exit on them.
+        task_q.cancel_join_thread()
+        out_q.cancel_join_thread()
+        line_iter.close()
+        writer.join()
+    else:
+        for w in workers:
+            while w.is_alive() and writer.is_alive():
+                w.join(timeout=1)
+        if writer.is_alive():
+            out_q.put(None)
+        else:
+            for w in workers:
+                w.terminate()
+        writer.join()
+    if writer.exitcode != 0:
+        print(f"[error] writer exited with code {writer.exitcode}; "
+              f"{final_out} left unchanged, partial output in {out_base}",
+              file=sys.stderr)
+        return 1
     stats = stats_q.get(timeout=5)
+    if replacing:
+        prev = final_out.with_name(final_out.name + ".prev")
+        if prev.exists():
+            shutil.rmtree(prev)
+        final_out.rename(prev)
+        out_base.rename(final_out)
+        print(f"[info] replaced {final_out}; previous parse kept in {prev}")
     print(f"[done] {time.time() - t0:.1f}s wall  "
           f"packets={stats['packets']:,} blobs={stats['blobs']:,} "
           f"l7={stats['l7']:,} iocs={stats['iocs']:,} "

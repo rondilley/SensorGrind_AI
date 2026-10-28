@@ -225,7 +225,11 @@ def _window_sql(where: str, win_seconds: int | None,
         tok AS (
             SELECT b.src_ip, b.ts, b.dst_port, b.token, b.boundary, b.tgap_us,
                    sb.base_us,
-                   sum(b.boundary) OVER (PARTITION BY b.src_ip ORDER BY b.ts, b.token
+                   -- boundary DESC: among identical (ts, token) packets the lag()
+                   -- gap lands on an arbitrary one, so put the boundary row first
+                   -- or the duplicates can split across two session ids.
+                   sum(b.boundary) OVER (PARTITION BY b.src_ip
+                                         ORDER BY b.ts, b.token, b.boundary DESC
                                          ROWS UNBOUNDED PRECEDING) AS sid
             FROM bounded b LEFT JOIN srcbase sb USING (src_ip)
         ),
@@ -555,7 +559,9 @@ def run(args: argparse.Namespace) -> int:
 
     # Spill area for intermediate per-window session parquets.
     if not os.environ.get("SG_DUCK_TMPDIR"):
-        sp = Path(tempfile.gettempdir()) / "chainfp_duck_spill"
+        # on disk, not tempfile.gettempdir(): /tmp is a RAM tmpfs on the
+        # workstation, and a 14 GB spill there filled it (2026-10-24)
+        sp = lib.OUTPUT_DIR / ".duckdb_tmp" / "chainfp_spill"
         sp.mkdir(parents=True, exist_ok=True)
         os.environ["SG_DUCK_TMPDIR"] = str(sp)
     spill_dir = Path(os.environ["SG_DUCK_TMPDIR"])

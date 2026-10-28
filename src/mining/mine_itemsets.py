@@ -155,6 +155,25 @@ def run(args: argparse.Namespace) -> int:
     from mlxtend.preprocessing import TransactionEncoder
     from mlxtend.frequent_patterns import fpgrowth
 
+    # An item below min_support cannot be in a frequent itemset, so drop
+    # those items before the dense one-hot encoding.  The FP-Growth result
+    # is the same; the matrix is (IPs x frequent items) instead of
+    # (IPs x every distinct port/UA/ASN), which was 49.7 GB on the
+    # 1.23B-packet corpus (2026-10-25).
+    min_count = args.min_support * len(transactions)
+    counts: dict[str, int] = defaultdict(int)
+    for t in transactions:
+        for it in t:
+            counts[it] += 1
+    keep = {it for it, c in counts.items() if c >= min_count}
+    n_items = len(counts)
+    # keep the empty transactions: support = count / all transactions
+    transactions = [[it for it in t if it in keep] for t in transactions]
+    print(f"[itemsets] {len(keep):,} of {n_items:,} items reach min_support",
+          file=sys.stderr)
+    if not keep:
+        return 0
+
     print("[itemsets] encoding transactions...", file=sys.stderr)
     te = TransactionEncoder()
     te_ary = te.fit(transactions).transform(transactions)

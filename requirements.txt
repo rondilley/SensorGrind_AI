@@ -21,8 +21,8 @@ eval_type_backport==0.3.1
 filelock==3.29.0
 fonttools==4.63.0
 frozenlist==1.8.0
+fsspec==2026.7.0
 geoip2==5.2.0
-google-ai-generativelanguage==0.6.15
 google-api-core==2.30.3
 google-api-python-client==2.197.0
 google-auth==2.53.0
@@ -30,7 +30,7 @@ google-auth-httplib2==0.4.0
 google-genai==2.7.0
 googleapis-common-protos==1.75.0
 grpcio==1.80.0
-grpcio-status==1.71.2
+grpcio-status==1.80.0
 h11==0.16.0
 hdbscan==0.8.43
 httpcore==1.0.9
@@ -39,6 +39,7 @@ httpx==0.28.1
 idna==3.16
 igraph==1.0.0
 importlib_metadata==8.7.1
+jinja2==3.1.6
 jiter==0.15.0
 joblib==1.5.3
 jsonpath-python==1.1.6
@@ -47,13 +48,16 @@ leidenalg==0.12.0
 lightgbm==4.6.0
 llvmlite==0.47.0
 markdown-it-py==4.2.0
+MarkupSafe==3.0.3
 matplotlib==3.10.9
 maxminddb==3.1.1
 mdit-py-plugins==0.6.1
 mdurl==0.1.2
 mistralai==2.4.8
 mlxtend==0.24.0
+mpmath==1.3.0
 multidict==6.7.1
+narwhals==2.27.1
 networkx==3.6.1
 numba==0.65.1
 numpy==2.4.6
@@ -66,7 +70,7 @@ patsy==1.0.2
 pillow==12.2.0
 propcache==0.5.2
 proto-plus==1.28.0
-protobuf==5.29.6
+protobuf==6.33.6
 pyarrow==24.0.0
 pyasn1==0.6.3
 pyasn1_modules==0.4.2
@@ -83,12 +87,18 @@ python-louvain==0.16
 pytz==2026.2
 requests==2.34.2
 requests-file==3.0.1
-ruptures==1.1.10
+river==0.26.1
+# ruptures 1.1.10 declares Requires-Python <3.14 but builds and runs on 3.14
+# from source.  On 3.14 install it after this file:
+#   pip install --ignore-requires-python --no-binary ruptures ruptures==1.1.10
+ruptures==1.1.10 ; python_version < "3.14"
 scikit-learn==1.8.0
 scipy==1.17.1
+setuptools==78.1.0
 six==1.17.0
 sniffio==1.3.1
 statsmodels==0.14.6
+sympy==1.14.0
 tenacity==9.1.4
 texttable==1.7.0
 threadpoolctl==3.6.0
@@ -106,3 +116,10 @@ websockets==16.0
 yarl==1.24.2
 zipp==4.1.0
 zopfli==0.4.2
+# torch: ROCm build for the gfx1151 GPU (DeepLog in bench/arrival_eval.py,
+# AKD1500 model training); install with
+#   pip install torch==2.11.0+rocm7.13.0a20260426 --index-url https://rocm.nightlies.amd.com/v2/gfx1151/
+# (do not use the PyPI ROCm wheels: no gfx1151 kernels)
+torch==2.11.0+rocm7.13.0a20260426
+# pybind11: build-time only, for the libakida binding (python src/sg/akd/build.py)
+pybind11==3.1.0

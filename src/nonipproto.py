@@ -11,7 +11,7 @@ every other IPv4 protocol is:
             DgLen:<n> Packetdata:<base64>
 
 These lines never reach the parquet pipeline.  This script scans the
-source merged.log.gz, tabulates `UNKNOWN-IPv4-Protocol:<NUM>` by IANA
+source sensor log, tabulates `UNKNOWN-IPv4-Protocol:<NUM>` by IANA
 protocol number, and emits per-protocol counts + a sample payload
 prefix so you can spot SCTP (132, telco signaling), GRE (47, tunneling),
 6to4 (41, v6-in-v4), IP-in-IP (4), etc.
@@ -19,6 +19,11 @@ prefix so you can spot SCTP (132, telco signaling), GRE (47, tunneling),
 For each protocol number it captures: packet count, total bytes, TTL
 mode, distinct source IPs (bounded), first/last seen dates, and a
 hex-printable sample of the first 32 payload bytes.
+
+Usage:  nonipproto.py INPUT [--max-lines N]
+
+INPUT is a gzip file, a plain ASCII file, or a folder of either (see
+sg/sensorlog.py).
 """
 from __future__ import annotations
 
@@ -33,7 +38,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sg import lib
+from sg import lib, sensorlog
 
 OUT_DIR = lib.REPORTS / "nonipproto"
 
@@ -113,7 +118,7 @@ def run(args: argparse.Namespace) -> int:
     if not src.exists():
         print(f"[nonip] input not found: {src}", file=sys.stderr)
         return 2
-    print(f"[nonip] scanning {src} for UNKNOWN-IPv4-Protocol lines...",
+    print(f"[nonip] scanning {sensorlog.describe(src)} for UNKNOWN-IPv4-Protocol lines...",
           file=sys.stderr)
 
     counts: dict[int, int] = defaultdict(int)
@@ -135,11 +140,9 @@ def run(args: argparse.Namespace) -> int:
     n_known = 0
     SRC_CAP = 50_000  # bound src-set memory per protocol
 
-    import subprocess as sp
-    p = sp.Popen(["zcat", str(src)], stdout=sp.PIPE, stderr=sp.DEVNULL,
-                 bufsize=1 << 22)
+    lines = sensorlog.iter_lines(src)
     try:
-        for raw in p.stdout:
+        for raw in lines:
             n_lines += 1
             mp = PROTO_RE.search(raw)
             if not mp:
@@ -190,15 +193,7 @@ def run(args: argparse.Namespace) -> int:
             if args.max_lines and n_lines >= args.max_lines:
                 break
     finally:
-        try:
-            p.stdout.close()
-        except Exception:
-            pass
-        p.terminate()
-        try:
-            p.wait(timeout=5)
-        except Exception:
-            p.kill()
+        lines.close()
 
     print(f"[nonip] {n_lines:,} lines scanned; "
           f"{n_known:,} were standard TCP/UDP/ICMP (parsed); "
@@ -306,11 +301,16 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--input",
-                    default=str(Path.home() / "git/SensorGrind_AI/data/merged.log.gz"))
+    ap.add_argument("input", nargs="?",
+                    help="Sensor log: gzip file, plain ASCII file, or a folder of them.")
+    ap.add_argument("--input", dest="input_opt", metavar="INPUT",
+                    help="Same as the positional INPUT (kept for older scripts).")
     ap.add_argument("--max-lines", type=int, default=0,
                     help="0 = scan all (default). Use small N for smoke tests.")
     args = ap.parse_args()
+    args.input = args.input or args.input_opt
+    if not args.input:
+        ap.error("an INPUT file or folder is required")
     return run(args)
 
 

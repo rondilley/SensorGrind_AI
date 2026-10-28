@@ -4,6 +4,8 @@ evolve — orchestrator for the SensorGrind_AI v2 learn-and-evolve loop.
 
 Sequence of stages (each runnable independently):
 
+  0. parse         — raw sensor log -> parquet tables (parser.py); runs only
+                     with --input, otherwise the existing parquet is used
   1. analyzers     — run the 19 base analyzers (sgquery.py)
   2. features      — build the per-IP feature snapshot (build_ip_features)
   3. model         — train the threat classifier on bootstrap labels
@@ -22,6 +24,10 @@ Usage:
   python evolve.py --no-cache       # don't read OR write freshness cache
   python evolve.py --parallel 4     # run independent stages on 4 workers
                                     # (DAG mode, respects all the flags above)
+  python evolve.py --input LOG      # parse LOG first (gzip file, ASCII file,
+                                    # or folder) and give it to the other
+                                    # raw-log stage (nonipproto); without it
+                                    # both are skipped
 """
 from __future__ import annotations
 
@@ -44,12 +50,16 @@ SRC = REPO_ROOT / "src"
 PY = REPO_ROOT / "venv" / "bin" / "python"
 
 STAGES: dict[str, list[str]] = {
+    # raw sensor log -> output/parquet/{packets,payload_blobs,l7_events,iocs}
+    "parse":        [str(SRC / "parser.py")],
     "analyzers":    [str(SRC / "sgquery.py")],
     # derived packets layout clustered by source ASN/CIDR/IP (see
     # cluster_packets.py); built once per parse, consumers read bounded windows
     "cluster":      [str(SRC / "cluster_packets.py")],
     # --- v3.3 sensor-off + clock-run mask for stateful detectors ---
     "sensormask":   [str(SRC / "sensormask.py")],
+    # --- v3.4 neuromorphic per-source scores (LIF/ALIF bank; ARCHITECTURE §9.4)
+    "neuro":        [str(SRC / "neuro.py")],
     "features":     [str(SRC / "features" / "build_ip_features.py")],
     "model":        [str(SRC / "models" / "train_threat_classifier.py")],
     "score":        [str(SRC / "models" / "score_threats.py")],
@@ -107,6 +117,10 @@ STAGES: dict[str, list[str]] = {
 }
 ORDER = list(STAGES.keys())
 
+# Stages that read the raw sensor log rather than the parquet tables.  They
+# get evolve's --input appended; without --input they are skipped.
+RAW_INPUT_STAGES = {"parse", "nonipproto"}
+
 # Per-stage I/O map — the inputs the stage reads + the outputs it writes.
 # Glob patterns are evaluated relative to REPO_ROOT.  A stage is considered
 # "fresh" if every input is older than every output AND the stage's own
@@ -116,6 +130,14 @@ ORDER = list(STAGES.keys())
 # That's the safe default — better to redo work than silently use stale
 # outputs.  Add an entry when you're confident in the I/O contract.
 STAGE_IO: dict[str, dict[str, list[str]]] = {
+    # The raw --input log is added to these inputs at run time (is_fresh).
+    "parse": {
+        "inputs":  ["src/parser.py", "src/sg/sensorlog.py"],
+        "outputs": ["output/parquet/packets/**/*.parquet",
+                    "output/parquet/payload_blobs/**/*.parquet",
+                    "output/parquet/l7_events/**/*.parquet",
+                    "output/parquet/iocs/**/*.parquet"],
+    },
     "cluster": {
         "inputs":  ["output/parquet/packets/**/*.parquet",
                     "output/parquet/l7_events/**/*.parquet",
@@ -130,6 +152,19 @@ STAGE_IO: dict[str, dict[str, list[str]]] = {
                     "output/reports/clock_skew/clock_runs.parquet",
                     "src/sensormask.py"],
         "outputs": ["output/reports/sensormask/sensormask.parquet"],
+    },
+    "neuro": {
+        "inputs":  ["output/parquet/packets/**/*.parquet",
+                    "output/reports/sensormask/sensormask.parquet",
+                    "output/reports/arrival_eval/arrival_scores_full.parquet",
+                    "src/neuro.py", "src/sg/lif.py", "src/bench/lif_eval.py",
+                    "src/sg/hdc.py", "src/sg/hdc_gpu.py", "src/bench/hdc_eval.py",
+                    "src/chainfp.py"],
+        # the per-day cache output/.neuro_cache/ stays out of this glob
+        # (rule 3 of ARCHITECTURE §9.3)
+        "outputs": ["output/reports/neuro/neuro.parquet",
+                    "output/reports/neuro/neuro_days.parquet",
+                    "output/reports/neuro/neuro_hdc_days.parquet"],
     },
     "features": {
         "inputs":  ["output/parquet/packets/**/*.parquet",
@@ -208,7 +243,10 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
     # for scheduling: it keeps the two heaviest DuckDB stages from running
     # concurrently in --parallel mode (memory pressure).
     "cluster":      ["analyzers"],
-    "features":     ["analyzers", "cluster"],
+    # neuro reads packets + sensormask; the analyzers/cluster/chainfp edges
+    # are for scheduling (memory).  features joins neuro.parquet.
+    "neuro":        ["analyzers", "cluster", "chainfp", "sensormask"],
+    "features":     ["analyzers", "cluster", "neuro"],
     "model":        ["features"],
     "score":        ["model"],
     "risk":         ["score"],
@@ -279,7 +317,7 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
     # The report consumes everything; depend on every stage that has
     # registered outputs.  Anything else just runs before report by
     # virtue of topological order.
-    "report":       ["risk", "dossiers", "mining", "promote", "longitudinal",
+    "report":       ["risk", "neuro", "dossiers", "mining", "promote", "longitudinal",
                      "chains", "sequences", "coordination", "actors",
                      "drift", "rotation", "cross_modal", "survival",
                      "pktanalysis", "payloadanalysis", "pacing", "landscape",
@@ -326,6 +364,11 @@ def build_dependency_graph() -> dict[str, set[str]]:
     inferred = _infer_io_deps()
     for s, parents in inferred.items():
         deps[s].update(parents)
+    # Everything downstream reads the parsed tables: every otherwise-root
+    # stage waits for parse (a no-op skip when --input is not given).
+    for s in STAGES:
+        if s != "parse" and not deps[s]:
+            deps[s].add("parse")
     # Ensure all referenced parents are real stages.
     for s, parents in deps.items():
         deps[s] = {p for p in parents if p in STAGES}
@@ -449,7 +492,17 @@ def _save_cache(c: dict) -> None:
     tmp.replace(_FRESH_CACHE)
 
 
-def is_fresh(name: str, cmd: list[str], cache: dict) -> tuple[bool, str]:
+def _raw_input_files(raw_input: str | None) -> list[Path]:
+    if not raw_input:
+        return []
+    p = Path(raw_input)
+    if p.is_dir():
+        return [f for f in p.iterdir() if f.is_file()]
+    return [p] if p.is_file() else []
+
+
+def is_fresh(name: str, cmd: list[str], cache: dict,
+             raw_input: str | None = None) -> tuple[bool, str]:
     """Decide whether a stage can be skipped.  Returns (fresh, reason)."""
     io = STAGE_IO.get(name)
     if io is None:
@@ -460,6 +513,8 @@ def is_fresh(name: str, cmd: list[str], cache: dict) -> tuple[bool, str]:
     if cached.get("cmd_hash") != _hash_command(cmd):
         return False, "command or source changed since last run"
     inputs = _resolve_globs(io.get("inputs", []))
+    if name in RAW_INPUT_STAGES:
+        inputs += _raw_input_files(raw_input)
     outputs = _resolve_globs(io.get("outputs", []))
     if not outputs:
         return False, "expected outputs missing"
@@ -616,7 +671,8 @@ def _terminate(proc: subprocess.Popen, grace: float = 10.0) -> None:
 
 
 def run_stage(name: str, cache: dict, force: bool,
-              no_cache: bool) -> tuple[bool, bool, str]:
+              no_cache: bool, raw_input: str | None = None
+              ) -> tuple[bool, bool, str]:
     """Run a single stage. Returns (success, skipped, detail).
 
     ``detail`` is empty on success/skip and a short failure reason
@@ -625,8 +681,14 @@ def run_stage(name: str, cache: dict, force: bool,
     even when parallel stages interleave on the console.
     """
     cmd = [str(PY)] + STAGES[name]
+    if name in RAW_INPUT_STAGES:
+        if not raw_input:
+            print(f"[evolve] STAGE: {name} -- skipped (needs the raw sensor "
+                  f"log; pass --input)", file=sys.stderr)
+            return True, True, ""
+        cmd.append(raw_input)
     if not force:
-        fresh, why = is_fresh(name, cmd, cache)
+        fresh, why = is_fresh(name, cmd, cache, raw_input)
         if fresh:
             print(f"[evolve] STAGE: {name} -- skipped ({why})",
                   file=sys.stderr)
@@ -691,7 +753,8 @@ def run_stage(name: str, cache: dict, force: bool,
 
 def run_dag(chosen: list[str], deps: dict[str, set[str]],
             cache: dict, force: bool, no_cache: bool,
-            workers: int) -> tuple[int, int, int, set[str],
+            workers: int, raw_input: str | None = None
+            ) -> tuple[int, int, int, set[str],
                                    dict[str, str], bool]:
     """DAG-aware runner.
 
@@ -737,7 +800,8 @@ def run_dag(chosen: list[str], deps: dict[str, set[str]],
                     for other in chosen:
                         remaining[other].discard(s)
                     continue
-                fut = pool.submit(run_stage, s, cache, force, no_cache)
+                fut = pool.submit(run_stage, s, cache, force, no_cache,
+                                  raw_input)
                 in_flight[fut] = s
             if not in_flight:
                 # Nothing to launch, nothing in flight -> we'd loop forever.
@@ -842,6 +906,12 @@ def main() -> int:
                          "preserves the legacy sequential behavior. "
                          "Stage dependencies are computed from STAGE_IO + "
                          "EXPLICIT_DEPS.")
+    ap.add_argument("--input", metavar="LOG",
+                    help="Raw sensor log for the stages that read it "
+                         f"({', '.join(sorted(RAW_INPUT_STAGES))}): a gzip "
+                         "file, a plain ASCII file, or a folder of them.  "
+                         "Without it those stages are skipped and the "
+                         "existing parquet tables are used.")
     ap.add_argument("--show-dag", action="store_true",
                     help="Print the computed dependency graph and exit.")
     ap.add_argument("--no-run-log", action="store_true",
@@ -850,6 +920,14 @@ def main() -> int:
                          "every run is logged there in addition to the "
                          "console, so a run is never lost.")
     args = ap.parse_args()
+
+    raw_input = None
+    if args.input:
+        in_path = Path(args.input).expanduser().resolve()
+        if not in_path.exists():
+            print(f"[evolve] input not found: {in_path}", file=sys.stderr)
+            return 2
+        raw_input = str(in_path)
 
     if args.list:
         for s in ORDER:
@@ -913,7 +991,7 @@ def main() -> int:
                 (passed, skipped, failed, failed_stages,
                  failure_reason, interrupted) = run_dag(
                     chosen, deps, cache, args.force, args.no_cache,
-                    args.parallel,
+                    args.parallel, raw_input,
                 )
             else:
                 for s in chosen:
@@ -928,7 +1006,7 @@ def main() -> int:
                             f"upstream failure: {', '.join(bad_parents)}")
                         continue
                     ok, was_skipped, detail = run_stage(
-                        s, cache, args.force, args.no_cache)
+                        s, cache, args.force, args.no_cache, raw_input)
                     if ok and was_skipped:
                         skipped += 1
                     elif ok:

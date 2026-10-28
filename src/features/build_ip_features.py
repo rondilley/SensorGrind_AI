@@ -84,6 +84,16 @@ SCHEMA = pa.schema([
     ("burstiness_cv",     pa.float32()),
     ("campaign_count",    pa.uint16()),
     ("botnet_family",     pa.string()),
+    # neuro step (ARCHITECTURE §9.4): calibrated LIF readouts, -log10
+    ("neuro_days",        pa.uint16()),
+    ("neuro_change",      pa.float32()),
+    ("neuro_reg",         pa.float32()),
+    ("neuro_flag_days",   pa.uint16()),
+    ("neuro_arrival_min", pa.uint32()),
+    # HDC choreography scores (calibrated -log10, best day), same step
+    ("neuro_hdc_days",    pa.uint16()),
+    ("neuro_hdc_proto",   pa.float32()),
+    ("neuro_hdc_drift",   pa.float32()),
 ])
 
 
@@ -191,6 +201,14 @@ def build_feature_sql(where: str, bucket: tuple[int, int] | None = None,
                                 ("burstiness_cv", "burstiness_cv", "0.0")])
     add_report("clusterxref", "cx", [("campaign_count", "campaign_count", "0"),
                                      ("botnet_family", "botnet_family", "''")])
+    add_report("neuro", "nr", [("neuro_days", "lif_days", "0"),
+                               ("neuro_change", "lif_change_max", "0.0"),
+                               ("neuro_reg", "lif_reg_max", "0.0"),
+                               ("neuro_flag_days", "lif_flag_days", "0"),
+                               ("neuro_arrival_min", "arrival_alarm_minutes", "0"),
+                               ("neuro_hdc_days", "hdc_days", "0"),
+                               ("neuro_hdc_proto", "hdc_proto_max", "0.0"),
+                               ("neuro_hdc_drift", "hdc_drift_max", "0.0")])
     extra_sql = ",\n            ".join(extra)
     joins_sql = "\n        ".join(joins)
 

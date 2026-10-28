@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import math
 import sys
 from pathlib import Path
 
@@ -39,6 +40,7 @@ SCHEMA = pa.schema([
     ("infra_signal",    pa.float32()),
     ("anomaly_signal",  pa.float32()),
     ("benign_offset",   pa.float32()),
+    ("neuro_signal",    pa.float32()),
     ("rationale",       pa.string()),
 ])
 
@@ -64,6 +66,50 @@ CLOUD_KEYWORDS = ("amazon", "google", "microsoft", "azure", "digitalocean",
                   "tencent", "constant company")
 RESIDENTIAL_KEYWORDS = ("comcast", "cox", "verizon", "att", "spectrum",
                         "telecom", "broadband", "china mobile", "china unicom")
+
+
+# Neuromorphic term (ARCHITECTURE §9.1 Phase 4), capped so that it can move
+# a source by part of one tier only.  neuro_change / neuro_reg are -log10
+# exceedance rates of the source's best day; log10(days) removes the gain
+# that a source gets from many days of tests.
+NEURO_FLAG = 4.0
+# Known scanners inside a published scanner CIDR (benignfilter evidence
+# "cidr:") take a small reduction (operator decision 2026-10-25); scanners
+# found only by user agent or ASN keep their behavior score.
+SCANNER_CIDR_OFFSET = -10.0
+# Arrival cap 0 (operator decision 2026-10-25): an stl_z alarm minute is a
+# property of all traffic, so it gave points to every source active in it.
+# Restore only with a per-source share of the excess packets.
+NEURO_LIF_CAP, NEURO_ARRIVAL_CAP, NEURO_CAP = 6.0, 0.0, 8.0
+# HDC choreography term: hdc_proto / hdc_drift passed their matched rff_*
+# twins on rotating_actor (test and development sets, 2026-10-27).  Same
+# excess rule as the LIF term; the shared NEURO_CAP still limits the total.
+NEURO_HDC_CAP = 4.0
+
+
+def neuro_score(r: dict) -> tuple[float, str]:
+    days = max(1, r.get("neuro_days") or 0)
+    best = max(r.get("neuro_change") or 0.0, r.get("neuro_reg") or 0.0)
+    excess = best - NEURO_FLAG - math.log10(days)
+    lif_term = min(NEURO_LIF_CAP, 2.0 * max(0.0, excess))
+    arr = r.get("neuro_arrival_min") or 0
+    arr_term = min(NEURO_ARRIVAL_CAP, math.log2(1 + arr)) if arr else 0.0
+    hp, hd = r.get("neuro_hdc_proto") or 0.0, r.get("neuro_hdc_drift") or 0.0
+    h_excess = (max(hp, hd) - NEURO_FLAG
+                - math.log10(max(1, r.get("neuro_hdc_days") or 0)))
+    hdc_term = min(NEURO_HDC_CAP, 2.0 * max(0.0, h_excess))
+    label = []
+    if lif_term > 0:
+        kind = ("rate-shift" if (r.get("neuro_change") or 0) >=
+                (r.get("neuro_reg") or 0) else "metronome")
+        label.append(f"lif-{kind}={best:.1f}")
+    if hdc_term > 0:
+        label.append(f"hdc-{'proto' if hp >= hd else 'drift'}="
+                     f"{max(hp, hd):.1f}")
+    if arr_term > 0:
+        label.append(f"arrival-alarm={arr}min")
+    return (min(NEURO_CAP, lif_term + hdc_term + arr_term),
+            ", ".join(label))
 
 
 def infra_score(asn_org: str) -> tuple[float, str]:
@@ -95,6 +141,17 @@ def run() -> int:
             con.close()
             print(f"[risk] loaded ML scores for {len(score_map):,} IPs from {latest[-1].name}",
                   file=sys.stderr)
+
+    cidr_scanners: set[str] = set()
+    bf = lib.REPORTS / "benignfilter" / "benignfilter.parquet"
+    if bf.exists():
+        con = lib.duck()
+        cidr_scanners = {r[0] for r in con.execute(
+            f"SELECT src_ip FROM read_parquet('{bf}') "
+            "WHERE evidence LIKE '%cidr:%'").fetchall()}
+        con.close()
+        print(f"[risk] {len(cidr_scanners):,} IPs in published scanner CIDRs",
+              file=sys.stderr)
 
     table = sf.load_snapshot(snap)
     print(f"[risk] scoring {table.num_rows:,} IPs...", file=sys.stderr)
@@ -130,13 +187,18 @@ def run() -> int:
         anom = float(r["anomaly_score"] or 0)
         anomaly_signal = min(10.0, anom / 5.0)
 
-        # Benign offset: known scanners take a big penalty.
-        benign_offset = -40.0 if r["benign_org"] else 0.0
+        # Benign offset (operator decision 2026-10-25): a small reduction
+        # for an IP in a published scanner CIDR only.  Other known scanners
+        # score by their behavior; benign_org stays in the rationale.
+        in_cidr = ip in cidr_scanners
+        benign_offset = SCANNER_CIDR_OFFSET if in_cidr else 0.0
+
+        neuro_signal, neuro_label = neuro_score(r)
 
         composite = (35.0 * ml +
                      persistence + breadth + exploit_signal +
                      botnet_signal + infra_signal + anomaly_signal +
-                     benign_offset)
+                     neuro_signal + benign_offset)
         composite = max(0.0, min(100.0, composite))
 
         t = tier(composite)
@@ -154,7 +216,10 @@ def run() -> int:
         if days >= 100:
             rationale_parts.append(f"persist={days}d")
         if r["benign_org"]:
-            rationale_parts.append(f"benign={r['benign_org']}")
+            rationale_parts.append(f"known-scanner={r['benign_org']}"
+                                   + (" (published CIDR)" if in_cidr else ""))
+        if neuro_label:
+            rationale_parts.append(neuro_label)
         rationale_parts.append(f"infra={infra_label}")
 
         out_rows.append({
@@ -163,7 +228,7 @@ def run() -> int:
             "persistence": persistence, "breadth": breadth,
             "exploit_signal": exploit_signal, "botnet_signal": botnet_signal,
             "infra_signal": infra_signal, "anomaly_signal": anomaly_signal,
-            "benign_offset": benign_offset,
+            "benign_offset": benign_offset, "neuro_signal": neuro_signal,
             "rationale": ", ".join(rationale_parts),
         })
 

@@ -55,6 +55,18 @@ KNOWN_CIDRS: dict[str, list[str]] = {
     ],
     "onyphe": [
         "2.16.11.0/24",
+        # OpenFilters onyphe.nft (from probe.onyphe.net/ip-ranges.txt)
+        "15.204.109.96/31", "15.204.109.103", "15.204.109.224",
+        "51.254.49.96/28", "91.196.152.0/24", "91.230.168.0/24",
+        "91.231.89.0/24", "94.231.206.0/24", "195.184.76.0/24",
+    ],
+    # OpenFilters modat.nft (from scanner.modat.io/ipv4.txt)
+    "modat": [
+        "23.111.14.183", "23.111.14.184/29", "23.111.14.192",
+        "31.14.32.4/30", "31.14.32.8", "54.37.81.238",
+        "57.129.64.10", "57.129.64.219", "57.129.64.237",
+        "85.217.140.0/24", "85.217.149.0/24", "142.91.102.186/31",
+        "185.2.80.252/31", "209.58.160.54", "212.73.148.0/24",
     ],
     "internet_measurement": [
         "141.212.121.0/24", "141.212.122.0/24",
@@ -105,6 +117,7 @@ UA_PATTERNS: dict[str, list[str]] = {
     "rapid7": ["sonar.labs", "rapid7"],
     "netcraft": ["netcraft"],
     "onyphe": ["onyphe"],
+    "modat": ["modatscanner"],
     "bitsight": ["bitsight"],
     "shadowserver": ["shadowserver"],
     "intrinsec": ["intrinsec"],
@@ -130,6 +143,8 @@ SCANNER_ASNS: dict[int, str] = {
     19994: "rapid7",
     11022: "shadowserver",
     210631: "onyphe",
+    213412: "onyphe",
+    209334: "modat",
     40027: "bitsight",
     202425: "alpha_strike",
     21501: "kudelski",

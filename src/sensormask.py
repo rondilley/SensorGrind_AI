@@ -5,8 +5,8 @@ sensormask — "sensor off" and clock-run-boundary mask for stateful detectors.
 Any detector that keeps state over time (leaky integrators, reservoirs, HTM
 cells, rolling z-scores, decayed prototypes) must know when the sensor was
 not recording.  Otherwise it learns an outage as "quiet normal" and then
-flags the restart as a huge burst.  No analyzer masked the 2025-11-12 ->
-2026-01-28 outage before this stage.
+flags the restart as a huge burst.  No analyzer masked the 2025-11-11 ->
+2026-02-05 outage before this stage.
 
 Two interval kinds are emitted:
 
@@ -50,11 +50,16 @@ def _gaps(con, where: str, gap_minutes: int) -> list[dict]:
 
     Only active minutes are materialized (<= ~1M rows for the full corpus),
     and a gap is the space between two consecutive active minutes.
+
+    NTP replies (UDP from port 123) do not make a minute active: they answer
+    the sensor's own NTP client every 2048 s, so during an upstream outage
+    they would cut one long gap into ~600 34-minute pieces.
     """
     rows = con.execute(f"""
         WITH m AS (
             SELECT DISTINCT date_trunc('minute', ts) AS minute
             FROM packets WHERE {where}
+              AND NOT (proto = 17 AND src_port IS NOT DISTINCT FROM 123)
         ), seq AS (
             SELECT minute,
                    lead(minute) OVER (ORDER BY minute) AS next_minute

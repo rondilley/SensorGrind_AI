@@ -1,51 +1,95 @@
 # SensorGrind_AI
 
-A self-evolving honeypot-log analysis pipeline. Consolidates rotated raw
-syslog (with clock-skew correction), parses into Parquet, runs ~36 analyzer
-stages over them (ML threat classifier, HDBSCAN actor clustering, FP-Growth
-pattern mining, Leiden community detection, change-point detection, drift
-detection, **cross-analyzer correlator + LLM-written conclusions**,
-multi-AI review, plus 20+ purpose-built analyzers), and emits a
-comprehensive defender-facing threat intelligence report in
-markdown / HTML / PDF.
+SensorGrind_AI is a pipeline for the analysis of honeypot logs. It changes
+itself and becomes better from run to run. The pipeline does these steps:
 
-## What it sees
+1. It puts the raw syslog files into one file and corrects the clock skew.
+2. It parses the log into Parquet tables. This is the `parse` step, the
+   first step of the DAG.
+3. It runs 46 analysis steps on the tables. These include:
+   - An ML threat classifier
+   - HDBSCAN actor clusters
+   - FP-Growth pattern mining
+   - Leiden community detection
+   - Change-point detection and drift detection
+   - **A cross-analyzer correlator, with a narrative from an LLM for each result**
+   - A review by many AI providers
+   - More than 20 analyzers that the project made for this data
+4. It writes a full threat intelligence report for defenders, in markdown,
+   HTML and PDF.
 
-This is a working pipeline against a real corpus, not a synthetic demo. As
-of the latest run (2026-05-31 snapshot, post-clock-skew-correction +
-post-tier-1-perf-pass):
+## What the pipeline sees
 
-| metric | value |
+The pipeline runs on a recorded corpus, not on synthetic data. These are the
+values from the last full run (snapshot of 2026-10-25). The input was the
+`honeypi_logs.py` output `honeypi_sensor.log` (472 GB).
+
+| Metric | Value |
 | --- | --- |
-| total packets (post-dedup) | 1,108,150,395 |
-| unique source IPs | 996,354 |
-| distinct payload blobs (SHA-256) | 97,000,357 |
-| L7-classified events | 32,520,828 |
-| IOCs extracted | 22,687,221 |
-| active days in corpus | 662 |
-| corpus span | 2024-02-08 to 2026-05-29 (with sensor outage 2025-11-12 -> 2026-01-28) |
-| critical-tier threats identified | 16,210 |
-| high-tier threats identified | 179,989 |
-| actor communities (Leiden) | 2,153 (>= 4 members) |
-| auto-promoted behavioral rules (this run) | 20 |
-| cross-signal findings (correlator + LLM) | 19 (7 critical, 6 high, 6 medium) |
-| campaigns identified (>=10 IPs, burst < 60% of corpus) | 1,867 |
-| end-to-end wall time (consolidator + parser + evolve) | 6h 35m |
+| Total packets (after the removal of duplicates) | 1,232,067,956 |
+| Different source IP addresses | 1,259,496 |
+| Different payload blobs (SHA-256) | 106,414,804 |
+| Events with an L7 protocol class | 34,777,746 |
+| IOCs found | 28,092,187 |
+| Days with traffic in the corpus | 899 |
+| Corpus range (UTC days) | 2023-07-07 to 2026-06-30 (8 sensor outages, refer to the table below) |
+| Threats in the `critical` tier | 8,321 |
+| Threats in the `high` tier | 164,308 |
+| Actor communities (Leiden, 4 or more members) | 16 of 80 groups in the graph of the top 10,000 threat IPs |
+| Behavior rules that the pipeline promoted (this run) | 20 |
+| Cross-signal findings (correlator and LLM) | 86 (7 critical, 52 high, 27 medium) |
+| Campaigns (10 or more IP addresses, burst of less than 60% of the corpus) | 1,853 of 2,000 payload waves |
+| Full time (parser and evolve) | 8 h 9 min: parser 2 h 13 min, evolve steps 5 h 56 min |
 
-The 2019-02-14 → 2025-09-18 history seen in earlier runs was an artifact
-of honeypi00's broken hardware clock - the sensor's RTC was repeatedly
-resetting to Feb 14, 2019.  The 2026-05-29 consolidator detects that skew
-via FortiGate / newsyslog anchors in the same syslog stream and rewrites
-each sensor event's timestamp to the real wallclock time at which it
-arrived at the log server.  See `output/reports/clock_skew/clock_skew.md`
-for the per-file skew dossier.
+The full time does not include `honeypi_logs.py`. The evolve time is the sum
+of the step times of two runs, because the memory limit stopped the first
+run in `mining`.
 
-Top findings in the latest run: 1,809 distinct payload campaigns peaking
-simultaneously on **2026-05-19** (coordinated multi-vector botnet push);
-**SIGTRAN / SS7 / SIP probing** of telco signaling planes from
-CN-clustered infrastructure (16 sources, 2019-02-14 through 2025-08-15);
-RDP credential spray reusing the `hello` mstshash cookie across 1,476
-distinct IPs over six years.
+The actor-community value is not comparable with the value of the run of
+2026-05-31 (2,153). At this time, the `actorlink` graph has only the top
+10,000 threat IPs.
+
+Sensor outages (each run of UTC days with no packets):
+
+| First day | Last day | Days |
+| --- | --- | ---: |
+| 2024-05-11 | 2024-05-20 | 10 |
+| 2025-02-24 | 2025-02-24 | 1 |
+| 2025-07-03 | 2025-07-03 | 1 |
+| 2025-08-20 | 2025-09-22 | 34 |
+| 2025-11-12 | 2026-02-04 | 85 |
+| 2026-03-03 | 2026-04-06 | 35 |
+| 2026-04-08 | 2026-04-26 | 19 |
+| 2026-05-03 | 2026-05-08 | 6 |
+
+The total is 191 days. The merged log of 2026-05-29 has packets from
+2024-05-11 to 2024-05-20, but `honeypi_sensor.log` has none. The cause of
+this difference is not known.
+
+Earlier runs showed a history from 2019-02-14 to 2025-09-18. This history
+was not correct. The hardware clock of honeypi00 had a defect, and its RTC
+went back to 2019-02-14 many times. The consolidator of 2026-05-29 finds
+this skew from the FortiGate and newsyslog anchors in the same syslog
+stream. Then it writes the wall-clock time at which each sensor line got to
+the log server. Refer to `output/reports/clock_skew/clock_skew.md` for the
+skew dossier of each file.
+
+The most important findings of the last run are:
+
+- 1,789 different payload campaigns had their peak on the same day,
+  **2026-05-19**. This was a coordinated botnet push with many vectors.
+- **SIGTRAN, SS7 and SIP probes** of telco signaling planes came from 23
+  sources (in CN, SC, TH, HK, US and AE), from 2023-08-22 to 2026-06-29.
+  32 sources sent SCTP packets.
+- An RDP credential spray used the same `hello` mstshash cookie from 1,820
+  different IP addresses on 860 days, from 2023-07-06 to 2026-06-29.
+- The 7 findings with the severity `critical` are:
+  - 25 `critical`-tier botnet sources with a long persistence.
+  - 5 synchronized pushes: 1,789 payloads on 2026-05-19, 18 on 2025-07-04,
+    9 on 2025-07-06, 8 on 2026-04-29 and 6 on 2025-09-28.
+  - The telco SS7, Diameter and SIGTRAN reconnaissance footprint.
+
+The finding dates are in the local time of the sensor (PDT or PST).
 
 ## Quickstart
 
@@ -59,13 +103,15 @@ distinct IPs over six years.
 #    merged.log.gz and the manifest, plus
 #    output/reports/clock_skew/clock_skew.{md,parquet}.
 #    Takes ~6h on the current corpus; safe to leave running unattended.
+#    honeypi_logs.py output (honeypi_sensor.log) is an equivalent input.
 venv/bin/python scripts/consolidate_logs.py
-mv ~/temp/sensor_logs/consolidated/merged.log.gz data/merged.log.gz
 
-# 1. Parse the merged honeypot log (one-time, ~95 min on 1.1B events)
-venv/bin/python src/parser.py
+# 1. Parse the log and run the full evolve pipeline (DAG-ordered,
+#    skip-if-fresh by default).  --input is a gzip file, a plain ASCII
+#    file, or a folder.  The parse takes ~75-95 min on 1.1-1.2B events.
+venv/bin/python src/evolve.py --input ~/temp/sensor_logs/consolidated/merged.log.gz
 
-# 2. Run the full evolve pipeline (DAG-ordered, skip-if-fresh by default)
+# 2. Run the pipeline again on the parsed tables (no --input: no parse)
 venv/bin/python src/evolve.py
 
 # 3. Read the report
@@ -74,32 +120,77 @@ output/reports/COMPREHENSIVE.html   # browser, live Mermaid via CDN
 output/reports/COMPREHENSIVE.pdf    # mermaid pre-rendered to SVG
 ```
 
-Re-run a specific stage:
+### Input of the parse step
+
+The `--input` argument of `evolve.py` gives the raw sensor log to two
+steps: `parse` and `nonipproto`. The input can be one of these types:
+
+- **A gzip file.** The tool finds the gzip format from the first two bytes
+  of the file, not from the file name.
+- **An ASCII file.** An example is `honeypi_sensor.log` from
+  `honeypi_logs.py`.
+- **A folder.** The tool reads each gzip file and each ASCII file in the
+  folder. It does not read the subfolders.
+
+Each line is a raw syslog line with a `PacketTime:` field. The lines of
+`merged.log.gz` start with an ISO time and a tab. The tool removes this
+prefix.
+
+For a folder, the lines of each file must be in time sequence. The tool
+merges the files in the sequence of their `PacketTime` values. It ignores binary files and files
+with no sensor lines, and it writes a note for each one. It does not
+remove duplicate lines that occur in more than one file.
+
+Without `--input`, the orchestrator does not start `parse` or
+`nonipproto`. The other steps use the Parquet tables that are on the disk.
+
+You can also start the two tools directly:
+
+```bash
+venv/bin/python src/parser.py INPUT [--output DIR]
+venv/bin/python src/nonipproto.py INPUT
+```
+
+The parser does not write into a Parquet root that has data in it. A
+parse that starts on a full root does these steps:
+
+1. It writes the new tables to `output/parquet.partial`.
+2. When the parse completes, it moves the root of the last parse to
+   `output/parquet.prev`. It deletes the `parquet.prev` of the run before.
+3. It moves `parquet.partial` to `output/parquet`.
+
+If the parse stops before the end, `output/parquet` does not change. The
+parser gives the exit code 1, and the orchestrator does not start the
+steps after it. The next parse deletes the remaining `parquet.partial`.
+
+To run some steps again:
 
 ```bash
 venv/bin/python src/evolve.py mining promote report
 ```
 
-Parallel execution (DAG-aware):
+To run steps in parallel (the orchestrator obeys the DAG):
 
 ```bash
 venv/bin/python src/evolve.py --parallel 4
 ```
 
-See the dependency graph:
+To show the dependency graph:
 
 ```bash
 venv/bin/python src/evolve.py --show-dag
 ```
 
-Force a stage to rerun even if its inputs are unchanged:
+To run a step again when its inputs did not change:
 
 ```bash
 venv/bin/python src/evolve.py --force mining
 ```
 
-Score the baseline detectors against injected archetypes (operator-run,
-not part of the DAG; the corpus on disk is never modified):
+To get the scores of the baseline detectors on injected archetypes:
+
+- The operator runs these commands. They are not part of the DAG.
+- The commands do not change the corpus on disk.
 
 ```bash
 venv/bin/python src/sensormask.py                       # sensor-off mask
@@ -110,9 +201,10 @@ venv/bin/python src/bench/baselines.py --eval phase0
 
 ## AI provider setup (optional)
 
-Several stages (`originintel`, `aipayloaddecode`, `aireview`) call hosted
-LLMs. Drop any of these key files in the repo root and the matching stage
-will pick the first one that has both a valid key and an installed SDK:
+Some steps (`originintel`, `aipayloaddecode`, `aireview`) send prompts to
+hosted LLMs. Put one or more of these key files in the root of the
+repository. Each of these steps uses the first provider that has a key that
+works and an installed SDK.
 
 ```
 claude.key.txt    # Anthropic
@@ -122,18 +214,20 @@ mistral.key.txt   # Mistral
 gemini.key.txt    # Google
 ```
 
-If no provider is available, the AI-driven stages skip gracefully -- the
-rest of the pipeline does not depend on them.
+If no provider is available, the AI steps do not run, and they do not stop
+the pipeline. The other steps do not use them.
 
 ## Layout
 
 ```
 src/                                  # all working code lives here
   parser.py                           # raw log to 4 Parquet tables
+                                      #   (the `parse` step)
   evolve.py                           # DAG orchestrator + skip-if-fresh
   sgquery.py                          # meta-runner over base analyzers
   sg/                                 # shared library
     lib.py                            #   DuckDB factory, GeoIP, IOC enums
+    sensorlog.py                      #   raw-log reader: gzip, ASCII, folder
     features.py                       #   feature snapshot registry
     models.py                         #   model registry (file-locked)
   25+ analyzer modules at src/*.py    # see ARCHITECTURE.md for the full list
@@ -178,6 +272,9 @@ src/                                  # all working code lives here
   adversarysim.py                     # synthetic adversary coverage harness
                                       #   (--inject: full-schema eval overlay)
   sensormask.py                       # sensor-off gaps + clock-run boundaries
+  neuro.py                            # LIF/ALIF scores per source (Phase 4)
+  sg/lif.py, sg/stdp.py               # LIF/ALIF bank, Hawkes twin, WTA-STDP
+  bench/lif_eval.py, bench/stdp_eval.py  # Phase 3 / Phase 5 gate harnesses
   bench/baselines.py                  # baseline detectors vs injected
                                       #   archetypes (recall@k, chance)
 scripts/                              # source-data preprocessing (NOT analyzers)
@@ -185,7 +282,8 @@ scripts/                              # source-data preprocessing (NOT analyzers
                                       #   per-file clock-skew correction
                                       #   against FortiGate / newsyslog anchors
 data/                                 # SOURCE data only -- do not write here
-  merged.log.gz                       # honeypot log
+  merged.log.gz                       # honeypot log (optional: --input
+                                      #   can point at any path)
 output/                               # ALL pipeline output goes here
   parquet/                            # parser output (4 tables, daily-partitioned)
   features/                           # per-IP feature snapshots
@@ -201,130 +299,164 @@ VIBE_HISTORY.md                       # session log
 .evolve/freshness.json                # skip-if-fresh cache
 ```
 
-The `scripts/` folder holds raw-input preprocessors only -- analyzer code
-lives in `src/`.  `scripts/consolidate_logs.py` is the pipeline's
-front-door: rotated honeypi00 syslog `.gz` files in, single sorted
-clock-skew-corrected `merged.log.gz` out, plus a clock-skew dossier
-under `output/reports/clock_skew/`.  The `data/` folder is for source
-input -- all output goes to `output/`.
+The `scripts/` directory has only the tools that prepare the raw input. The
+analyzer code is in `src/`. `scripts/consolidate_logs.py` is the first step
+of the pipeline:
 
-## Pipeline at a glance
+- Input: the rotated honeypi00 syslog `.gz` files.
+- Output: one sorted `merged.log.gz` file with the clock skew corrected.
+  Give this file to `evolve.py --input`.
+- It also writes a clock-skew dossier in `output/reports/clock_skew/`.
 
-35 stages, DAG-scheduled. The orchestrator (`evolve.py`) computes a
-dependency graph from explicit edges plus glob-overlap inference between
-each stage's declared inputs and outputs.
+The `data/` directory is for the source input. All the outputs go to
+`output/`.
 
-Top of the graph (text-only, no box-drawing characters):
+## Pipeline summary
 
-- analyzers (no parent)
-- sensormask (no parent; reads packets + clock_runs)
-- features  parent: analyzers
-- model     parent: features
-- score     parents: features, model
-- risk      parent:  score
-- dossiers  parent:  risk
-- mining    parent:  features
-- promote   parent:  mining
-- actors    parent:  features
-- drift     parent:  features
-- chains, sequences, coordination, rotation, cross_modal, survival,
-  pktanalysis, payloadanalysis, pacing, landscape, protocolanomaly,
-  isc_compare, longitudinal, slowlow, dnstlsintel, selfmimic  parent: analyzers
-- nonipproto, asnintel, cidrintel, tooling                    parent: analyzers
-- aipayloaddecode                                             parent: nonipproto
-- actorlink                                                   parents: analyzers, tooling, risk
-- originintel                                                 parent:  actorlink
-- correlate        parents: risk, nonipproto, protocolanomaly, asnintel,
-                            cidrintel, tooling, slowlow, selfmimic,
-                            isc_compare, coordination, chains
-- conclude         parent:  correlate (LLM-narrated findings)
-- report           parents: everything upstream (25+ stages incl. conclude)
-- adversarysim     parents: slowlow, dnstlsintel, selfmimic, risk, report
-- aireview         parent:  report
+The pipeline has 48 steps in a DAG. The orchestrator (`evolve.py`) makes a
+dependency graph from two sources:
 
-Note: `asnintel`, `chains`, `cidrintel`, `actorlink`, and `promote` all
-depend on both `features` AND `risk` (they read per-IP feature vectors
-joined against the risk-tier table).  Earlier versions of the DAG
-declared only `analyzers` as their parent; this was fixed
-2026-05-29 after stages failed with `no risk file` on a cold pipeline.
+- The explicit edges.
+- The edges that it finds where the input globs of a step are the same as
+  the output globs of a different step.
 
-The full edge list is in `python src/evolve.py --show-dag`. Stages with a
-registered I/O contract participate in the skip-if-fresh cache; the rest
-always run.
+The top of the graph (text only, with no box-drawing characters):
 
-## Methodology notes
+| Step | Parent steps |
+| --- | --- |
+| `parse` | None (it starts only with `--input`) |
+| `analyzers` | `parse` |
+| `sensormask` | `parse` (it reads `packets` and `clock_runs`) |
+| `neuro` | `analyzers`, `cluster`, `chainfp`, `sensormask` |
+| `features` | `analyzers`, `cluster`, `neuro` |
+| `model` | `features` |
+| `score` | `features`, `model` |
+| `risk` | `score` |
+| `dossiers` | `risk` |
+| `mining` | `features` |
+| `promote` | `mining` |
+| `actors` | `features` |
+| `drift` | `features` |
+| `chains`, `sequences`, `coordination`, `rotation`, `cross_modal`, `survival`, `pktanalysis`, `payloadanalysis`, `pacing`, `landscape`, `protocolanomaly`, `isc_compare`, `longitudinal`, `slowlow`, `dnstlsintel`, `selfmimic` | `analyzers` |
+| `nonipproto`, `asnintel`, `cidrintel`, `tooling` | `analyzers` |
+| `aipayloaddecode` | `nonipproto` |
+| `actorlink` | `analyzers`, `tooling`, `risk` |
+| `originintel` | `actorlink` |
+| `correlate` | `risk`, `nonipproto`, `protocolanomaly`, `asnintel`, `cidrintel`, `tooling`, `slowlow`, `selfmimic`, `isc_compare`, `coordination`, `chains` |
+| `conclude` | `correlate` (findings with an LLM narrative) |
+| `report` | All the steps before it (25 or more, with `conclude`) |
+| `adversarysim` | `slowlow`, `dnstlsintel`, `selfmimic`, `risk`, `report` |
+| `aireview` | `report` |
 
-The pipeline went through a multi-AI review pass (Claude, OpenAI, xAI,
-Mistral, Gemini) and applied every recommendation that hit >= 2-of-5
-consensus. The substantive ones:
+Note: `asnintel`, `chains`, `cidrintel`, `actorlink` and `promote` use
+`features` and `risk`. They read the feature vector of each IP address with
+a join to the risk-tier table. Earlier versions of the DAG had only
+`analyzers` as their parent. On 2026-05-29 these steps stopped with the
+error `no risk file` on a pipeline with no outputs, and the DAG got the
+correction.
 
-- **Drift**: KS-test (no FDR) replaced with Wasserstein-1 + PSI +
-  Benjamini-Hochberg FDR.
-- **Actor clustering**: HDBSCAN now reports per-cluster `cluster_persistence_`
-  and a global DBCV score; unstable clusters are flagged rather than dropped.
-- **Pattern mining**: FP-Growth itemsets now gated on lift >= 2 + conviction
-  >= 1.5 (per-item, not via `association_rules` -- that OOM'd at 1M itemsets).
-- **Pattern promotion**: Wilson lower confidence bound on purity instead of
-  point-estimate, so small-support patterns do not get promoted on luck.
-- **Change-points**: PELT now uses length-and-variance-adaptive mBIC penalty
-  instead of a fixed scalar.
-- **Community detection**: Louvain replaced with Leiden (Traag et al. 2019).
-- **Cross-modal lag**: STL detrending (weekly + trend) before correlation
-  to remove spurious weekly "causal" lags.
-- **Threat classifier**: temporal `first_seen` split instead of random;
-  Brier calibration + unlabeled-positive-rate reported alongside AUC/AP;
-  SHAP attribution persisted next to the model.
-- **Originintel**: prompt rewritten for graded confidence with explicit
-  `alternative_classes` + `uncertainty_notes`; default to `low` confidence
-  unless evidence overwhelms.
-- **Sensor model registry**: cross-process `filelock` around `registry.json`
-  read-modify-write to stop concurrent training stages losing each other's
-  entries.
-- **BOGON filter**: rewrite using `ipaddress` module -- proper CIDR
-  containment for CGNAT (100.64/10), full IPv6 (`::`, `::1`, fc00::/7,
-  fe80::/10, ff00::/8, 2001:db8::/32). The previous string-prefix check was
-  rejecting `1.1.1.10` as bogon.
-- **New analyzers**: `slowlow` (low-and-slow scanners), `dnstlsintel`
-  (DGA / brand-mimic), `selfmimic` (sensor banner echo), `adversarysim`
-  (synthetic coverage harness).
-- **Clock-skew correction** (2026-05-29): the honeypi00 sensor's hardware
-  clock failed intermittently from 2025-09-23 onward, repeatedly
-  resetting to its 2019-02-14 epoch on every reboot.  The consolidator
-  now anchors against FortiGate `date=time=tz=` and newsyslog ISO-UTC
-  prefix lines in the same syslog stream, detects per-run skew, and
-  rewrites both the leading ISO column AND the body `PacketTime:` field
-  so downstream tools (parser, ad-hoc grep) see consistent timestamps.
-  Per-file skew stats land in `output/reports/clock_skew/`.
-- **Cross-signal findings + LLM-written conclusions** (2026-05-29):
-  `src/conclusions/correlate.py` runs 18 hand-coded cross-analyzer
-  rules over every per-analyzer parquet + the risk snapshot, producing
-  a `findings.parquet`.  `src/conclusions/synthesize.py` then asks the
-  configured LLM to write what / why-noteworthy / threat-model / risk /
-  recommended-action for each finding (cached by prompt sha256).  The
-  rules cover the telco SS7/SIGTRAN signature, synchronized campaign
-  bursts, recent tight campaigns, bulletproof ASN density, RDP
-  credential spray, IPsec ESP probing, covert tunneling, and more.
-  Report section 0.5 surfaces every finding above the executive
-  summary so a defender does not have to dig.
-- **Campaign-onset detection** (2026-05-30): `detect_coordination.py`
-  now computes per-payload first-arrival percentiles (p5 launch, p25,
-  p50, p75, p95 decay) and the single busiest day (peak), ranking by
-  density_score = `ip_count * corpus_span_days / burst_window_days`.
-  Always-on background payloads (whose senders span the whole corpus)
-  are filtered out via a 60%-of-corpus cutoff.  Report section 6
-  shows per-month launch histograms, a top-20 SVG Gantt with month-year
-  axis labels and gray dashed gridlines, and a top-50 table.
+Each step with no other parent step has `parse` as its parent. Thus a new
+parse completes before the analysis starts. Without `--input`, the
+orchestrator does not start `parse`, and the other steps start.
 
-See `docs/ARCHITECTURE.md` for the full data + model contracts and
-`VIBE_HISTORY.md` for how the pipeline got here.
+`python src/evolve.py --show-dag` gives the full list of edges. The steps
+with an I/O contract use the skip-if-fresh cache. The other steps run at
+all times. For `parse`, the cache also compares the mtime of the
+`--input` files with the Parquet tables. Thus, if the input and the
+parser code did not change, the step does not parse again.
 
-## Neuromorphic detection plan (v3.3, Phase 0 built)
+## Method notes
+
+Many AI providers (Claude, OpenAI, xAI, Mistral, Gemini) did a review of the
+pipeline. The project applied each recommendation that 2 or more of the 5
+providers gave. The important changes are:
+
+- **Drift**: Wasserstein-1, PSI and Benjamini-Hochberg FDR replaced the
+  KS test (that had no FDR).
+- **Actor clusters**: HDBSCAN gives the `cluster_persistence_` of each
+  cluster and a global DBCV score. The code flags the clusters that are not
+  stable, and it does not remove them.
+- **Pattern mining**: an FP-Growth itemset must have a lift of 2 or more
+  and a conviction of 1.5 or more. The code calculates these values for
+  each item. It does not use `association_rules`, because that function
+  had an OOM at 1 million itemsets.
+- **Pattern promotion**: the code uses the Wilson lower confidence bound
+  on purity, not a point estimate. Thus a pattern with small support does
+  not get promotion by chance.
+- **Change points**: PELT uses an mBIC penalty that changes with the length
+  and the variance. It does not use a fixed value.
+- **Community detection**: Leiden (Traag and others, 2019) replaced
+  Louvain.
+- **Cross-modal lag**: STL removes the weekly pattern and the trend before
+  the correlation. This removes weekly lags that look causal but are not.
+- **Threat classifier**:
+  - The train and validation sets come from the `first_seen` time, not
+    from a random selection.
+  - The model gives the Brier calibration and the unlabeled positive rate
+    with the AUC and AP.
+  - The registry keeps the SHAP attribution with the model.
+- **Originintel**: a new prompt asks for graded confidence, with explicit
+  `alternative_classes` and `uncertainty_notes`. The default confidence is
+  `low`, unless the evidence is very strong.
+- **Model registry**: a cross-process `filelock` on `registry.json` covers
+  each read, change and write. Thus two training steps that run at the same
+  time cannot replace the entries of the other step.
+- **BOGON filter**: the new code uses the `ipaddress` module.
+  - It does correct CIDR tests for CGNAT (100.64/10) and for all of IPv6
+    (`::`, `::1`, fc00::/7, fe80::/10, ff00::/8, 2001:db8::/32).
+  - The previous test used string prefixes, and it flagged `1.1.1.10` as a
+    bogon in error.
+- **New analyzers**: `slowlow` (slow scanners that send a small number of
+  packets), `dnstlsintel` (DGA and brand names), `selfmimic` (traffic that
+  sends back the sensor banners), `adversarysim` (a synthetic coverage
+  harness).
+- **Clock-skew correction** (2026-05-29):
+  - From 2025-09-23, the hardware clock of the honeypi00 sensor sometimes
+    did not work. At each reboot, it went back to its 2019-02-14 epoch.
+  - The consolidator uses the FortiGate `date=time=tz=` lines and the
+    newsyslog ISO-UTC prefix lines in the same syslog stream as anchors.
+    It finds the skew of each run.
+  - It writes the corrected time into the first ISO column and into the
+    `PacketTime:` field. Thus all the tools after it (the parser, grep)
+    see the same timestamps.
+  - The skew values for each file are in `output/reports/clock_skew/`.
+- **Cross-signal findings, with a narrative from an LLM** (2026-05-29):
+  - `src/conclusions/correlate.py` applies 18 cross-analyzer rules to all
+    the analyzer parquet files and the risk snapshot. It writes
+    `findings.parquet`.
+  - Then `src/conclusions/synthesize.py` sends a prompt to the configured LLM. The LLM writes
+    these fields for each finding: what, why it is important, threat model,
+    risk, and the recommended action. The cache key is the sha256 of the
+    prompt.
+  - The rules include these patterns, and more:
+    - The telco SS7 and SIGTRAN signature
+    - Synchronized campaign bursts and recent short campaigns
+    - The density of bulletproof ASNs
+    - RDP credential spray, IPsec ESP probes and covert tunnels
+  - Section 0.5 of the report shows each finding before the executive
+    summary. Thus a defender can find them quickly.
+- **Campaign start detection** (2026-05-30):
+  - `detect_coordination.py` calculates the first-arrival percentiles of
+    each payload (p5 start, p25, p50, p75, p95 end) and the day with the
+    most traffic (the peak).
+  - It sorts the campaigns by
+    density_score = `ip_count * corpus_span_days / burst_window_days`.
+  - The code removes the background payloads that occur at all times. These
+    are the payloads with senders across more than 60% of the corpus.
+  - Section 6 of the report shows a start histogram for each month, a
+    top-20 SVG Gantt chart and a top-50 table. The chart has month-year
+    labels on the axis and gray dashed grid lines.
+
+Refer to `docs/ARCHITECTURE.md` for the full data and model contracts.
+Refer to `VIBE_HISTORY.md` for the history of the pipeline.
+
+## Neuromorphic detection plan (v3.4, all phases built and tested)
 
 The research report `reports/Neuromorphic anomaly detection for honeypi.md`
 examined SNN, HDC, reservoir, and HTM methods for the honeypi data. No
 published result shows that these methods find network anomalies better than
-isolation forest or ECOD. Thus the plan uses them for three new signals, not
-for a better accuracy number:
+`isolation forest` or ECOD. Thus the plan uses them for three new signals,
+not for better detection numbers:
 
 1. Graded similarity between session chains (HDC on `chainfp` tokens).
 2. An adaptive baseline for the global arrival series (ESN or NG-RC with the
@@ -335,8 +467,9 @@ Phase 0 gives the data and the yardstick that each subsequent phase must
 have:
 
 - `sensormask` (DAG stage) writes the sensor-off intervals. A `gap` interval
-  is 30 or more minutes with no packets. The 2025-11-12 to 2026-01-28 outage
-  is one `gap` interval. A `run_boundary` interval is 5 s before and after a
+  is 30 or more minutes with no packets. NTP replies (UDP from port 123) to
+  the sensor do not count as packets for this test. The 2025-11-11 to
+  2026-02-05 outage is one `gap` interval. A `run_boundary` interval is 5 s before and after a
   clock-run start.
 - `scripts/consolidate_logs.py` writes
   `output/reports/clock_skew/clock_runs.parquet`. Run the consolidator again
@@ -348,100 +481,153 @@ have:
   IForest, and ECOD detectors on those archetypes. It gives recall@k with the
   chance level, and no point adjustment.
 
-Phases 1 to 5 (HDC choreography novelty, global arrival detector, timing for
-each source, feature and risk inputs, optional research) did not start. Each
-phase has an exit gate. A new detector must be better than the baselines and
-than an untrained copy of itself on the same injection set.
+Each phase has an exit gate. A new detector must be better than the
+baselines and than an untrained copy of itself on the same injection set.
+
+All phases ran on all the data on 2026-10-24: 899 days with packets, from
+2023-07-07 to 2026-06-30. No neuromorphic detector was better than its
+classical twin. `docs/ARCHITECTURE.md` §9.5 to §9.9 give the full results.
+Round 2 (§9.10) found three detectors that are better than their matched
+classical twins on the test sets and on the development sets: `lif` on
+`beacon_gap`, and `hdc_proto` and `hdc_drift` on `rotating_actor`.
+
+| Phase | Code | Gate result |
+| --- | --- | --- |
+| 1. HDC choreography novelty | `sg/hdc.py`, `bench/hdc_eval.py` | Round 1: failure. `hdc_align` found 22 of 70 `chain_mutation` sources, and its RFF twin found 24. Round 2 (2026-10-27): `hdc_proto` and `hdc_drift` get `pass` against their matched RFF twins on `rotating_actor`, on the test sets and on the development sets (recall at k = 100: 0.35 and 0.31 against 0.09 and 0.01 on the test sets). |
+| 2. Global arrival detector | `bench/arrival_series.py`, `bench/arrival_eval.py` | Failure. `ngrc_htm` gave 97.6 incorrect alarms each year, and `stl_z` gave 10.3. |
+| 3. LIF/ALIF timing for each source | `sg/lif.py`, `bench/lif_eval.py` | Failure by 0.01. On 43 days, `lif` found 0.82 of 430 beacons in the top 10, `pacing` 0.04. But `pacing` with the same calibration found 0.86. |
+| 4. Feature and risk inputs | `neuro.py` (DAG step), 8 `neuro_*` feature columns, `neuro_signal` risk term (8 points or less) | Built and run on all data. The arrival term gave an alarm minute to all sources in that minute, so its cap is 0 (operator decision of 2026-10-25). The HDC term (`hdc_proto`, `hdc_drift`, cap 4 points) uses the LIF flag level of 4 (operator decision of 2026-10-27). Few sources get HDC points, because only a very small number of calibrated HDC scores are 4 or more. The gate uses the escalation labels of `docs/NEUROMORPHIC_ROUND2_PLAN.md` §3.4. |
+| 5. WTA-STDP port prototypes | `sg/stdp.py`, `bench/stdp_eval.py` | Failure. No recall on `chain_mutation`. No Akida hardware for the Pi 5 part. |
+
+To run the tests again:
+
+```bash
+./venv/bin/python src/bench/arrival_series.py
+OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 NUMBA_NUM_THREADS=4 \
+    ./venv/bin/python src/bench/arrival_eval.py --mode full
+./venv/bin/python src/adversarysim.py --inject p3t_20240606 --day 2024-06-06 \
+    --replay-copies 10 --beacon-copies 10
+./venv/bin/python src/bench/baselines.py --eval p3t_20240606
+./venv/bin/python src/bench/lif_eval.py --eval p3t_20240606
+./venv/bin/python src/bench/stdp_eval.py --eval p3t_20240606
+./venv/bin/python src/bench/lif_eval.py --summary p3t_20240606 [more sets]
+```
+
+Use 4 threads for each numeric library. With 24 threads on a loaded host,
+`arrival_eval.py` was 9 times slower.
+
+`docs/NEUROMORPHIC_COMPANIONS.md` examines the companion methods (Hawkes,
+SPOT, MIDAS, BOCPD, sketches and others).
 
 The first test used a slice of 25 days (2024-01-13 to 2024-05-10). All
 baselines missed `lockstep_24` at k = 100 or less, and `port_hour_z` found
 nothing. Phases 1 to 3 must find this archetype.
 
 See `docs/ARCHITECTURE.md` section 9 for the phase table, the data
-contracts, and the rules for each detector that keeps state.
+contracts, and the rules for each stateful detector.
 
-## Performance pass (2026-05-30)
+## Performance changes (2026-05-30)
 
-A read-only review (perf / security / AI-slop dimensions) yielded the
-Tier 1 fixes below.  Measured end-to-end speedup: **9h 53m -> 6h 35m**
-on the 1.1 B-event corpus (~33% saved, dominated by the consolidator
-swap).
+A read-only inspection (performance, security and AI-slop) gave the tier 1
+corrections that follow. The full run time decreased from **9 h 53 min to
+6 h 35 min** on the corpus of 1.1 billion events. This is approximately 33%
+less time. Most of the decrease came from the consolidator change.
 
-- **`*.key.txt` in `.gitignore`** -- the five LLM API key files at the
-  repo root are now ignored by pattern; `git add -A` will no longer
-  stage them.
-- **`scripts/consolidate_logs.py`: gzip -> zstd** for the per-file
-  intermediates and the GNU-sort spill compressor.  Final `merged.log.gz`
-  stays gzip for downstream compatibility.  Measured: consolidator wall
-  time dropped from 6h 16m to 2h 36m (~2.4x; the merge-spill phase
-  alone went from 5h 50m to 2h 10m).
-- **`src/parser.py`**: bounded the base64 `Packetdata:` capture to
-  `{1,131072}` chars so a giant blob can't exhaust a worker process via
-  `base64.b64decode`; lifted the `--workers` default from `min(6,
-  cpu-2)` to `max(2, cpu-2)` now that the old writer-OOM has been
-  fixed; fused the per-line `KEY:VALUE` regex storm in
-  `parse_text_fields` (11 separate `.search()` calls -> one
-  `finditer` with `lastgroup` dispatch).  Wall-clock unchanged because
-  the parser turns out to be writer-bound (pyarrow flush ~200k/s), but
-  per-worker CPU is roughly halved -- useful future-proofing if the
-  writer gets faster.
-- **`src/longitudinal/detect_coordination.py`**: replaced 3-4 full
-  scans of the 1.1B-row `packets` view with a single `CREATE TEMP TABLE
-  first_per_payload_ip` staging pass, then derives candidate shas,
-  percentiles, peak day, and ip-counts from it.  Arrival-burst pass
-  still scans `packets` separately (it needs payload-less SYN scans).
-- **`src/asnintel.py`**: materializes `(src_ip, asn)` once into
-  `CREATE TEMP TABLE asn_ip` so the four downstream queries (top
-  ports, top families, top probes, cooperation score) join against a
-  small in-memory table instead of `packets x feature-parquet` four
-  separate times.  (DuckDB's planner was already smart enough that the
-  wall-clock didn't move; kept as defense-in-depth.)
-- **`src/sg/lib.py:load_report()` helper**: collapses the
-  `path / if exists / con.execute(SELECT FROM read_parquet) / fetchall`
-  pattern repeated ~40 times in `comprehensive_report.py` into one
-  call.  A representative subset of call sites are migrated; the rest
-  can follow incrementally.
-- **`src/conclusions/correlate.py` cleanup**: inlined the single-call
-  `_table` wrapper, switched `TELCO_TCP_PORTS` from dict-with-unused-
-  descriptions to `frozenset`, and promoted 12 magic thresholds
-  (`> 0.5`, `>= 50`, `< 7 days`, ...) to named module constants.
+- **`*.key.txt` in `.gitignore`**: git ignores the five LLM API key
+  files in the root of the repository. Thus `git add -A` does not add them.
+- **`scripts/consolidate_logs.py`: gzip to zstd** for the temporary
+  files of each input file and for the compression of the GNU sort spill.
+  - The output `merged.log.gz` stays in gzip format, for the tools after it.
+  - The consolidator time decreased from 6 h 16 min to 2 h 36 min
+    (approximately 2.4 times faster).
+  - The merge-spill part alone decreased from 5 h 50 min to 2 h 10 min.
+- **`src/parser.py`**:
+  - The base64 `Packetdata:` capture has a maximum of `{1,131072}`
+    characters. Thus a very large blob cannot use all the memory of a
+    worker process in `base64.b64decode`.
+  - The `--workers` default changed from `min(6, cpu-2)` to
+    `max(2, cpu-2)`, because the writer OOM had a correction before.
+  - In `parse_text_fields`, one `finditer` with `lastgroup` dispatch
+    replaced 11 different `.search()` calls for each line.
+  - The total time did not change, because the writer controls the speed
+    (pyarrow writes approximately 200k rows each second). But each worker
+    uses approximately half of the CPU time that it used before. This helps
+    if the writer becomes faster in the future.
+- **`src/longitudinal/detect_coordination.py`**:
+  - One `CREATE TEMP TABLE first_per_payload_ip` pass replaced 3 or 4 full
+    scans of the `packets` view (1.1 billion rows).
+  - The code gets the candidate shas, the percentiles, the peak day and the
+    IP counts from this table.
+  - The arrival-burst step reads `packets` one more time, because it must
+    have the SYN scans that have no payload.
+- **`src/asnintel.py`**:
+  - The code writes `(src_ip, asn)` one time into
+    `CREATE TEMP TABLE asn_ip`.
+  - The four queries after it (top ports, top families, top probes,
+    cooperation score) use this small table in memory. Before, each
+    query read `packets` and the feature parquet one time.
+  - The time did not change, because the DuckDB planner did this
+    correctly before. The change stays as a second protection.
+- **`src/sg/lib.py:load_report()` helper**:
+  - One call replaces a pattern that occurred approximately 40 times in
+    `comprehensive_report.py`:
+    `path / if exists / con.execute(SELECT FROM read_parquet) / fetchall`.
+  - Some of the call sites use the helper at this time. The other call
+    sites can change in the future.
+- **`src/conclusions/correlate.py`**:
+  - The code of the `_table` wrapper, which had only one call, is in the
+    caller at this time.
+  - `TELCO_TCP_PORTS` is a `frozenset`, not a dict with descriptions
+    that the code did not use.
+  - 12 limits (`> 0.5`, `>= 50`, `< 7 days`, and others) have names as
+    module constants at this time.
 
 ## Reporting
 
-Every run produces three formats of the same comprehensive report at
-`output/reports/COMPREHENSIVE.{md,html,pdf}`. Section 0 is the 60-second
-defender read; Section 0.5 is the cross-signal findings layer; Sections
-1-25 are the deep dive with per-table captions.
+Each run makes the same full report in three formats at
+`output/reports/COMPREHENSIVE.{md,html,pdf}`:
 
-The report includes:
+- Section 0 is a summary that a defender can read in 60 seconds.
+- Section 0.5 gives the cross-signal findings.
+- Sections 1 to 25 give the full analysis, with a caption for each table.
 
-- TL;DR (Section 0) -- top-5 threats, top-5 actor communities, drift
-  call-out, cross-signal finding counts, recommended next steps
-- **Cross-signal findings & conclusions** (Section 0.5) -- one card per
-  matched cross-analyzer rule, with LLM-written narrative (what /
-  why-noteworthy / threat model / risk if realized / recommended
-  action) and a links-back-to-evidence pointer to the supporting
-  per-analyzer section
-- Risk stratification with composite-score histograms
-- Geographic / ASN / CIDR breakdown
-- L7 protocol mix + non-IP-protocol decoding (via local or hosted AI)
-- Per-IP attack chain reconstruction (RPDBC: recon, probe, drop, brute,
-  C2, exfil)
-- **Campaign-onset Section 6** -- per-month launch histogram, top-20
-  SVG Gantt of campaign lifespans (p5 launch -> p95 decay) with
-  on-bar labels (white inside, black outside with gray connector for
-  short bars), and a top-50 density-ranked table
-- Pattern-mining promoted rules + content-pattern candidates
-- ML feature drift (Wasserstein / PSI / BH-FDR)
-- Survival analysis by actor cohort
-- Detection gaps + recommended actions
-- Actor Atlas -- Leiden communities, AI-profiled (when an AI provider is
-  configured)
-- Non-IP-protocol catalog + AI-decoded sample payloads (SCTP, GRE,
-  ESP/AH, IP-in-IP, 6to4 etc.)
-- Per-analyzer data-quality appendix
+The report has these parts:
 
-## License & data
+- Summary (Section 0): top-5 threats, top-5 actor communities, the drift
+  warning, the counts of cross-signal findings, and the recommended steps.
+- **Cross-signal findings** (Section 0.5): one card for
+  each cross-analyzer rule that found a match.
+  - Each card has a narrative that an LLM writes: what, why it is
+    important, threat model, risk if it occurs, and the recommended action.
+  - Each card has a link to the analyzer section with the evidence.
+- Sensor outages (Section 1): each run of UTC days with no packets, with
+  its first day, last day and day count. The report finds these days from
+  the `packets` day partitions. Rates and baselines have no data for these
+  days.
+- Risk tiers, with histograms of the composite score.
+- Country, ASN and CIDR tables.
+- L7 protocol mix, and the decoded non-IP protocols (from a local or a
+  hosted AI).
+- Attack chains for each IP address (RPDBC: recon, probe, drop, brute, C2,
+  exfil).
+- **Campaign start, Section 6**:
+  - A start histogram for each month.
+  - A top-20 SVG Gantt chart of the time length of each campaign (from the p5 start
+    to the p95 end). Each bar has a label. The label is white in the bar,
+    or black near a short bar with a gray line to the bar.
+  - A top-50 table, sorted by density.
+- Promoted rules from the pattern mining, and content-pattern candidates.
+- ML feature drift (Wasserstein, PSI, BH-FDR).
+- Survival analysis for each actor cohort.
+- The types of attack that the detectors do not find, and recommended actions.
+- Actor Atlas: Leiden communities, with an AI profile when you configure
+  an AI provider.
+- A catalog of the non-IP protocols, with sample payloads that an AI
+  decoded (SCTP, GRE, ESP/AH, IP-in-IP, 6to4 and others).
+- A data-quality appendix for each analyzer.
 
-The corpus is the operator's own honeypot capture. Do not commit it. Do not
-commit the `*.key.txt` files (they are git-ignored, but worth saying twice).
+## License and data
+
+The corpus is the honeypot capture of the operator. Do not add it to git.
+Do not add the `*.key.txt` files to git. Git ignores them, but this rule is
+important.

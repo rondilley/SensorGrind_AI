@@ -45,15 +45,36 @@ coverage mode):
   slow_scanner       1 IP, 12 probes ~2 h apart
   distributed_brute  40 IPs in one /24, 20 x 3389 each at 60 s
   jittered_beacon    1 IP, port 8443 every 300 s +/- 2 %
+                     (--beacon-copies N adds N-1 more, period 30 s .. 1 h,
+                     jitter 1 .. 10 %)
   lockstep_24        16 IPs in one /24 replaying one 8-port sequence in
                      lockstep (+/- 50 ms), three times
   rhythm_change      a recorded source; 2nd half inter-arrivals x 0.1
   chain_mutation     a recorded source; its top port swapped for one
                      the sensor did not see that day
+                     (--replay-copies N sources each for these two)
   burst_replay       (global) the busiest 10 min of an earlier day,
                      re-sourced and replayed into the target day
   control_replay     5 recorded ordinary sources, only re-addressed.
                      Detectors should NOT flag these (is_control=True).
+                     (--controls N sets the count; round 2 uses 50)
+
+Round 2 archetypes (--v2, docs/NEUROMORPHIC_ROUND2_PLAN.md §3.3), each
+--beacon-copies sources unless noted:
+  beacon_drift       a beacon whose period changes linearly by a factor of
+                     1.01 .. 1.2 (up or down) over the day
+  beacon_gap         a beacon that stops for 1 .. 6 h, then starts again
+                     with a new phase
+  multi_period       one source with two beacons on two ports (period
+                     30 s .. 5 min and 30 min .. 2 h)
+  lagged_lockstep    16 .. 256 sources in different /24s send one 8-port
+                     sequence; source i starts i x lag after source 0
+                     (lag 0.5 .. 30 s; --test-families: 30 .. 60 s), 3 times
+With --test-families (held out from design work; --rotating-actor adds
+only this family):
+  rotating_actor     a recorded source with >= 200 packets, sent again from
+                     4 fresh IPs (one quarter of its packets each), 10 % of
+                     the packets dropped, times moved by +/- 1 s
 """
 from __future__ import annotations
 
@@ -61,6 +82,7 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import math
 import random
 import string
 import sys
@@ -280,19 +302,31 @@ DAY = _dt.timedelta(days=1)
 class _Injector:
     """Builds the injection set for one background day."""
 
-    def __init__(self, con, day: _dt.date, seed: int):
+    def __init__(self, con, day: _dt.date, seed: int, copies: int = 1,
+                 beacon_copies: int = 1, controls: int = 5, v2: bool = False,
+                 test_families: bool = False, rotating_actor: bool = False):
         self.con = con
+        self.copies = copies
+        self.controls = controls
+        self.v2 = v2
+        self.test_families = test_families
+        self.rotating_actor = rotating_actor or test_families
+        self.beacon_copies = max(1, beacon_copies)
         self.rng = random.Random(seed)
         self.day = day
         self.t0 = _dt.datetime.combine(day, _dt.time(), _dt.timezone.utc)
         self.rows: list[dict] = []
         self.truth: list[dict] = []
         d = day.isoformat()
+        # DuckDB samples the FROM relation before WHERE, so filter in a
+        # subquery first; ORDER BY + REPEATABLE keep the draw seeded.
         self.templates = con.execute(f"""
-            SELECT ttl, tcp_win, pkt_len, dg_len, tcp_len, sensor_resp, tos
-            FROM packets
-            WHERE dt = DATE '{d}' AND proto = 6 AND tcp_flags = 2
-            USING SAMPLE 2000 ROWS
+            SELECT * FROM (
+                SELECT ttl, tcp_win, pkt_len, dg_len, tcp_len, sensor_resp, tos
+                FROM packets
+                WHERE dt = DATE '{d}' AND proto = 6 AND tcp_flags = 2
+                ORDER BY ts, src_ip, src_port
+            ) USING SAMPLE reservoir(2000 ROWS) REPEATABLE ({seed})
         """).fetchall()
         if not self.templates:
             raise SystemExit(f"[adversim] no TCP SYN background on {d}")
@@ -425,11 +459,16 @@ class _Injector:
 
         ip = self.fresh_ip()
         tpl = rng.choice(self.templates)
-        st = self.start_for(12 * 7200)
+        # The probes span ~22 h, so any mask interval in the day would make
+        # start_for() reject every start; drop the masked probes instead.
+        st = self.t0 + _dt.timedelta(
+            seconds=600 + rng.uniform(0, 86400 - 11 * 7200 - 1201))
         common = [22, 23, 80, 443, 3389, 5900, 8080, 445, 1433, 3306]
-        self.add("slow_scanner", [self.syn(
-            st + _dt.timedelta(seconds=k * 7200 + rng.uniform(-600, 600)),
-            ip, rng.choice(common), tpl) for k in range(12)])
+        probes = [st + _dt.timedelta(seconds=k * 7200 + rng.uniform(-600, 600))
+                  for k in range(12)]
+        self.add("slow_scanner", [
+            self.syn(t, ip, rng.choice(common), tpl) for t in probes
+            if not self.masked(t, t + _dt.timedelta(seconds=1))])
 
         net = self.fresh_24()
         st = self.start_for(20 * 60 + 60)
@@ -442,15 +481,27 @@ class _Injector:
                     f"{net}.{h}", 3389, tpl))
         self.add("distributed_brute", rows)
 
-        ip = self.fresh_ip()
-        tpl = rng.choice(self.templates)
-        st = self.t0 + _dt.timedelta(seconds=rng.uniform(0, 300))
-        rows, t = [], st
-        while t < self.t0 + DAY:
-            if not self.masked(t, t + _dt.timedelta(seconds=1)):
-                rows.append(self.syn(t, ip, 8443, tpl))
-            t += _dt.timedelta(seconds=300 * rng.uniform(0.98, 1.02))
-        self.add("jittered_beacon", rows)
+        # The first beacon is the fixed 300 s +/- 2 % case; each extra copy
+        # (--beacon-copies) draws its period log-uniform in 30 s .. 1 h and
+        # its jitter in 1 .. 10 %, on a port of the day.
+        for c in range(self.beacon_copies):
+            ip = self.fresh_ip()
+            tpl = rng.choice(self.templates)
+            if c == 0:
+                period, jit, port = 300.0, 0.02, 8443
+            else:
+                period = math.exp(rng.uniform(math.log(30), math.log(3600)))
+                jit = rng.uniform(0.01, 0.10)
+                port = rng.choice(sorted(self.day_ports)) if self.day_ports \
+                    else 8443
+            st = self.t0 + _dt.timedelta(seconds=rng.uniform(0, period))
+            rows, t = [], st
+            while t < self.t0 + DAY:
+                if not self.masked(t, t + _dt.timedelta(seconds=1)):
+                    rows.append(self.syn(t, ip, port, tpl))
+                t += _dt.timedelta(seconds=period * rng.uniform(1 - jit, 1 + jit))
+            self.add("jittered_beacon", rows,
+                     note=f"period {period:.0f} s, jitter {jit:.0%}, port {port}")
 
         net = self.fresh_24()
         seq_ports = rng.sample(sorted(self.day_ports), 8) \
@@ -469,7 +520,7 @@ class _Injector:
         self.add("lockstep_24", rows,
                  note=f"ports {seq_ports}")
 
-        for ip in self.recorded(100, 2000, 1):
+        for ip in self.recorded(100, 2000, self.copies):
             rows = self.replay(ip)
             half = len(rows) // 2
             if half >= 2:
@@ -479,10 +530,11 @@ class _Injector:
             self.add("rhythm_change", rows,
                      note="second-half inter-arrivals x 0.1")
 
-        for ip in self.recorded(30, 2000, 1):
+        for ip in self.recorded(30, 2000, self.copies):
             rows = self.replay(ip)
-            top = max(set(r["dst_port"] for r in rows),
-                      key=lambda p: sum(r["dst_port"] == p for r in rows))
+            # ICMP rows have no port; recorded() makes sure of >= 3 real ones
+            ports = [r["dst_port"] for r in rows if r["dst_port"] is not None]
+            top = max(sorted(set(ports)), key=ports.count)
             unseen = [p for p in range(40000, 60000) if p not in self.day_ports]
             new_port = rng.choice(unseen)
             for r in rows:
@@ -502,7 +554,8 @@ class _Injector:
             cols = ", ".join(_REPLAY_COLS)
             rows = self.con.execute(f"""
                 SELECT {cols} FROM packets
-                WHERE ts >= ? AND ts < ? + INTERVAL 10 MINUTE ORDER BY ts
+                WHERE dt BETWEEN DATE '{d}' AND DATE '{d}' + 1
+                  AND ts >= ? AND ts < ? + INTERVAL 10 MINUTE ORDER BY ts
             """, [b0, b0]).to_arrow_table().to_pylist()
             st = self.start_for(600)
             shift = st - b0
@@ -513,9 +566,89 @@ class _Injector:
             self.add("burst_replay", rows, level="global",
                      note=f"replay of {b0} ({len(ipmap)} sources)")
 
-        for ip in self.recorded(20, 200, 5):
+        for ip in self.recorded(20, 200, self.controls):
             self.add("control_replay", self.replay(ip), control=True,
                      note="re-addressed recorded source")
+        if self.v2:
+            self.build_v2()
+
+    # -- round 2 archetypes ----------------------------------------------
+    def _train(self, ip: str, port: int, tpl, start: _dt.datetime,
+               end: _dt.datetime, period, jit: float) -> list[dict]:
+        """Periodic SYNs from start to end; ``period(t)`` gives the period
+        (seconds) at a time t."""
+        rows, t = [], start
+        while t < end:
+            if not self.masked(t, t + _dt.timedelta(seconds=1)):
+                rows.append(self.syn(t, ip, port, tpl))
+            t += _dt.timedelta(seconds=period(t) * self.rng.uniform(1 - jit, 1 + jit))
+        return rows
+
+    def _port(self) -> int:
+        return self.rng.choice(sorted(self.day_ports)) if self.day_ports else 8443
+
+    def build_v2(self) -> None:
+        rng, end = self.rng, self.t0 + DAY
+        logu = lambda a, b: math.exp(rng.uniform(math.log(a), math.log(b)))
+        for _ in range(self.beacon_copies):
+            ip, tpl, port = self.fresh_ip(), rng.choice(self.templates), self._port()
+            p0, jit = logu(30, 3600), rng.uniform(0.01, 0.05)
+            f = rng.uniform(1.01, 1.2) ** rng.choice((-1, 1))
+            per = lambda t, p0=p0, f=f: p0 * f ** ((t - self.t0).total_seconds() / 86400)
+            st = self.t0 + _dt.timedelta(seconds=rng.uniform(0, p0))
+            self.add("beacon_drift", self._train(ip, port, tpl, st, end, per, jit),
+                     note=f"period {p0:.0f} s x {f:.3f} over the day, jitter {jit:.0%}")
+        for _ in range(self.beacon_copies):
+            ip, tpl, port = self.fresh_ip(), rng.choice(self.templates), self._port()
+            p0, jit = logu(30, 3600), rng.uniform(0.01, 0.05)
+            gap = rng.uniform(3600, 6 * 3600)
+            g0 = self.t0 + _dt.timedelta(seconds=rng.uniform(2 * 3600, 86400 - gap - 2 * 3600))
+            g1 = g0 + _dt.timedelta(seconds=gap + rng.uniform(0, p0))
+            st = self.t0 + _dt.timedelta(seconds=rng.uniform(0, p0))
+            rows = (self._train(ip, port, tpl, st, g0, lambda t, p0=p0: p0, jit) +
+                    self._train(ip, port, tpl, g1, end, lambda t, p0=p0: p0, jit))
+            self.add("beacon_gap", rows,
+                     note=f"period {p0:.0f} s, gap {gap / 3600:.1f} h at {g0:%H:%M}")
+        for _ in range(self.beacon_copies):
+            ip, tpl = self.fresh_ip(), rng.choice(self.templates)
+            pa_, pb = logu(30, 300), logu(1800, 7200)
+            jit = rng.uniform(0.01, 0.05)
+            rows = (self._train(ip, self._port(), tpl,
+                                self.t0 + _dt.timedelta(seconds=rng.uniform(0, pa_)),
+                                end, lambda t, p=pa_: p, jit) +
+                    self._train(ip, self._port(), tpl,
+                                self.t0 + _dt.timedelta(seconds=rng.uniform(0, pb)),
+                                end, lambda t, p=pb: p, jit))
+            rows.sort(key=lambda r: r["ts"])
+            self.add("multi_period", rows, note=f"periods {pa_:.0f} s and {pb:.0f} s")
+
+        n = int(round(logu(16, 256)))
+        lag = rng.uniform(30, 60) if self.test_families else rng.uniform(0.5, 30)
+        seq_ports = rng.sample(sorted(self.day_ports), 8) \
+            if len(self.day_ports) >= 8 else rng.sample(range(1, 65536), 8)
+        offsets = sorted(rng.uniform(0, 20) for _ in seq_ports)
+        ips = [self.fresh_ip() for _ in range(n)]
+        tpls = {ip: rng.choice(self.templates) for ip in ips}
+        rows = []
+        for _ in range(3):
+            st = self.start_for(n * lag + 30)
+            for i, ip in enumerate(ips):
+                for off, p in zip(offsets, seq_ports):
+                    rows.append(self.syn(st + _dt.timedelta(
+                        seconds=i * lag + off + rng.uniform(-0.05, 0.05)),
+                        ip, p, tpls[ip]))
+        self.add("lagged_lockstep", rows,
+                 note=f"{n} sources, lag {lag:.1f} s, ports {seq_ports}")
+
+        if self.rotating_actor:
+            for ip in self.recorded(200, 5000, self.copies):
+                rows = [r for r in self.replay(ip) if rng.random() >= 0.1]
+                new = [self.fresh_ip() for _ in range(4)]
+                for k, r in enumerate(rows):
+                    r["src_ip"] = new[k * 4 // max(1, len(rows))]
+                    r["ts"] = r["ts"] + _dt.timedelta(seconds=rng.uniform(-1, 1))
+                rows.sort(key=lambda r: r["ts"])
+                self.add("rotating_actor", rows, note=f"recorded source {ip}")
 
 
 def inject(args: argparse.Namespace) -> int:
@@ -524,7 +657,11 @@ def inject(args: argparse.Namespace) -> int:
         raise SystemExit("[adversim] --inject needs --day YYYY-MM-DD")
     con = lib.duck()
     lib.register_views(con)
-    inj = _Injector(con, day, args.seed)
+    if "/" in args.inject or ".." in args.inject:
+        raise SystemExit("[adversim] --inject NAME must be a plain name")
+    inj = _Injector(con, day, args.seed, args.replay_copies,
+                    args.beacon_copies, args.controls, args.v2,
+                    args.test_families, args.rotating_actor)
     inj.build()
     con.close()
 
@@ -625,6 +762,25 @@ def main() -> int:
                          "instead of running coverage mode.")
     ap.add_argument("--day", default=None,
                     help="Background day for --inject (YYYY-MM-DD).")
+    ap.add_argument("--replay-copies", type=int, default=1,
+                    help="Recorded sources per rhythm_change and "
+                         "chain_mutation (more instances -> recall is not "
+                         "a single 0/1 outcome).")
+    ap.add_argument("--beacon-copies", type=int, default=1,
+                    help="jittered_beacon sources (the first is 300 s +/- "
+                         "2 %%; the others have a random period and jitter).")
+    ap.add_argument("--controls", type=int, default=5,
+                    help="control_replay sources (round 2 uses 50).")
+    ap.add_argument("--v2", action="store_true",
+                    help="Add the round 2 archetypes (beacon_drift, "
+                         "beacon_gap, multi_period, lagged_lockstep).")
+    ap.add_argument("--test-families", action="store_true",
+                    help="With --v2: add the held-out rotating_actor family "
+                         "and lagged_lockstep lags of 30 .. 60 s.")
+    ap.add_argument("--rotating-actor", action="store_true",
+                    help="With --v2: add only the rotating_actor family "
+                         "(development-day confirmation sets; the "
+                         "lagged_lockstep lags do not change).")
     args = ap.parse_args()
     return run(args)
 

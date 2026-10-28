@@ -164,6 +164,10 @@ def _source_features(con, days_pred: str) -> dict:
         FROM base b
         LEFT JOIN iat i USING (src_ip, dt)
         LEFT JOIN pm USING (src_ip, dt)
+        -- fixed row order: random scores, tie breaks and the IForest
+        -- subsample are all index-based, so an unordered result changes
+        -- the exit-gate numbers from run to run
+        ORDER BY b.src_ip, b.dt
     """).to_arrow_table()
     ips = t["src_ip"].to_pylist()
     keep = np.array([lib.is_real_external_ip(ip) for ip in ips], dtype=bool)
@@ -467,6 +471,9 @@ def run(args: argparse.Namespace) -> lib.Report:
     src_scores = source_scores(fit, d, new24, args.seed)
     rows = eval_source(args.eval, d["src_ip"], src_scores, truth,
                        args.source_k, args.seed)
+    from bench import harness2
+    harness2.write_ranks("baselines", args.eval, harness2.truth_ranks(
+        args.eval, day, d["src_ip"], src_scores, truth, args.seed))
 
     days = fit_days + [day]
     ser = _minute_series(con, days, _days_pred(days))

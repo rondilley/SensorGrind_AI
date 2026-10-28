@@ -56,6 +56,18 @@ from report.render import (
 )
 
 
+def sensor_outages() -> list[tuple[_dt.date, _dt.date, int]]:
+    """(first, last, n_days) for each run of UTC days with no packets.
+
+    The parser writes one ``packets/dt=YYYY-MM-DD`` partition per UTC day
+    that saw traffic, so a missing partition is a whole day the sensor
+    recorded nothing.  Sub-day gaps are sensormask's job."""
+    days = sorted(_dt.date.fromisoformat(p.name[3:])
+                  for p in (lib.PARQUET / "packets").glob("dt=*"))
+    one = _dt.timedelta(days=1)
+    return [(a + one, b - one, (b - a).days - 1)
+            for a, b in zip(days, days[1:]) if (b - a).days > 1]
+
 
 # ----------------------------------------------------------------------
 # Main report builder
@@ -929,6 +941,23 @@ def run(args: argparse.Namespace) -> int:
     P(f"| L7-classified events | {l7_count:,} |")
     P(f"| IOCs extracted | {ioc_count:,} |")
     P(f"| active days in corpus | {total_days:,} |")
+
+    outages = sensor_outages()
+    P("\n### Sensor outages\n")
+    P("_Each run of whole UTC days with no packets at all - the sensor was "
+      "off, unplugged, or its log was lost.  Every rate, baseline and "
+      "first-seen figure in this report has a hole here; do not read a "
+      "drop in activity across these dates as attacker behavior.  Gaps "
+      "shorter than a day are masked per detector by `sensormask`._")
+    P("")
+    if outages:
+        P(f"**{len(outages):,} outages, {sum(n for *_, n in outages):,} "
+          "days with no packets.**\n")
+        P("| first day | last day | days |\n| --- | --- | ---: |")
+        for a, b, n in outages:
+            P(f"| {a} | {b} | {n:,} |")
+    else:
+        P("_No whole-day outages in the corpus._")
 
     if tier_counts:
         P("\n### Risk tier distribution\n")
@@ -1956,8 +1985,8 @@ def run(args: argparse.Namespace) -> int:
       "TCP/UDP/ICMP that the main parser drops because its protocol "
       "regex only accepts those three.  The honeypi sensor writes "
       "these as `UNKNOWN-IPv4-Protocol:<NUM>` lines - they never reach "
-      "the parquet pipeline.  This module rescans the source "
-      "`merged.log.gz` to surface them.  Notable categories: "
+      "the parquet pipeline.  This module rescans the raw sensor log "
+      "(the `evolve.py --input` log) to surface them.  Notable categories: "
       "**SCTP (132)** - telco signaling (Diameter, SIGTRAN); "
       "**GRE (47)** - generic tunneling/VPN; "
       "**6to4 (41)** - IPv6 packets wrapped in IPv4; "
@@ -2312,6 +2341,98 @@ def run(args: argparse.Namespace) -> int:
         P("> _No multi-finding storylines yet.  Run `python src/evolve.py kg` "
           "then `conclude` to populate this section._")
 
+    # ---------- 32. Neuromorphic per-source scores (neuro) ----------
+    H(2, "32. Neuromorphic Per-Source Scores (neuro: LIF, arrival, HDC)")
+    P("**What this shows:** the per-source detectors of the neuromorphic "
+      "plan (ARCHITECTURE §9).  The **LIF / ALIF bank** reads each source's "
+      "packet rate per day: `change` is the largest sustained shift of its "
+      "own rate, `reg` is how mechanical (metronome-like) its timing is.  "
+      "**HDC** encodes each session's packet choreography as a binary "
+      "hypervector: `hdc_proto` scores a choreography no known cluster "
+      "explains, `hdc_drift` a source whose choreography changes.  Every "
+      "readout is calibrated against the previous days (-log10 exceedance "
+      "among comparable source-days); a source-day is **flagged** at >= 4.  "
+      "The **arrival** detector marks minutes with an abnormal flood of new "
+      "sources.  The flags add a capped `neuro_signal` term to the risk "
+      "score (LIF <= 6, HDC <= 4, total <= 8; arrival is 0 by operator "
+      "decision).")
+    neuro_path = lib.OUTPUT_DIR / "reports" / "neuro" / "neuro.parquet"
+    if neuro_path.exists():
+        ncon = lib.duck()
+        n = ncon.execute(f"""
+            SELECT count(*) FILTER (WHERE lif_days > 0),
+                   coalesce(sum(lif_days), 0),
+                   count(*) FILTER (WHERE lif_flag_days > 0),
+                   count(*) FILTER (WHERE hdc_days > 0),
+                   coalesce(sum(hdc_days), 0),
+                   count(*) FILTER (WHERE hdc_flag_days > 0),
+                   count(*) FILTER (WHERE arrival_alarm_minutes > 0),
+                   count(*) FILTER (WHERE arrival_first_in_alarm)
+            FROM read_parquet('{neuro_path}')""").fetchone()
+        P("")
+        P("| detector | sources scored | source-days | sources flagged (>= 4) |")
+        P("| --- | ---: | ---: | ---: |")
+        P(f"| LIF / ALIF (change, reg) | {n[0]:,} | {n[1]:,} | {n[2]:,} |")
+        P(f"| HDC (proto, drift) | {n[3]:,} | {n[4]:,} | {n[5]:,} |")
+        P(f"| arrival alarms | {n[6]:,} in an alarm minute | -- | "
+          f"{n[7]:,} first seen in one |")
+        if risk_path.exists():
+            nr = ncon.execute(f"""
+                SELECT risk_tier, count(*),
+                       count(*) FILTER (WHERE rationale LIKE '%lif-%'),
+                       count(*) FILTER (WHERE rationale LIKE '%hdc-%')
+                FROM read_parquet('{risk_path}') WHERE neuro_signal > 0
+                GROUP BY 1""").fetchall()
+            if nr:
+                order = {t: i for i, t in enumerate(
+                    ("critical", "high", "medium", "low", "info"))}
+                nr.sort(key=lambda r: order.get(r[0], 9))
+                H(3, "Sources with a neuro risk term, by tier")
+                P("| tier | sources | LIF term | HDC term |")
+                P("| --- | ---: | ---: | ---: |")
+                for tier, cnt, lif_n, hdc_n in nr:
+                    P(f"| {tier} | {cnt:,} | {lif_n:,} | {hdc_n:,} |")
+            top = ncon.execute(f"""
+                SELECT r.src_ip, r.risk_tier, r.risk_score, r.neuro_signal,
+                       n.lif_max, n.lif_flag_days, n.lif_best_day,
+                       greatest(n.hdc_proto_max, n.hdc_drift_max),
+                       n.hdc_flag_days, n.hdc_best_day
+                FROM read_parquet('{risk_path}') r
+                JOIN read_parquet('{neuro_path}') n USING (src_ip)
+                WHERE r.neuro_signal > 0
+                ORDER BY r.neuro_signal DESC, r.risk_score DESC LIMIT 25
+            """).fetchall()
+            if top:
+                H(3, "Top 25 sources by neuro risk term")
+                P("| src_ip | tier | risk | neuro | lif_max | lif flag days "
+                  "| lif best day | hdc_max | hdc flag days | hdc best day |")
+                P("| --- | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- |")
+                f = lambda v: "--" if v is None else f"{v:.2f}"
+                for (ip, tier, rs, ns, lm, lfd, lbd, hm, hfd, hbd) in top:
+                    P(f"| {ip} | {tier} | {rs:.1f} | {ns:.2f} | {f(lm)} "
+                      f"| {lfd or 0} | {lbd or '--'} | {f(hm)} | {hfd or 0} "
+                      f"| {hbd or '--'} |")
+        hdc_top = ncon.execute(f"""
+            SELECT hdc_best_day, count(*) AS n,
+                   string_agg(src_ip, ', ' ORDER BY src_ip)
+            FROM read_parquet('{neuro_path}') WHERE hdc_flag_days > 0
+            GROUP BY 1 ORDER BY n DESC, 1 LIMIT 10""").fetchall()
+        if hdc_top:
+            H(3, "HDC-flagged sources grouped by their best day")
+            P("_HDC flags arrive in groups: related sources that share one "
+              "unexplained choreography on the same day._")
+            P("")
+            P("| day | sources | src_ips |")
+            P("| --- | ---: | --- |")
+            for day, cnt, ips in hdc_top:
+                ips_disp = ips if len(ips) <= 160 else ips[:157] + "..."
+                P(f"| {day} | {cnt} | {ips_disp} |")
+        ncon.close()
+    else:
+        P("")
+        P("> _No neuro output yet.  Run `python src/evolve.py neuro` to "
+          "populate this section._")
+
     # ---------- Appendix ----------
     H(2, "Appendix A. Per-analyzer data coverage")
     analyzer_dirs = sorted((p.name for p in lib.REPORTS.iterdir() if p.is_dir()))
@@ -2337,6 +2458,7 @@ def run(args: argparse.Namespace) -> int:
 - **Drift**: two-sample Kolmogorov-Smirnov test on a feature distribution between recent 7d and baseline 60d.
 - **Cluster**: HDBSCAN result over normalized per-IP feature vectors.
 - **Coordination wave**: a single payload SHA-256 sent by N+ distinct IPs ranked by tightness (IPs/min).
+- **Sensor outage**: a run of whole UTC days with no packets (no `packets` day partition); listed in section 1.
 """)
 
     P("\n---\n_End of report._\n")
