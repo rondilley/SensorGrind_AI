@@ -80,7 +80,7 @@ RESP_MAP = {
 # L7 protocol enum.
 L7_UNKNOWN, L7_HTTP, L7_TLS, L7_SSH, L7_FTP, L7_SMTP, L7_DNS, \
 L7_TELNET, L7_RDP, L7_SMB, L7_MQTT, L7_IRC, L7_BITTORRENT, \
-L7_MIRAI, L7_MONGO, L7_REDIS, L7_VNC = range(17)
+L7_MIRAI, L7_MONGO, L7_REDIS, L7_VNC, L7_LEVIN = range(18)
 
 L7_NAME = {
     L7_UNKNOWN: "unknown", L7_HTTP: "http", L7_TLS: "tls", L7_SSH: "ssh",
@@ -88,6 +88,7 @@ L7_NAME = {
     L7_RDP: "rdp", L7_SMB: "smb", L7_MQTT: "mqtt", L7_IRC: "irc",
     L7_BITTORRENT: "bittorrent", L7_MIRAI: "mirai",
     L7_MONGO: "mongo", L7_REDIS: "redis", L7_VNC: "vnc",
+    L7_LEVIN: "levin",
 }
 
 # IOC kind enum.
@@ -323,13 +324,35 @@ _HTTP_METHODS = (b"GET ", b"POST ", b"PUT ", b"HEAD ", b"DELETE ",
                  b"OPTIONS ", b"PATCH ", b"TRACE ", b"CONNECT ", b"PROPFIND ")
 _SSH_PREFIX = b"SSH-"
 _BITTORRENT_PREFIX = b"\x13BitTorrent protocol"
+# A BitTorrent fork (peer IDs "-DL3790-") with its own 19-byte protocol
+# string in the standard handshake layout.  It caused the burst ports of
+# 2025-07 to 2026-06 (23142, 56846, 14762, 59705, ...); see
+# docs/NEUROMORPHIC_NEXT_PATHS.md.  Its encrypted (MSE) handshakes are random
+# bytes and cannot be classified alone.
+_BITTORRENT_DL_PREFIX = b"\x13" + bytes.fromhex("49020f570d73660a167d264957110000000000")
 _SMB_PREFIXES = (b"\xffSMB", b"\xfeSMB")
 _HTTP_RESP_PREFIX = b"HTTP/"
 
 # Mirai/IoT shell strings — used to detect dropper/recon stages.
+# Levin: the P2P protocol of Monero and other CryptoNote coins.  Each message
+# starts with the 8-byte signature 0x0101010101012101 (little-endian), then
+# body size u64, have_to_return u8, command u32 (1001 = handshake), ...
+_LEVIN_SIGNATURE = bytes.fromhex("0121010101010101")
 _MIRAI_HINTS = (b"/bin/busybox", b"BUSYBOX", b"ECCHI", b"/tmp/.x", b";wget ",
                 b"; tftp ", b"; chmod ", b"; sh ", b"/dev/null 2>&1",
                 b"enable\r\n", b"system\r\n", b"shell\r\n")
+
+
+def _is_bt_handshake_layout(payload: bytes) -> bool:
+    """A 68-byte BitTorrent handshake with any 19-byte protocol string.
+
+    pstrlen 19, then 19 + 8 + 20 bytes, then an Azureus-style peer ID
+    ("-XX1234-...").  The peer ID test keeps random 68-byte payloads out
+    (about 1 in 2**24 match by chance).
+    """
+    return (len(payload) == 68 and payload[0] == 19
+            and payload[48] == 0x2D and payload[55] == 0x2D
+            and payload[49:51].isalnum() and payload[51:55].isalnum())
 
 
 def detect_l7(payload: bytes, src_port: int | None, dst_port: int | None) -> int:
@@ -341,8 +364,12 @@ def detect_l7(payload: bytes, src_port: int | None, dst_port: int | None) -> int
         return L7_HTTP
     if first.startswith(_SSH_PREFIX):
         return L7_SSH
-    if payload.startswith(_BITTORRENT_PREFIX):
+    if payload.startswith(_BITTORRENT_PREFIX) or payload.startswith(_BITTORRENT_DL_PREFIX):
         return L7_BITTORRENT
+    if _is_bt_handshake_layout(payload):
+        return L7_BITTORRENT
+    if payload.startswith(_LEVIN_SIGNATURE):
+        return L7_LEVIN
     if any(payload.startswith(p) for p in _SMB_PREFIXES):
         return L7_SMB
     # TLS record: type(0x14-0x17) + version 0x03 0x0?
@@ -535,9 +562,23 @@ def extract_l7_fields(l7: int, payload: bytes) -> dict | None:
         if mc:
             fields["mstshash"] = mc.group(1).decode("ascii", errors="replace")
     elif l7 == L7_BITTORRENT:
-        # Bytes 20..28 = peer info hash bytes, 28..48 = peer ID.
-        if len(payload) >= 48:
-            fields["peer_id"] = payload[28:48].decode("ascii", errors="replace")
+        # Handshake: pstrlen(1) pstr(19) reserved(8) info_hash(20) peer_id(20).
+        # (Before 2026-10-28 "peer_id" held bytes 28..48, the info hash.)
+        if len(payload) >= 68 and payload[0] == 19:
+            pstr = payload[1:20]
+            if pstr != b"BitTorrent protocol":
+                fields["variant"] = "dl" if payload.startswith(_BITTORRENT_DL_PREFIX) else "other"
+                fields["pstr_hex"] = pstr.hex()
+            fields["info_hash"] = payload[28:48].hex()
+            fields["peer_id"] = payload[48:68].decode("ascii", errors="replace")
+    elif l7 == L7_LEVIN:
+        # A sender often puts the 8-byte signature in its own packet; the
+        # command is there only when the header (33 bytes) is complete.  A
+        # split header still gets a field, so its packet gets an l7_events row.
+        if len(payload) >= 21:
+            fields["command"] = int.from_bytes(payload[17:21], "little")
+        else:
+            fields["header"] = "split"
     elif l7 == L7_MIRAI:
         cmds = _BUSYBOX_CMD.findall(payload)
         if cmds:

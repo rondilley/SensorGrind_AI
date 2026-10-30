@@ -108,6 +108,9 @@ STAGES: dict[str, list[str]] = {
     "correlate":    [str(SRC / "conclusions" / "correlate.py")],
     # --- v3.2 KG-lite: fuse findings into threat storylines (Track C) ---
     "kg":           [str(SRC / "conclusions" / "graph.py")],
+    # deterministic, fact-based verdict per finding (no LLM)
+    "verdict":      [str(SRC / "conclusions" / "verdict.py")],
+    # LLM narratives: paid API calls, so opt-in (see OPT_IN)
     "conclude":     [str(SRC / "conclusions" / "synthesize.py")],
     "report":       [str(SRC / "report" / "comprehensive_report.py")],
     # --- v2.4 cross-AI review of the tool itself ---
@@ -116,6 +119,9 @@ STAGES: dict[str, list[str]] = {
     "metrics":      [str(SRC / "bench" / "compute_metrics.py")],
 }
 ORDER = list(STAGES.keys())
+# Stages that run only when named on the command line, never in a default
+# (all-stages) run.  conclude makes paid LLM calls.
+OPT_IN = {"conclude"}
 
 # Stages that read the raw sensor log rather than the parquet tables.  They
 # get evolve's --input appended; without --input they are skipped.
@@ -129,6 +135,12 @@ RAW_INPUT_STAGES = {"parse", "nonipproto"}
 # Stages with no entry here NEVER skip (we don't know what they touch).
 # That's the safe default — better to redo work than silently use stale
 # outputs.  Add an entry when you're confident in the I/O contract.
+_ANALYZERS = (
+    "benignfilter", "ja4plus", "fingerprint", "portscans", "droppers",
+    "rdpbrute", "tlsintel", "probesigs", "scannerintel", "campaign",
+    "botnetcls", "timing", "workhours", "emergence", "ecodanom",
+    "trafficprint", "cveseries", "clusterxref", "attackmap")
+
 STAGE_IO: dict[str, dict[str, list[str]]] = {
     # The raw --input log is added to these inputs at run time (is_fresh).
     "parse": {
@@ -137,6 +149,28 @@ STAGE_IO: dict[str, dict[str, list[str]]] = {
                     "output/parquet/payload_blobs/**/*.parquet",
                     "output/parquet/l7_events/**/*.parquet",
                     "output/parquet/iocs/**/*.parquet"],
+    },
+    # sgquery runs every module in its ANALYZER_ORDER; each reads the parsed
+    # tables (some also GeoLite) and writes output/reports/<name>/<name>.*.
+    # A new analyzer must be added to both lists.
+    "analyzers": {
+        "inputs":  ["output/parquet/packets/**/*.parquet",
+                    "output/parquet/payload_blobs/**/*.parquet",
+                    "output/parquet/l7_events/**/*.parquet",
+                    "output/parquet/iocs/**/*.parquet",
+                    "GeoLite/**/*.mmdb",
+                    "src/sgquery.py", "src/sg/lib.py"]
+                   + [f"src/{m}.py" for m in _ANALYZERS],
+        "outputs": [f"output/reports/{m}/{m}.parquet" for m in _ANALYZERS],
+    },
+    "chainfp": {
+        "inputs":  ["output/parquet/packets/**/*.parquet",
+                    "output/parquet/packets_clustered/**/*.parquet",
+                    "src/chainfp.py", "src/sg/lib.py"],
+        "outputs": ["output/reports/chainfp/chainfp.parquet",
+                    "output/reports/chainfp/window_snr.parquet",
+                    "output/reports/chainfp/chainfp_timed.parquet",
+                    "output/reports/chainfp/window_snr_timed.parquet"],
     },
     "cluster": {
         "inputs":  ["output/parquet/packets/**/*.parquet",
@@ -159,7 +193,8 @@ STAGE_IO: dict[str, dict[str, list[str]]] = {
                     "output/reports/arrival_eval/arrival_scores_full.parquet",
                     "src/neuro.py", "src/sg/lif.py", "src/bench/lif_eval.py",
                     "src/sg/hdc.py", "src/sg/hdc_gpu.py", "src/bench/hdc_eval.py",
-                    "src/chainfp.py"],
+                    "src/chainfp.py", "src/sg/context.py",
+                    "output/reports/benignfilter/benignfilter.parquet"],
         # the per-day cache output/.neuro_cache/ stays out of this glob
         # (rule 3 of ARCHITECTURE §9.3)
         "outputs": ["output/reports/neuro/neuro.parquet",
@@ -229,6 +264,7 @@ STAGE_IO: dict[str, dict[str, list[str]]] = {
     },
     "kg": {
         "inputs":  ["output/conclusions/findings.parquet",
+                    "output/conclusions/finding_members.parquet",
                     "src/conclusions/graph.py"],
         "outputs": ["output/conclusions/storylines/storylines.parquet"],
     },
@@ -305,10 +341,12 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
                         "asnintel", "cidrintel", "tooling", "slowlow",
                         "selfmimic", "isc_compare", "coordination",
                         "chains", "chainfp", "compositeprint",
-                        "campaignmigration"],
+                        "campaignmigration", "neuro"],
     # kg fuses the correlator's findings into storylines; conclude then narrates
     # both the per-finding cards and the multi-finding storylines.
     "kg":              ["correlate"],
+    # verdict reads the findings + members, benignfilter (analyzers) and risk.
+    "verdict":         ["correlate", "analyzers", "risk"],
     "conclude":        ["correlate", "kg"],
     # adversarysim consults other analyzers' outputs for coverage scoring;
     # depending on a broad set of stages keeps it last among siblings.
@@ -326,11 +364,11 @@ EXPLICIT_DEPS: dict[str, list[str]] = {
                      "actorlink", "originintel",
                      "slowlow", "dnstlsintel", "selfmimic",
                      "chainfp", "compositeprint", "campaignmigration",
-                     "httppatterns", "correlate", "kg", "conclude"],
+                     "httppatterns", "correlate", "kg", "verdict", "conclude"],
     "aireview":     ["report"],
     # metrics reads findings (conclude), storylines (kg), risk, and analyzer
     # reports (trafficprint, attackmap, httppatterns); depend on producers.
-    "metrics":      ["conclude", "kg", "risk", "analyzers", "httppatterns"],
+    "metrics":      ["conclude", "verdict", "kg", "risk", "analyzers", "httppatterns"],
 }
 
 
@@ -891,7 +929,9 @@ def _print_failure_summary(failed_stages: set[str],
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stages", nargs="*", help="Specific stages (default: all)")
+    ap.add_argument("stages", nargs="*",
+                    help="Specific stages (default: all except the opt-in "
+                         f"stages: {', '.join(sorted(OPT_IN))})")
     ap.add_argument("--skip", nargs="*", default=[], help="Stages to skip")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--force", action="store_true",
@@ -933,6 +973,7 @@ def main() -> int:
         for s in ORDER:
             io = STAGE_IO.get(s)
             mark = " [skip-if-fresh]" if io else ""
+            mark += " [opt-in]" if s in OPT_IN else ""
             print(f"{s}{mark}")
         return 0
 
@@ -962,7 +1003,7 @@ def main() -> int:
             run_log_fh = None
 
     try:
-        chosen = args.stages or ORDER
+        chosen = args.stages or [s for s in ORDER if s not in OPT_IN]
         bad = [s for s in chosen if s not in STAGES]
         if bad:
             print(f"Unknown stages: {bad}\nKnown: {ORDER}", file=sys.stderr)

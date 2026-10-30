@@ -105,7 +105,26 @@ protocol.
 
 `l7_proto` values: 0 unknown, 1 http, 2 tls, 3 ssh, 4 ftp, 5 smtp, 6 dns,
 7 telnet, 8 rdp, 9 smb, 10 mqtt, 11 irc, 12 bittorrent, 13 mirai, 14 mongo,
-15 redis, 16 vnc.
+15 redis, 16 vnc, 17 levin.
+
+`levin` (2026-10-30) is the P2P protocol of Monero and other CryptoNote
+coins. Each message starts with the 8-byte signature `01 21 01 01 01 01 01
+01`. A sender frequently puts the signature in its own packet. That packet gets
+the field `{"header": "split"}`, so it also gets an `l7_events` row. A
+complete header gets the field `command` (1001 is the handshake).
+
+`src/l7_backfill.py --apply` added the label to the stored tables on
+2026-10-30: 472,412 packets and `l7_events` rows from 2,385 sources. The
+backfill writes its `l7_events` rows to `part-l7backfill-<labels>.parquet`,
+so it does not replace the rows of the BitTorrent backfill
+(`part-l7backfill.parquet`).
+
+Without `--apply`, the tool does a dry run and gives only the counts. With
+`--apply`, it moves each initial file to `output/.l7_backfill_backup/`
+before it writes the new file. Use `--no-backup` to write without a backup.
+After a full run, a second dry run finds 0 targets. On 2026-10-30, the
+operator deleted the backup of the Levin run (33 GiB). To get the initial
+labels back, parse the raw log again.
 
 ### 1.4 `iocs`
 
@@ -136,7 +155,8 @@ The DAG has 48 steps in these groups:
 - Deep packet, payload and behavior analysis
 - Non-IP, source-country and attribution analysis
 - Blind-spot analyzers
-- **Cross-signal results** (`correlate`, `conclude`)
+- **Cross-signal results** (`correlate`, `kg`, `verdict`, and the opt-in
+  `conclude`)
 - Output
 
 One step can run before the DAG:
@@ -275,8 +295,14 @@ dependency between them to a `ProcessPoolExecutor`.
     `icmp_payload_anomalies`, `tcp_midstream_or_syn_payload`,
     `global_arrival_burst`, `local_only_targeted_ports`,
     `honeypot_aware_self_mimic`, `critical_persistent_botnet`.
-- `conclude`: sends each finding to the configured LLM, and gets a
+- `verdict`: gives each finding one verdict from fixed rules, and merges
+  the findings into problems. It uses no LLM. Refer to "Verdict rules"
+  below.
+- `conclude` (opt-in): sends each finding to the configured LLM, and gets a
   structured narrative back.
+  - `evolve.OPT_IN` contains this step. A run with no step names does not
+    run it. Use `evolve.py conclude` to run it. Each new prompt is a paid
+    API call.
   - The providers are anthropic, openai, xai, mistral and gemini. The first
     provider with a key and an installed SDK is the one that the step uses.
     `aipayloaddecode` uses the same method to find its provider.
@@ -286,13 +312,153 @@ dependency between them to a `ProcessPoolExecutor`.
   - The step keeps each response in `output/ai_cache/conclude_*.json`, with
     the sha256 of the prompt as the key. Thus a second run costs nothing,
     unless you use `--force`.
-  - It writes `output/conclusions/conclusions.{parquet,md}`. The full report
-    uses this file for Section 0.5.
+  - It writes `output/conclusions/conclusions.{parquet,md}`. The report does
+    not use these files.
+
+### Verdict rules (`src/conclusions/verdict.py`, 2026-10-30)
+
+The correlator finds a pattern. The `verdict` step tells what the pattern
+is, from measured facts only.
+
+**Facts.** For each finding, the step measures these facts for all the
+member sources in `finding_members.parquet`:
+
+| Fact | Source |
+|---|---|
+| Share of members with each L7 protocol | `l7_events` |
+| Share of members in the research scanner table (confidence high or medium) | `benignfilter` |
+| Share with a botnet family, and the family that most members have | risk rationale `botnet=` |
+| Share on bulletproof hosting | risk rationale `infra=bulletproof` |
+| Members that sent an HTTP `Authorization` header, and that are not in the scanner table | `l7_events` field `auth` |
+| Share of bulletproof ASNs, and ASNs graded `block_asn` (ASN-level findings) | `asnintel` |
+| Port, service, L7 protocol, HTTP template, population | correlator `key_metrics` |
+| Top port of most members, its share, and the mean SYN-only share | newest per-IP feature snapshot |
+| Number of other findings on the same port that are P2P by member facts | the other findings (set before the rules run) |
+
+**Rules.** The rules have this sequence. The first rule that fires gives
+the verdict. The step keeps all the other rules that fire in
+`also_matched`.
+
+| Rule | Verdict | Fires when |
+|---|---|---|
+| `bt_members` | `benign_p2p` | 50% or more of the members sent BitTorrent |
+| `levin_members` | `benign_p2p` | 50% or more of the members sent Levin (Monero P2P) |
+| `p2p_port` | `benign_p2p` | other findings on the same port are P2P, and each protocol other than P2P has less than 50% of the members |
+| `bt_surge` | `benign_p2p` | the correlator surge is BitTorrent |
+| `rdp_cookie` | `credential_attack` | the correlator found one RDP mstshash cookie from many sources |
+| `botnet_payload` | `exploit_attempt` | 50% or more of the members sent botnet payloads |
+| `http_exploit` | `exploit_attempt` | the HTTP template is an exploit (for example `POST /wsman`), and less than 50% of the members are in the scanner table |
+| `http_credentials` | `credential_attack` | 10 or more members, and 10% or more of the members, sent HTTP credentials |
+| `known_scanner` | `research_scanner` | 50% or more of the members are in the `benignfilter` scanner table |
+| `http_recon` | `service_recon` | the HTTP template finds a target (for example the Docker API or `.env`) |
+| `hostile_infra` | `hostile_infrastructure` | 50% or more of the named ASNs are bulletproof, or 50% or more of the members are on bulletproof hosting (10 or more members, or the full population) |
+| `service_handshake` | `service_recon` | 50% or more of the members sent the L7 protocol of the service |
+| `service_probe` | `service_recon` | the port is a known service, and less than 50% of the members sent the L7 of that service |
+| `recon_pattern` | `service_recon` | the correlator pattern is a recon pattern (wrong transport, telco ports, IPsec, low-and-slow) |
+| `anomaly_pattern` | `protocol_anomaly` | the correlator pattern is ICMP payload, tunnels or TCP state violations |
+| `web_l7` | `service_recon` | 50% or more of the members sent HTTP or TLS |
+| `port_scan` | `service_recon` | the port is not a known service, and 50% or more of the member packets are SYN-only |
+| `asn_context` | `context` | an ASN-level finding with less than 50% bulletproof ASNs |
+
+When the correlator gives no port, the step uses the top port of the
+members, if 50% or more of the members have it. The LIF groups and the
+arrival burst get their port from this rule.
+
+The P2P rules (`bt_members`, `levin_members`, `p2p_port`) do not fire when
+50% or more of the members are in the scanner table. Scanners that send P2P
+probes are scanners, not peers.
+
+When no rule fires, the verdict is `unclassified`. The step does not guess.
+
+**Thresholds.** On the 2026-10-29 corpus the BitTorrent share of a finding
+is 0.74 or more, or 0.25 or less. Thus the limit of 0.5 is in an empty
+interval. The HTTP credential shares are 11.3%, 6.0%, and then 3% or less,
+so the limit is 10%. A smaller group of credential senders goes in the
+`note` column. It does not set the verdict of the finding.
+
+**What the sensor cannot see.**
+
+- The sensor completes only the TCP handshake. It does not send a
+  greeting, a banner or a key exchange.
+- The corpus has 0 telnet, VNC and FTP events, and SSH shows only client
+  banners.
+- Thus the sensor cannot see a login on a service where the server speaks
+  first (SSH, telnet, VNC, FTP, SMTP, MySQL, PostgreSQL, MSSQL). The
+  `service_probe` and `service_handshake` sentences tell this. No rule gives
+  `credential_attack` for these services.
+- The sensor can see HTTP credentials. Of approximately 700 sources that
+  sent credentials, only 1 is in the `benignfilter` scanner table.
+
+**ASN clusters.** The `bp_asn_cluster` findings of the correlator have
+only 0% to 5% bulletproof ASNs (`asnintel` flag). The largest cluster has
+3,902 ASNs, which include tier-1 transit ASNs. Thus these findings get
+`context`: no new action, because the `asnintel` table grades their
+block-grade ASNs at this time.
+`bulletproof_high_density_asns` has 9 of 9 bulletproof ASNs, and it gets
+`hostile_infrastructure`.
+
+Since 2026-10-30, the correlator gives these clusters the category
+`asn-cohost-cluster` and the title "ASN co-hosting cluster", with the
+bulletproof and block-grade counts. Their severity comes from
+`hostile_asn_share` (the share of the ASNs that are bulletproof or
+block-grade): `high` at 50% or more, `medium` at 10% or more, else `low`.
+Before this change, each cluster with 6 or more ASNs got `high`.
+
+**Outputs.**
+
+- `output/conclusions/verdicts.parquet`: one row for each finding. The
+  columns include the verdict, the rule, the ATT&CK technique, the `why`
+  sentence, the action, the basis, the target, the note and the facts as
+  JSON.
+- `output/conclusions/problems.parquet`: the findings with the same
+  verdict and target merged into one problem. `sources` is the number of
+  different member IP addresses. `population_max` is the full population of
+  a finding that keeps only a sample.
+- `output/conclusions/verdicts.md`: the problem table, then one line for
+  each finding.
+
+**Basis.**
+
+- `members`: the facts come from 10 or more members, and the members are
+  the full population.
+- `sample`: fewer than 10 members, or the correlator kept only a sample
+  (for example 12 of 20,599 sources in a `fp_rotation` finding).
+- `asns`: the facts come from the named ASNs.
+- `pattern`: the verdict comes only from the correlator pattern or its
+  `key_metrics`.
+
+**Evaluation** (`src/bench/verdict_eval.py`, 2026-10-30, no API calls).
+The tool compares each verdict with the cached LLM card of the same
+finding. The LLM class is the intent that comes first in the LLM threat
+model text. The tool finds it with a regex table.
+
+| Measure | Value |
+|---|---|
+| Findings | 175 |
+| Coverage (not `unclassified`) | 100% |
+| Same class as the LLM | 44.0% |
+| Same root cause (an LLM "BitTorrent DRDoS" = `benign_p2p`) | 69.1% |
+| 5 builds give the same rows | yes |
+| `verdicts.md` against `conclusions.md` | 27 KB against 883 KB |
+
+Most disagreements are claims of the LLM with no support in the facts:
+
+- "Credential spray" on telnet, VNC and SSH: the sensor cannot see a
+  login on these services.
+- Known research scanners: the LLM did not have the `benignfilter` facts.
+- BitTorrent: the LLM gave "not an attack" for some cards and "DRDoS
+  attack" for other cards with the same facts.
+
+The full list of disagreements is in
+`output/reports/verdict_eval/verdict_eval.md`.
 
 **Output**
 - `report`: makes 25 or more sections. These include Section 0 (summary),
-  Section 0.5 (`Cross-Signal Findings & Conclusions`) and Section 6
-  (campaign start).
+  Section 0.5 (`Cross-Signal Problems`) and Section 6 (campaign start).
+  - Section 0.5 shows the problem table, a legend with one action for each
+    verdict, and one line for each finding. Section 31 shows each
+    storyline with 2 or more findings, and the verdicts of its findings.
+    The report shows no LLM narrative.
   - Section 1 shows the sensor outages. An outage is a run of UTC days
     with no `packets` day partition. `sensor_outages()` reads the
     partition names, and it does not start a query.
@@ -482,6 +648,10 @@ with a `.md` summary. The writer has two important properties:
   that completes. Refer to section 1.
 - The model registry write has a file lock. Thus two parallel runs from
   `--parallel N` cannot replace the entries of the other run.
+- The `verdict` step writes no timestamps, sorts its rows and rounds its
+  shares. Ties go to the first name, not to a DuckDB `mode()` (which
+  selected a different family on each run). `verdict_eval.py` makes 5
+  builds and compares their sha256.
 
 ## 7. Configuration variables
 
@@ -537,7 +707,7 @@ gate failure.
 | 2. Global arrival detector | ESN or NG-RC on vectors for each minute, the prediction error goes into the HTM likelihood layer (`W` of 2 to 8 weeks, Benjamini-Hochberg across series) | Built, gate failure (§9.6) | Flags the three known events. Fewer incorrect alarms each year than the 5x tail-median rule and `stl_z`. |
 | 3. Timing for each source | Event-driven LIF or ALIF with some different `tau` values, only for sources with 20 or more packets | Built, gate failure by 0.01 (§9.7) | Better than `pacing` and an untrained LIF on `jittered_beacon` and `rhythm_change` |
 | 4. Feature and risk inputs | Score columns in `build_ip_features`, then a capped risk term | Built, in the DAG (§9.8). The gate needs operator labels. | Operator precision@k increases. Balance the tier counts again. |
-| 5. Optional research | WTA-STDP port-retina prototypes, Akida demonstration on a Pi 5 | WTA-STDP built, gate failure (§9.9). No Akida hardware. | Only if Phases 1 to 3 show value |
+| 5. Optional research | WTA-STDP port-retina prototypes, Akida demonstration on a Pi 5 | WTA-STDP built, gate failure (§9.9). AKD1500 card installed 2026-10-27 (§9.9). | Only if Phases 1 to 3 show value |
 
 The three known events for Phase 2 are:
 
@@ -1051,6 +1221,30 @@ Code: `src/neuro.py` (DAG step), `src/features/build_ip_features.py`,
   mask, the number of fit days and the seed. One day takes approximately
   85 s with 4 workers (`--hdc-workers`), and each worker uses
   approximately 3.5 GB.
+- GPU path (2026-10-27): `sg/hdc_gpu.py` does the HDC encoder and the
+  prototype step with ROCm or CUDA PyTorch. `--hdc-device auto` (the
+  default) uses the GPU when PyTorch finds one. On the GPU, the default is
+  2 workers, because the integrated GPU uses host memory. Each worker
+  releases the PyTorch memory pool after each day.
+  - The encoder rows are bit-exact with the CPU encoder.
+  - The prototypes use integer dot values with no rounding (fp16 `matmul`
+    on blocks of 2048 columns, added in float64). The CPU path
+    adds in float32. That rounding changes approximately 90 % of the
+    centroid parts that are 0 into +1 or -1. The GPU keeps them at
+    0 (weight 1e-3), as the design says. Thus `hdc_proto` is not fully the
+    same on the two paths: Spearman 0.995 to 0.999, top-100 overlap 0.92.
+  - The cache key adds `sg/hdc_gpu.py` and the device. A change of device
+    calculates all days again.
+  - `bench/hdc_gpu_check.py` compares the two paths on 4 days. Its report
+    is `output/reports/hdc_gpu/hdc_gpu_check.md`.
+- DuckDB memory: `neuro._sessions_retry` runs the session query again with
+  4 times more `hash(src_ip)` buckets after an out-of-memory error (the
+  same rows), and then with a 16 GB limit. DuckDB can stop the process
+  with a heap error (`GroupedAggregateHashTable::Destroy`) when it cleans
+  up after an out-of-memory error. The `hdc_gpu_gate.py` run at a 4 GB
+  limit had this crash 4 times. With the 12 GB default, the error did not
+  occur. Thus use a memory limit that prevents the error, not the retry
+  as the only protection.
 - When `arrival_scores_full.parquet` is available, the step also counts the
   alarm minutes in which each source sent packets. The alarms are the
   minutes at 1 alarm minute each day of `stl_z` (the Phase 2 result).
@@ -1174,8 +1368,26 @@ recorded sources with 5 or more packets plus its own sources.
 recorded sources hit port mixes that no prototype has, so a source with
 one changed port is not unusual. STDP and k-means give the same result.
 
-The Akida demonstration must have a BrainChip Akida device on a Raspberry Pi 5.
-This hardware is not available, so that part of Phase 5 did not run.
+**AKD1500 card (2026-10-27).** The operator installed a BrainChip AKD1500
+PCIe card in the host (not on a Raspberry Pi 5). It operates with a driver
+that the operator built for kernel 7.0 (`/dev/akd1500_0`). The vendor
+Python package must have TensorFlow and Python 3.12 or older. There is no
+ROCm TensorFlow for Python 3.14. Thus `src/sg/akd/` is a pybind11 binding
+to libakida 2.19.3, and the models train in PyTorch.
+
+- `bench/akd_check.py` compares the card, the libakida software and a
+  NumPy reference (`fc_reference`). The timing model H1 (4-bit weights)
+  maps to one hardware sequence and is bit-exact on the card.
+- Fault: with 1-bit weights and 15 to 32 units, output unit 13 uses the
+  `act_step` of unit 14. `akd_check.py` found 742 mismatches in 2,171,664
+  outputs, all of this type. The cause is in libakida or in the driver.
+  Do not use 1-bit weights on the card. The full report is
+  `KNOWN_ISSUE_1BIT_STEP.md` in the driver folder.
+- Speed of H1: 17.4 µs for each window on the card (batches), 39 µs for
+  one call, 0.78 µs in the libakida software on the CPU and 2.8 µs with
+  NumPy. The PCIe cost is larger than the calculation of this small model.
+- There is no energy measurement. No AKD1500 result goes into the
+  production pipeline.
 
 ### 9.10 Round 2 v0.1: harness v2 and the first round again
 
@@ -1362,3 +1574,72 @@ difference". At k = 100 the two detectors find 91% (test) and 94%
 (development) of the same sources. The files are
 `harness2_hdc_eval_summary_gpu.md` and
 `harness2_hdc_eval_summary_devra_gpu.md`.
+
+**Neuro flags in the storylines (2026-10-28).** `correlate.py` makes one
+finding for each day with a group of HDC or LIF flags
+(`pat_neuro_hdc_group`, `pat_neuro_lif_group`). `graph.py` gets the
+entity types `payload`, `port`, `day` and `l7` from the packets of the
+members of each finding. With these types, the 59618 groups of
+2025-08-16 to 2025-08-18 are one storyline. The HDC group of 2026-05-19
+is in the storyline of the push of that day. The rules and the results
+are in `docs/NEUROMORPHIC_NEXT_PATHS.md` §8.
+
+Four more patterns change report facts into findings. They are miner
+rules for a protocol on an unusual port, and new ports in the landscape
+monthly top ranks. They are also `l7` protocol surges, and `chainfp`
+chains that occur only in a short burst. With them, the 59618 storyline
+has 8 findings from 6 analyzers.
+The IP entity of the graph does not contain the known scanners
+(`scannerintel` sources with a `benign_org` value). The scanners keep
+their findings, flags and risk scores.
+
+The `kg` stage also reads the plaintext BitTorrent handshakes (68 bytes,
+length byte 19) in the packets of each finding's member sample. For each
+finding with 10 or more senders that are also 25% or more of the
+sample, it records these facts in the
+`handshake_facts` column of `storylines.parquet`:
+
+- the number of senders in the sample
+- the protocol strings
+- the peer-ID prefixes, which name the client software
+- the number of infohashes
+- the ports
+
+The opt-in `conclude` step adds these facts to the storyline prompt. (The
+`verdict` step uses the BitTorrent share of all the members.) Then the
+model can tell a P2P swarm (one peer-ID prefix, few infohashes) from an
+attack that only uses BitTorrent ports. Each peer-ID prefix in the prompt
+has a client name from `PEER_ID_CLIENTS` (well-known client codes) or the
+text "unidentified client". The prompt tells the model not to guess a
+vendor or a country for an unidentified client. A storyline without these facts
+gets the same prompt as before, so conclude uses its cached answer again.
+
+Since 2026-10-29, the prompt for each finding card (report section 0.5)
+also gets the facts of its finding. `conclude` reads them from all
+storylines, and a storyline with one finding is also included. A finding
+without facts gets the same prompt as before.
+
+**BitTorrent share of a neuro group (2026-10-29).** A P2P swarm makes
+neuro groups, because its peers share one session shape and one timing.
+For each group day, `correlate.py` counts the group sources that sent a
+packet with the `bittorrent` l7 label on that day. The value goes into
+`key_metrics.bittorrent_sources`. When the share is
+`NEURO_P2P_SHARE` (0.5) or more, the finding has the severity "low", and
+its title shows the share. The finding stays in the report.
+
+The l7 label shows only the plaintext handshake. An encrypted (MSE)
+handshake does not get the label, so a swarm with many encrypted peers
+can stay below the share.
+
+**Proposals A1 and C1 (2026-10-29).** `src/sg/context.py` gives the
+calibration with context (A1). `neuro_surprisal` in
+`compute_risk_score.py` gives the combined surprisal term (C1). The
+defaults (`--calibration count`, `NEURO_TERM = "capped"`) keep the
+production scores. Neither proposal got the result `pass`.
+
+A1 increased the flagged escalation rate from 0.0005 to 0.0040. But the
+flagged sources escalated less than the control sources. The results are
+in `docs/NEUROMORPHIC_NEXT_PATHS.md` §8a.
+
+On 2026-10-29 the operator turned on the calibration with context for
+the `neuro` stage. The risk term stays `capped`.

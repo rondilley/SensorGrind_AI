@@ -17,8 +17,10 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import pyarrow as pa
@@ -79,7 +81,12 @@ mid-stream TCP payloads, or banner echoes are all anomalous on their
 face.  Frame your analysis from a defender's perspective: what does the
 combination of signals tell us, and what would a defender at a real
 service-provider see if this attacker turned the same toolkit on their
-production estate?"""
+production estate?
+
+BitTorrent peers that send packets to the sensor have its address in a
+peer list.  The sensor data does not show where that list came from
+(DHT, tracker or peer exchange), so do not name a source for it and do
+not use the term "DHT"; say "peer list"."""
 
 
 PROMPT_TEMPLATE = """You are a senior threat-intel analyst.  Write a structured conclusion for one cross-signal finding from a long-running internet honeypot.
@@ -109,7 +116,7 @@ PROMPT_TEMPLATE = """You are a senior threat-intel analyst.  Write a structured 
 
 ```json
 {key_metrics}
-```
+```{handshake_block}
 
 # Your task
 
@@ -128,8 +135,15 @@ Reply with strict JSON (no markdown fences, no prose outside the JSON):
 Return ONLY the JSON object."""
 
 
-def _prompt(f: dict) -> str:
+def _prompt(f: dict, bt: dict | None = None) -> str:
+    """``bt``: the kg handshake facts of this finding, if any."""
+    block = ""
+    if bt:
+        block = _handshake_text(
+            "the packets of a sample of this finding's sources",
+            [_bt_fact_lines("This finding", bt)])
     return PROMPT_TEMPLATE.format(
+        handshake_block=block,
         sensor_context=SENSOR_CONTEXT,
         pattern_id=f["pattern_id"],
         pattern_title=f["pattern_title"],
@@ -167,6 +181,158 @@ def _cache_key(provider: str, model: str, prompt: str, stem: str = "conclude") -
     sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     safe_model = model.replace("/", "_").replace(":", "_")
     return CACHE / f"{stem}_{provider}_{safe_model}_{sha}.json"
+
+
+def _sha(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str)
+                          .encode("utf-8")).hexdigest()
+
+
+# Fields of a finding that its card prompt shows.  A change to any of them is a
+# change to the facts; a change to the prompt text around them is not.
+_CARD_FACT_FIELDS = ("pattern_id", "pattern_title", "severity", "category",
+                     "src_ip_count", "src_ips_sample", "asns_sample",
+                     "countries_sample", "first_seen", "last_seen",
+                     "evidence_refs", "key_metrics")
+
+
+def _card_facts(f: dict, bt: dict | None) -> str:
+    return _sha([{k: f.get(k) for k in _CARD_FACT_FIELDS}, bt or {}])
+
+
+def _story_facts(story: dict, members: list[dict]) -> str:
+    return _sha([story.get("linking_entities"), story.get("handshake_facts"),
+                 [{k: f.get(k) for k in ("finding_id",) + _CARD_FACT_FIELDS}
+                  for f in members]])
+
+
+# Provider errors after which no later call can succeed in this run.
+_FATAL_ERRORS = ("credit balance", "insufficient_quota", "billing",
+                 "invalid x-api-key", "authentication_error", "permission_error")
+
+
+class AICache:
+    """The AI outputs of the cards and storylines, and the calls that make them.
+
+    The output file of a prompt is still keyed by sha256 of the full prompt.
+    ``ai_cache/conclude_index.jsonl`` also records, for each output, the item
+    id, the model, a hash of the item's facts and a hash of the shared prompt
+    text (instructions).  An item whose facts did not change keeps its output
+    when only the instructions change; ``--refresh-instructions`` or
+    ``--redo-match`` make new outputs for it.  When a call fails or is not
+    made (``--max-calls``, ``--dry-run``, a fatal provider error), the item
+    keeps its newest earlier output, so a card is not left empty."""
+
+    def __init__(self, args, provider: dict, api_key: str, model: str):
+        self.INDEX = CACHE / "conclude_index.jsonl"
+        self.args, self.provider, self.api_key, self.model = (
+            args, provider, api_key, model)
+        for k, v in (("dry_run", False), ("max_calls", 0),
+                     ("refresh_instructions", False), ("redo_match", None)):
+            if not hasattr(args, k):
+                setattr(args, k, v)
+        self.redo = re.compile(args.redo_match, re.I) if args.redo_match else None
+        self.stop_reason: str | None = None
+        self.calls = 0
+        self.prompt_chars = 0
+        self.stats: Counter = Counter()
+        self.index: dict[tuple, list[dict]] = {}
+        if self.INDEX.exists():
+            for line in self.INDEX.read_text().splitlines():
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                self.index.setdefault((e["kind"], e["id"], e["model"]), []).append(e)
+
+    def _record(self, kind, item_id, path: Path, facts: str, instr: str) -> None:
+        key = (kind, item_id, self.model)
+        if any(e["file"] == path.name and e["facts"] == facts and e["instr"] == instr
+               for e in self.index.get(key, [])):
+            return
+        e = {"kind": kind, "id": item_id, "model": self.model,
+             "provider": self.provider["name"], "facts": facts, "instr": instr,
+             "file": path.name,
+             "at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
+        self.index.setdefault(key, []).append(e)
+        CACHE.mkdir(parents=True, exist_ok=True)
+        with self.INDEX.open("a") as fh:
+            fh.write(json.dumps(e) + "\n")
+
+    def _load(self, e: dict | None) -> dict | None:
+        p = CACHE / e["file"] if e else None
+        return json.loads(p.read_text()) if p and p.exists() else None
+
+    def _wanted(self, parsed: dict) -> bool:
+        """True when the cached output is good enough to keep."""
+        return not (self.redo and self.redo.search(json.dumps(parsed)))
+
+    def get(self, kind: str, item_id: str, prompt: str, facts: str,
+            instr: str, label: str) -> dict | None:
+        if self.provider["name"] == "none":
+            return None
+        stem = "conclude" if kind == "card" else "storyline"
+        exact = _cache_key(self.provider["name"], self.model, prompt, stem=stem)
+        entries = self.index.get((kind, item_id, self.model), [])
+        if exact.exists() and not self.args.force:
+            parsed = json.loads(exact.read_text())
+            self._record(kind, item_id, exact, facts, instr)
+            if self._wanted(parsed):
+                self.stats["cached"] += 1
+                return parsed
+        elif not (self.args.force or self.args.refresh_instructions):
+            same = [e for e in entries if e["facts"] == facts]
+            parsed = self._load(same[-1]) if same else None
+            if parsed is not None and self._wanted(parsed):
+                self.stats["reused"] += 1
+                return parsed
+
+        older = self._load(entries[-1]) if entries else None
+        if self.args.dry_run:
+            self.stats["would_call"] += 1
+            self.prompt_chars += len(prompt)
+            return older
+        if self.stop_reason or (self.args.max_calls and self.calls >= self.args.max_calls):
+            self.stats["not_called"] += 1
+            return self._fallback(older)
+
+        print(f"[conclude] {label} -> {self.provider['name']}/{self.model}...",
+              file=sys.stderr)
+        self.calls += 1
+        parsed = None
+        try:
+            parsed = self.provider["call"](self.api_key, self.model, prompt)
+        except Exception as e:
+            print(f"[conclude] call failed: {e}", file=sys.stderr)
+            if any(s in str(e).lower() for s in _FATAL_ERRORS):
+                self.stop_reason = str(e)[:200]
+                print("[conclude] fatal provider error: no more calls in this run",
+                      file=sys.stderr)
+        time.sleep(self.args.sleep)
+        if parsed is None:
+            self.stats["failed"] += 1
+            return self._fallback(older)
+        exact.write_text(json.dumps(parsed, indent=2))
+        self._record(kind, item_id, exact, facts, instr)
+        self.stats["fresh"] += 1
+        return parsed
+
+    def _fallback(self, older: dict | None) -> dict | None:
+        if older is not None:
+            self.stats["kept_older"] += 1
+        return older
+
+    def summary(self) -> str:
+        s = self.stats
+        text = (f"cached {s['cached']}, reused {s['reused']} (facts same, "
+                f"instructions changed), fresh {s['fresh']}, failed {s['failed']}, "
+                f"not called {s['not_called']}, kept older output {s['kept_older']}")
+        if self.args.dry_run:
+            text += (f"; would call {s['would_call']} "
+                     f"(~{self.prompt_chars // 4:,} prompt tokens)")
+        if self.stop_reason:
+            text += f"; stopped: {self.stop_reason}"
+        return text
 
 
 def _bullets(v) -> str:
@@ -231,7 +397,7 @@ They were fused because they share: {link_reason}.
 
 # The member findings ({n} total)
 
-{member_block}
+{member_block}{handshake_block}
 
 # Your task
 
@@ -262,6 +428,93 @@ def _story_member_block(members: list[dict]) -> str:
     return "\n\n".join(out)
 
 
+# Azureus-style peer-ID client codes (the 2 letters after the leading '-') with
+# a well-known owner.  The prompt names a client only from this table; any other
+# code is shown as unidentified, so the model does not invent a vendor for it.
+PEER_ID_CLIENTS = {
+    "AG": "Ares", "AZ": "Azureus/Vuze", "BC": "BitComet", "BI": "BiglyBT",
+    "BT": "BitTorrent (mainline)", "BW": "BitTorrent Web", "DE": "Deluge",
+    "FD": "Free Download Manager", "FG": "FlashGet", "KT": "KTorrent",
+    "LT": "libtorrent (rakshasa)", "lt": "libtorrent (rasterbar)",
+    "qB": "qBittorrent", "SD": "Thunder (Xunlei)", "TL": "Tribler",
+    "TR": "Transmission", "UE": "uTorrent embedded", "UM": "uTorrent Mac",
+    "UT": "uTorrent", "UW": "uTorrent Web", "XL": "Xunlei",
+}
+
+
+def _peer_client(prefix: str) -> str:
+    code = prefix[1:3] if len(prefix) == 8 and prefix[0] == "-" else ""
+    name = PEER_ID_CLIENTS.get(code)
+    return f"{prefix} = {name}" if name else f"{prefix} = unidentified client"
+
+
+def _handshake_block(story: dict, members: list[dict]) -> str:
+    """The BitTorrent handshake facts kg read from the members' packets.  Empty
+    when there are none, so the prompt (and its cache key) does not change."""
+    try:
+        facts = json.loads(story.get("handshake_facts") or "{}")
+    except (ValueError, TypeError):
+        facts = {}
+    lines = [_bt_fact_lines(f"Finding {i} (`{f['pattern_id']}`)", facts[f["finding_id"]])
+             for i, f in enumerate(members, 1) if facts.get(f["finding_id"])]
+    return _handshake_text("the packets of a sample of each finding's sources",
+                           lines)
+
+
+def _load_handshake_facts() -> dict[str, dict]:
+    """finding_id -> kg handshake facts, from every storyline (singletons too)."""
+    path = STORY_DIR / "storylines.parquet"
+    if not path.exists():
+        return {}
+    out: dict[str, dict] = {}
+    for s in pq.read_table(path, columns=["handshake_facts"]).to_pylist():
+        try:
+            out.update(json.loads(s.get("handshake_facts") or "{}"))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def _bt_fact_lines(label: str, bt: dict) -> str:
+    n, of = bt["handshake_sources"], bt["sampled_sources"]
+    share = f" ({n / of:.0%})" if of else ""
+
+    def top(key: str, name=str) -> str:
+        return ", ".join(f"{name(v)} ({k:,})"
+                         for v, k in bt.get(key, [])) or "(none)"
+    return (
+        f"- {label}: {n:,} of {of:,} sampled "
+        f"sources{share} sent a BitTorrent handshake; "
+        f"{bt['infohashes']:,} distinct infohashes.\n"
+        f"  - protocol strings (sources): {top('protocol_strings')}\n"
+        f"  - peer-ID prefixes (sources): {top('peer_id_prefixes', _peer_client)}\n"
+        f"  - ports (sources): {top('ports')}")
+
+
+def _handshake_text(where: str, lines: list[str]) -> str:
+    if not lines:
+        return ""
+    return (
+        "\n\n# BitTorrent handshakes in the member sources' packets\n\n"
+        "These are plaintext 68-byte BitTorrent handshakes (length byte 19) "
+        f"found in {where}.  A "
+        "BitTorrent client sends this handshake to an address it takes to be a "
+        "peer in the same torrent swarm.  It carries a 19-byte protocol string "
+        "(\"BitTorrent protocol\" in the standard client; \"custom\" shows a "
+        "non-text string in hex), the 20-byte infohash of the torrent, and the "
+        "sender's peer ID.  The first 8 bytes of the peer ID name the client "
+        "software and version (Azureus style, for example -qB4630- for "
+        "qBittorrent 4.6.3).  Few infohashes and one peer-ID prefix across many "
+        "sources show one client family that shares a small set of torrents.  "
+        "Use these facts when you decide between a P2P swarm and an attack.  "
+        "Each prefix comes with its client name from a table of well-known "
+        "client codes.  Name a client only as given there.  For an "
+        "\"unidentified client\", say that the client is not identified: do "
+        "not guess its vendor, product or country from the prefix, the protocol "
+        "string or the source networks.\n\n"
+        + "\n".join(lines))
+
+
 def _storyline_prompt(story: dict, members: list[dict]) -> str:
     try:
         link_counts = json.loads(story.get("linking_entities") or "{}")
@@ -273,6 +526,7 @@ def _storyline_prompt(story: dict, members: list[dict]) -> str:
         sensor_context=SENSOR_CONTEXT,
         link_reason="; ".join(reasons),
         member_block=_story_member_block(members),
+        handshake_block=_handshake_block(story, members),
     )
 
 
@@ -284,14 +538,25 @@ def _load_storylines() -> list[dict]:
     return [r for r in rows if int(r.get("finding_count") or 0) >= 2]
 
 
-def synthesize_storylines(args, provider, api_key, model,
+def _card_instr() -> str:
+    """Hash of the shared card prompt text (not the facts of one finding)."""
+    return _sha([SENSOR_CONTEXT, PROMPT_TEMPLATE, _handshake_text("", ["-"]),
+                 PEER_ID_CLIENTS])
+
+
+def _story_instr() -> str:
+    return _sha([SENSOR_CONTEXT, STORYLINE_PROMPT_TEMPLATE,
+                 _handshake_text("", ["-"]), PEER_ID_CLIENTS, _LINK_GLOSS])
+
+
+def synthesize_storylines(args, cache: AICache,
                           findings_by_id: dict[str, dict]) -> list[dict]:
     """Campaign-level narratives for multi-finding storylines.  Returns the
     written rows (for the markdown roll-up); writes storyline_conclusions.parquet.
     Singletons are skipped — their per-finding card already covers them."""
     stories = _load_storylines()
     out_rows: list[dict] = []
-    n_cached = n_called = n_failed = 0
+    instr = _story_instr()
     for s in stories:
         try:
             member_ids = json.loads(s["finding_ids"])
@@ -300,29 +565,10 @@ def synthesize_storylines(args, provider, api_key, model,
         members = [findings_by_id[m] for m in member_ids if m in findings_by_id]
         if len(members) < 2:
             continue
-        prompt = _storyline_prompt(s, members)
-        parsed: dict | None = None
-        if provider["name"] != "none":
-            cache_p = _cache_key(provider["name"], model, prompt, stem="storyline")
-            if cache_p.exists() and not args.force:
-                parsed = json.loads(cache_p.read_text())
-                n_cached += 1
-            else:
-                print(f"[conclude] storyline {s['storyline_id']} "
-                      f"({len(members)} findings) -> {provider['name']}/{model}...",
-                      file=sys.stderr)
-                try:
-                    parsed = provider["call"](api_key, model, prompt)
-                except Exception as e:
-                    print(f"[conclude] storyline call failed: {e}", file=sys.stderr)
-                if parsed is None:
-                    n_failed += 1
-                else:
-                    cache_p.write_text(json.dumps(parsed, indent=2))
-                    n_called += 1
-                time.sleep(args.sleep)
-        if parsed is None:
-            parsed = {}
+        parsed = cache.get(
+            "story", s["storyline_id"], _storyline_prompt(s, members),
+            _story_facts(s, members), instr,
+            f"storyline {s['storyline_id']} ({len(members)} findings)") or {}
         out_rows.append({
             "storyline_id":     s["storyline_id"],
             "finding_count":    int(s["finding_count"]),
@@ -334,8 +580,8 @@ def synthesize_storylines(args, provider, api_key, model,
             "linking_entities": s["linking_entities"],
             "first_seen":       s["first_seen"],
             "last_seen":        s["last_seen"],
-            "provider":         provider["name"],
-            "model":            model,
+            "provider":         cache.provider["name"],
+            "model":            cache.model,
             "ai_title":              str(parsed.get("ai_title", "")),
             "ai_campaign_summary":   str(parsed.get("ai_campaign_summary", "")),
             "ai_why_connected":      str(parsed.get("ai_why_connected", "")),
@@ -345,6 +591,8 @@ def synthesize_storylines(args, provider, api_key, model,
             "synthesized_at":   _dt.datetime.now(_dt.timezone.utc),
         })
 
+    if args.dry_run:
+        return out_rows
     STORY_DIR.mkdir(parents=True, exist_ok=True)
     pq.write_table(
         pa.Table.from_pylist(out_rows, schema=STORYLINE_CONCLUSION_SCHEMA),
@@ -352,9 +600,7 @@ def synthesize_storylines(args, provider, api_key, model,
         compression="zstd", compression_level=3,
     )
     if stories:
-        print(f"[conclude] {len(out_rows)} storyline narratives "
-              f"(cache {n_cached}, fresh {n_called}, fail {n_failed})",
-              file=sys.stderr)
+        print(f"[conclude] {len(out_rows)} storyline narratives", file=sys.stderr)
     return out_rows
 
 
@@ -404,33 +650,16 @@ def run(args: argparse.Namespace) -> int:
               file=sys.stderr)
 
     out_rows: list[dict] = []
-    n_cached = n_called = n_failed = 0
+    cache = AICache(args, provider, api_key, model)
+    instr = _card_instr()
+    bt_facts = _load_handshake_facts()
     for i, f in enumerate(findings):
         if args.limit and i >= args.limit:
             break
-        prompt = _prompt(f)
-        parsed: dict | None = None
-        if provider["name"] != "none":
-            cache_p = _cache_key(provider["name"], model, prompt)
-            if cache_p.exists() and not args.force:
-                parsed = json.loads(cache_p.read_text())
-                n_cached += 1
-            else:
-                print(f"[conclude] {i+1}/{len(findings)} {f['pattern_id']} -> "
-                      f"{provider['name']}/{model}...", file=sys.stderr)
-                try:
-                    parsed = provider["call"](api_key, model, prompt)
-                except Exception as e:
-                    print(f"[conclude] call failed: {e}", file=sys.stderr)
-                if parsed is None:
-                    n_failed += 1
-                else:
-                    cache_p.write_text(json.dumps(parsed, indent=2))
-                    n_called += 1
-                time.sleep(args.sleep)
-
-        if parsed is None:
-            parsed = {}
+        bt = bt_facts.get(f["finding_id"])
+        parsed = cache.get(
+            "card", f["finding_id"], _prompt(f, bt), _card_facts(f, bt), instr,
+            f"{i+1}/{len(findings)} {f['pattern_id']}") or {}
 
         out_rows.append({
             "finding_id":            f["finding_id"],
@@ -459,16 +688,20 @@ def run(args: argparse.Namespace) -> int:
             "synthesized_at":        _dt.datetime.now(_dt.timezone.utc),
         })
 
+    # Cross-finding pass: campaign-level narratives over the storylines the kg
+    # stage fused.  Reuses the same provider/cache; writes its own parquet.
+    findings_by_id = {f["finding_id"]: f for f in findings}
+    story_rows = synthesize_storylines(args, cache, findings_by_id)
+    print(f"[conclude] AI outputs: {cache.summary()}", file=sys.stderr)
+    if args.dry_run:
+        print("[conclude] dry run: no calls made, no files written", file=sys.stderr)
+        return 0
+
     pq.write_table(
         pa.Table.from_pylist(out_rows, schema=CONCLUSION_SCHEMA),
         OUT_DIR / "conclusions.parquet",
         compression="zstd", compression_level=3,
     )
-
-    # Cross-finding pass: campaign-level narratives over the storylines the kg
-    # stage fused.  Reuses the same provider/cache; writes its own parquet.
-    findings_by_id = {f["finding_id"]: f for f in findings}
-    story_rows = synthesize_storylines(args, provider, api_key, model, findings_by_id)
 
     sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     out_sorted = sorted(out_rows, key=lambda r: sev_order.get(r["severity"], 9))
@@ -477,7 +710,7 @@ def run(args: argparse.Namespace) -> int:
           f"_Generated by `conclusions/synthesize.py` on "
           f"{_dt.datetime.now(_dt.timezone.utc).isoformat(timespec='seconds')}.  "
           f"AI: {provider['name']} / {model}.  "
-          f"Cache hits: {n_cached}, fresh calls: {n_called}, failures: {n_failed}._",
+          f"AI outputs: {cache.summary()}._",
           "",
           "Each card below is a pattern the correlator detected across two or more "
           "analyzers.  The AI-written conclusion explains *what* happened, *why* "
@@ -595,6 +828,14 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--sleep", type=float, default=0.3)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="count the calls a run would make; make no calls, write no files")
+    ap.add_argument("--max-calls", type=int, default=0,
+                    help="stop calling the provider after N calls (0 = no limit)")
+    ap.add_argument("--refresh-instructions", action="store_true",
+                    help="make new outputs when only the shared prompt text changed")
+    ap.add_argument("--redo-match", default=None, metavar="REGEX",
+                    help="make new outputs only for items whose cached output matches")
     args = ap.parse_args()
     return run(args)
 

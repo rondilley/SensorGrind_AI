@@ -38,6 +38,7 @@ import pyarrow.parquet as pq
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sg import features as sf
 from sg import lib
+from conclusions import verdict
 # Rendering primitives moved to render.py so this file can focus on
 # section composition.  Re-export the constants the rest of the code
 # expects so existing call sites keep working.
@@ -667,24 +668,25 @@ def run(args: argparse.Namespace) -> int:
             ORDER BY shared_campaigns DESC LIMIT 25
         """).fetchall()
 
-    # ---- cross-signal conclusions ----
-    # Produced by conclusions/correlate + conclusions/synthesize.  Each
-    # row is one rule-matched pattern + the LLM-written narrative.
-    conclusions_rows: list[dict] = []
-    concl_path = lib.OUTPUT_DIR / "conclusions" / "conclusions.parquet"
-    if concl_path.exists():
-        try:
-            cols = con.execute(
-                f"DESCRIBE SELECT * FROM read_parquet('{concl_path}')"
-            ).fetchall()
-            col_names = [c[0] for c in cols]
-            for r in con.execute(
-                f"SELECT * FROM read_parquet('{concl_path}')"
-            ).fetchall():
-                conclusions_rows.append(dict(zip(col_names, r)))
-        except Exception as e:
-            print(f"[report] could not read conclusions.parquet: {e}",
-                  file=sys.stderr)
+    # ---- cross-signal problems (deterministic verdicts) ----
+    # conclusions/correlate finds the patterns; conclusions/verdict gives
+    # each one a fact-based verdict and merges them into problems.  No LLM:
+    # the opt-in synthesize narratives are not part of the report.
+    problem_rows: list[dict] = []
+    verdict_rows: list[dict] = []
+    concl_dir = lib.OUTPUT_DIR / "conclusions"
+    try:
+        if (concl_dir / "problems.parquet").exists():
+            problem_rows = pq.read_table(concl_dir / "problems.parquet").to_pylist()
+        if (concl_dir / "verdicts.parquet").exists():
+            titles = {f["finding_id"]: f["pattern_title"] for f in pq.read_table(
+                concl_dir / "findings.parquet",
+                columns=["finding_id", "pattern_title"]).to_pylist()}
+            verdict_rows = pq.read_table(concl_dir / "verdicts.parquet").to_pylist()
+            for r in verdict_rows:
+                r["title"] = titles.get(r["finding_id"], r["pattern_id"])
+    except Exception as e:
+        print(f"[report] could not read verdicts/problems: {e}", file=sys.stderr)
 
     con.close()
 
@@ -732,15 +734,16 @@ def run(args: argparse.Namespace) -> int:
     if auto_rules:
         P(f"- **{len(auto_rules):,} new behavioral rules** auto-promoted "
           f"this run — review and deploy. See Section 13.")
-    if conclusions_rows:
-        sev_count = {"critical": 0, "high": 0, "medium": 0, "low": 0}
-        for r in conclusions_rows:
-            sev_count[r["severity"]] = sev_count.get(r["severity"], 0) + 1
-        sev_summary = ", ".join(
-            f"**{n} {s}**" for s, n in sev_count.items() if n
-        )
-        P(f"- **{len(conclusions_rows)} cross-signal findings** "
-          f"({sev_summary}) flagged by the correlator — see Section 0.5.")
+    act_probs = [p for p in problem_rows if p["verdict"] in verdict.ACT_VERDICTS]
+    if problem_rows:
+        n_benign = sum(p["finding_count"] for p in problem_rows
+                       if p["verdict"] in ("benign_p2p", "research_scanner"))
+        n_uncl = sum(p["finding_count"] for p in problem_rows
+                     if p["verdict"] == "unclassified")
+        P(f"- **{len(verdict_rows)} cross-signal findings → "
+          f"{len(problem_rows)} problems**: **{len(act_probs)} need action**, "
+          f"{n_benign} findings are benign (BitTorrent peers, known scanners), "
+          f"{n_uncl} are unclassified — see Section 0.5.")
     P("")
     if risk_top:
         P("### Top 5 threat IPs (by composite risk score)\n")
@@ -774,6 +777,10 @@ def run(args: argparse.Namespace) -> int:
         P("")
     P("### Recommended next steps\n")
     rec_steps: list[str] = []
+    for p in act_probs:
+        rec_steps.append(
+            f"**{p['verdict']}: {p['target']}** "
+            f"(sources: {verdict.sources_text(p)}) — {p['action']}")
     if crit_n:
         rec_steps.append(
             f"Pull the **{crit_n:,} critical-tier IPs** from Section 1 "
@@ -806,117 +813,40 @@ def run(args: argparse.Namespace) -> int:
     P("")
     P("---")
 
-    # ---------- 0.5 Cross-Signal Findings & Conclusions ----------
-    # Each entry is a pattern the correlator matched across two or more
-    # analyzers, plus the AI-written conclusion (what / why-noteworthy /
-    # threat-model / risk / recommended-action).  The point of this
-    # section is to STOP the report from saying "this is noteworthy"
-    # without explaining why.  When the synthesize stage has no AI
-    # provider, the AI fields are blank and only the rule-detected
-    # metadata is rendered.
-    if conclusions_rows:
-        H(2, "0.5 Cross-Signal Findings & Conclusions")
-        P("**What this section shows:** patterns that only become visible "
-          "when two or more analyzers' outputs are looked at *together*.  "
-          "Each card explains what the combination of signals is, why it's "
-          "anomalous in the context of an unsolicited-inbound honeypot, "
-          "the closest real-world threat model, and what a defender "
-          "should do about it this week.  Findings come from "
-          "`output/conclusions/findings.parquet` (rule-based correlator) "
-          "with narratives written by `conclusions/synthesize.py`.")
+    # ---------- 0.5 Cross-Signal Problems ----------
+    # Findings from the correlator with a deterministic verdict each
+    # (conclusions/verdict.py), merged into problems by (verdict, target).
+    # Every verdict names the rule and the facts that made it fire, so the
+    # same corpus always gives the same table.
+    H(2, "0.5 Cross-Signal Problems")
+    if problem_rows:
+        P("**What this section shows:** the correlator's findings, each with a "
+          "verdict from fixed rules over measured facts (L7 protocol share, "
+          "known-scanner share, botnet payloads, bulletproof hosting, HTTP "
+          "credentials).  Findings with the same verdict and target are one "
+          "problem.  `sources` counts distinct member IPs; `of >= N` shows the "
+          "full population when a finding keeps only a sample.  Rules: "
+          "`src/conclusions/verdict.py`.  No rule fired → `unclassified`.")
         P("")
-        sev_emoji = {"critical": "[CRIT]", "high": "[HIGH]",
-                     "medium": "[MED]",  "low":  "[LOW]"}
-        sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-        sorted_concl = sorted(conclusions_rows,
-                              key=lambda r: sev_order.get(r["severity"], 9))
-        P("### Index of findings\n")
-        P("| sev | title | sources | category | jump |")
-        P("| --- | --- | --- | --- | --- |")
-        for r in sorted_concl:
-            title0 = r["ai_title"] or r["pattern_title"]
-            anchor = f"#05-{r['pattern_id'].replace('_', '-')}"
-            P(f"| {sev_emoji.get(r['severity'], r['severity'])} | "
-              f"{title0} | {r['src_ip_count']} | {r['category']} | "
-              f"[jump]({anchor}) |")
+        P("### Problems\n")
+        for line in verdict.problem_table(problem_rows):
+            P(line)
         P("")
-        for r in sorted_concl:
-            title1 = r["ai_title"] or r["pattern_title"]
-            sev_tag = sev_emoji.get(r["severity"], r["severity"].upper())
-            slug = r["pattern_id"].replace("_", "-")
-            # Use an HTML anchor so the link target survives markdown
-            # heading-slug normalization across renderers.
-            md.append(f'\n<a id="05-{slug}"></a>')
-            H(3, f"{sev_tag} {title1}")
-            meta_bits = [
-                f"pattern: `{r['pattern_id']}`",
-                f"category: {r['category']}",
-                f"sources: {r['src_ip_count']}",
-            ]
-            if r.get("ai_confidence"):
-                meta_bits.append(f"confidence: {r['ai_confidence']}")
-            if r.get("first_seen") or r.get("last_seen"):
-                meta_bits.append(
-                    f"seen: {r['first_seen'] or '?'} -> "
-                    f"{r['last_seen'] or '?'}"
-                )
-            P(f"_{' | '.join(meta_bits)}_")
-            P("")
-            if r["ai_what"]:
-                P(f"**What:** {r['ai_what']}")
-                P("")
-            if r["ai_why_noteworthy"]:
-                P(f"**Why it's noteworthy:** {r['ai_why_noteworthy']}")
-                P("")
-            if r["ai_threat_model"]:
-                P(f"**Threat model:** {r['ai_threat_model']}")
-                P("")
-            if r["ai_risk_if_realized"]:
-                P(f"**Risk if realized:** {r['ai_risk_if_realized']}")
-                P("")
-            if r["ai_recommended_action"]:
-                P("**Recommended action:**\n")
-                for line in r["ai_recommended_action"].split("\n"):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("-"):
-                        P(line)
-                    else:
-                        P(f"- {line}")
-                P("")
-            # Evidence + IPs + ASNs
-            try:
-                ev_refs = json.loads(r["evidence_refs"])
-            except Exception:
-                ev_refs = []
-            if ev_refs:
-                P("**Evidence:**\n")
-                for ev in ev_refs:
-                    P(f"- Section {ev.get('section','?')}: "
-                      f"{ev.get('label','')}")
-                P("")
-            if r["src_ips_sample"]:
-                ips_l = [s for s in r["src_ips_sample"].split(",") if s]
-                shown = ", ".join(f"`{ip}`" for ip in ips_l[:10])
-                more = (f" (+{len(ips_l) - 10} more)"
-                        if len(ips_l) > 10 else "")
-                P(f"**Representative source IPs:** {shown}{more}\n")
-            if r["asns_sample"]:
-                P(f"**ASNs:** {r['asns_sample']}\n")
-            if r["countries_sample"]:
-                P(f"**Countries:** {r['countries_sample']}\n")
-            P("")
-        P("---")
+        P("### Finding index\n")
+        P("| verdict | finding | sources | rule | why |")
+        P("| --- | --- | ---: | --- | --- |")
+        vorder = {v: i for i, v in enumerate(verdict.VERDICT_ORDER)}
+        for r in sorted(verdict_rows, key=lambda r: (
+                vorder[r["verdict"]], r["target"], r["finding_id"])):
+            cells = [r["verdict"], r["title"], f"{r['n_members']:,}",
+                     r["rule_id"], r["why"] + (f" ({r['note']})" if r["note"] else "")]
+            P("| " + " | ".join(str(c).replace("|", "\\|") for c in cells) + " |")
+        P("")
     else:
-        # When no findings or no conclusions file yet, point operators
-        # at the stage rather than going silent.
-        H(2, "0.5 Cross-Signal Findings & Conclusions")
-        P("_No cross-signal findings produced this run.  Run "
-          "`src/conclusions/correlate.py` then "
-          "`src/conclusions/synthesize.py` to populate this section._")
-        P("")
-        P("---")
+        P("_No verdicts this run.  Run `python src/evolve.py correlate verdict` "
+          "to populate this section._")
+    P("")
+    P("---")
 
     # ---------- 1. Executive Summary ----------
     H(2, "1. Executive Summary")
@@ -2288,9 +2218,15 @@ def run(args: argparse.Namespace) -> int:
     P("**What this shows:** the cross-signal findings (sections above) fused "
       "into operator-level **storylines**.  `conclusions/graph.py` links any two "
       "findings that share a strong entity — a compositeprint `core_hash` "
-      "(infrastructure-independent fingerprint), a packet-choreography chain, or "
-      "source IPs (a single shared ASN alone is below the bar, so a hub network "
-      "can't fuse unrelated findings) — then groups the connected findings.  A "
+      "(infrastructure-independent fingerprint), a packet-choreography chain, the "
+      "same payload on the same port, or source IPs — or two weak ones (a port "
+      "and an activity day, two ASNs) — then groups the connected findings.  "
+      "Payload, port, day and l7 protocol come from the members' own packets, so "
+      "findings of different analyzers (neuromorphic flag groups, l7 surges, "
+      "miner rules, landscape ports, burst chains) can meet.  Shared IPs count "
+      "only when they are a real part of both findings, and known and behavioral "
+      "scanners (scannerintel `benign_org`, the benignfilter scanner ASNs, "
+      "portscans) are left out of IP links; they keep their flags and risk.  A "
       "storyline reads as one campaign instead of N disconnected cards.")
     _story_summary = lib.OUTPUT_DIR / "conclusions" / "storylines" / "summary.json"
     if _story_summary.exists():
@@ -2305,41 +2241,36 @@ def run(args: argparse.Namespace) -> int:
         if ratio is not None:
             P(f"- consolidation ratio **{ratio:.2f}** "
               f"(1.0 = nothing fused; lower = more campaigns collapsed)")
-    _story_concl = (lib.OUTPUT_DIR / "conclusions" / "storylines"
-                    / "storyline_conclusions.parquet")
+    # Storylines with 2+ findings, with the verdict mix of their findings
+    # (the correlator severity says nothing about a benign BitTorrent swarm).
+    _stories = lib.OUTPUT_DIR / "conclusions" / "storylines" / "storylines.parquet"
     story_rows: list[dict] = []
-    if _story_concl.exists():
+    if _stories.exists():
         try:
-            story_rows = pq.read_table(_story_concl).to_pylist()
+            story_rows = [r for r in pq.read_table(_stories, columns=[
+                "storyline_id", "finding_count", "finding_ids", "pattern_ids",
+                "src_ip_count", "linking_entities", "first_seen", "last_seen",
+            ]).to_pylist() if r["finding_count"] >= 2]
         except Exception as e:
-            print(f"[report] could not read storyline_conclusions: {e}",
-                  file=sys.stderr)
+            print(f"[report] could not read storylines: {e}", file=sys.stderr)
     if story_rows:
-        sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-        story_rows.sort(key=lambda r: sev_rank.get(str(r.get("severity")), 9))
+        vmap = {r["finding_id"]: r["verdict"] for r in verdict_rows}
+        story_rows.sort(key=lambda r: (-r["finding_count"], r["storyline_id"]))
+        P("")
+        P("| storyline | findings | verdicts | sources | linked by | seen |")
+        P("| --- | ---: | --- | ---: | --- | --- |")
         for sr in story_rows:
-            title = sr.get("ai_title") or f"storyline {sr.get('storyline_id')}"
-            H(3, f"{str(sr.get('severity','')).upper()} — {title}")
-            P(f"_`{sr.get('storyline_id')}` — {sr.get('finding_count')} findings — "
-              f"patterns: {sr.get('pattern_ids')} — bound by "
-              f"{sr.get('linking_entities')} — {sr.get('src_ip_count')} source IPs — "
-              f"confidence: {sr.get('ai_confidence') or 'n/a'}_")
-            if sr.get("ai_campaign_summary"):
-                P(f"**Campaign:** {sr['ai_campaign_summary']}")
-            if sr.get("ai_why_connected"):
-                P(f"**Why these are one story:** {sr['ai_why_connected']}")
-            if sr.get("ai_actor_assessment"):
-                P(f"**Actor:** {sr['ai_actor_assessment']}")
-            if sr.get("ai_recommended_action"):
-                P("**Recommended action:**")
-                for line in str(sr["ai_recommended_action"]).split("\n"):
-                    if line.strip():
-                        P(line if line.lstrip().startswith("-")
-                          else f"- {line.strip()}")
+            mix = Counter(vmap.get(f, "?") for f in json.loads(sr["finding_ids"]))
+            mix_s = ", ".join(f"{v} {n}" for v, n in mix.most_common())
+            links = ", ".join(f"{k} {v}" for k, v in
+                              json.loads(sr["linking_entities"] or "{}").items())
+            P(f"| `{sr['storyline_id']}` | {sr['finding_count']} | {mix_s} | "
+              f"{sr['src_ip_count']:,} | {links} | "
+              f"{(sr['first_seen'] or '')[:10]} to {(sr['last_seen'] or '')[:10]} |")
     else:
         P("")
         P("> _No multi-finding storylines yet.  Run `python src/evolve.py kg` "
-          "then `conclude` to populate this section._")
+          "to populate this section._")
 
     # ---------- 32. Neuromorphic per-source scores (neuro) ----------
     H(2, "32. Neuromorphic Per-Source Scores (neuro: LIF, arrival, HDC)")

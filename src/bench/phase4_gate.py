@@ -10,8 +10,14 @@ corpus):
               the ``--window`` days up to D that have an escalation label
               (bench/priority_labels.escalation: no level-1 evidence on or
               before D)
-  flagged     the LIF risk term of compute_risk_score is > 0: the best
-              calibrated readout in the window > NEURO_FLAG + log10(days)
+  flagged     the neuro risk term of the window is > 0.  ``--term``:
+              lif        the LIF part of the capped term only (result 6):
+                         best calibrated readout > NEURO_FLAG + log10(days)
+              capped     compute_risk_score.neuro_score (LIF + HDC parts)
+              surprisal  compute_risk_score.neuro_surprisal (proposal C1;
+                         its matched twin is ``capped``)
+              ``--calibration`` count | context selects the *_cal or the
+              *_ctx day columns of the neuro stage (proposal A1)
   nocal       the same number of sources, chosen by the uncalibrated
               readouts (rank of max(change, reg) among the candidates);
               the co-primary of round 2 correction D14
@@ -41,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sg import lib
 from bench import harness2
 from bench import priority_labels as pl
+from risk import compute_risk_score as crs
 from risk.compute_risk_score import NEURO_FLAG
 
 OUT = lib.REPORTS / "phase4_gate"
@@ -50,21 +57,69 @@ SCHEMA = pa.schema([
 ])
 
 
+def _term_flags(term, u, ndays, ips, cch, crg, d, window, hdays, hip, hpr,
+                hdr, n_pop) -> np.ndarray:
+    """neuro risk term > 0 for each source of ``u``, with the window's LIF
+    and HDC source-days in the form of the features table."""
+    pos = {s: i for i, s in enumerate(u)}
+    mch = np.zeros(len(u))
+    mrg = np.zeros(len(u))
+    for s, a, b in zip(ips, cch, crg):
+        i = pos.get(s)
+        if i is not None:
+            mch[i], mrg[i] = max(mch[i], a), max(mrg[i], b)
+    hsel = (hdays > d - np.timedelta64(window, "D")) & (hdays <= d)
+    hn, hp, hq = np.zeros(len(u)), np.zeros(len(u)), np.zeros(len(u))
+    for s, a, b in zip(hip[hsel], hpr[hsel], hdr[hsel]):
+        i = pos.get(s)
+        if i is not None:
+            hn[i] += 1
+            hp[i], hq[i] = max(hp[i], a), max(hq[i], b)
+    out = np.zeros(len(u), dtype=bool)
+    for i in range(len(u)):
+        r = {"neuro_days": int(ndays[i]), "neuro_change": mch[i],
+             "neuro_reg": mrg[i], "neuro_arrival_min": 0,
+             "neuro_hdc_days": int(hn[i]), "neuro_hdc_proto": hp[i],
+             "neuro_hdc_drift": hq[i]}
+        v = (crs.neuro_surprisal(r, n_pop)[0] if term == "surprisal"
+             else crs.neuro_score(r)[0])
+        out[i] = v > 0
+    return out
+
+
 def run(args) -> None:
     t0 = time.time()
     labels = pl.load()
+    sfx = "ctx" if args.calibration == "context" else "cal"
     con = lib.duck()
     nd = con.execute(f"""
-        SELECT src_ip, dt, n_pkts, change, reg, change_cal, reg_cal
+        SELECT src_ip, dt, n_pkts, change, reg,
+               change_{sfx} AS change_cal, reg_{sfx} AS reg_cal
         FROM read_parquet('{lib.REPORTS / "neuro" / "neuro_days.parquet"}')
         WHERE dt >= DATE '{harness2.DEV_END}' - INTERVAL {args.window} DAY
         ORDER BY dt
     """).to_arrow_table()
+    hd = con.execute(f"""
+        SELECT src_ip, dt, proto_{sfx} AS proto, drift_{sfx} AS drift
+        FROM read_parquet('{lib.REPORTS / "neuro" / "neuro_hdc_days.parquet"}')
+        WHERE dt >= DATE '{harness2.DEV_END}' - INTERVAL {args.window} DAY
+          AND proto_{sfx} IS NOT NULL AND NOT isnan(proto_{sfx})
+    """).to_arrow_table()
+    n_pop = con.execute(f"""
+        SELECT count(*) FROM read_parquet('{lib.REPORTS / "neuro" / "neuro.parquet"}')
+        WHERE lif_days > 0 OR hdc_days > 0
+    """).fetchone()[0]
     con.close()
+    hdays = np.array(hd["dt"].to_numpy(zero_copy_only=False), dtype="datetime64[D]")
+    hip = np.array(hd["src_ip"].to_pylist(), dtype=object)
+    hpr = np.nan_to_num(hd["proto"].to_numpy(zero_copy_only=False).astype(float))
+    hdr = np.nan_to_num(hd["drift"].to_numpy(zero_copy_only=False).astype(float))
     days = np.array(nd["dt"].to_numpy(zero_copy_only=False), dtype="datetime64[D]")
     ip = np.array(nd["src_ip"].to_pylist(), dtype=object)
     npk = nd["n_pkts"].to_numpy().astype(float)
-    cal = np.maximum(nd["change_cal"].to_numpy(), nd["reg_cal"].to_numpy())
+    cch = np.nan_to_num(nd["change_cal"].to_numpy(zero_copy_only=False).astype(float))
+    crg = np.nan_to_num(nd["reg_cal"].to_numpy(zero_copy_only=False).astype(float))
+    cal = np.maximum(cch, crg)
     raw = np.maximum(nd["change"].to_numpy(), nd["reg"].to_numpy())
     rec = np.unique(days)
     last = rec.max() - np.timedelta64(args.horizon, "D")
@@ -89,7 +144,11 @@ def run(args) -> None:
         u, ndays, pk, best, braw, lab = (x[keep] for x in (u, ndays, pk, best, braw, lab))
         if not len(u):
             continue
-        flag = best - NEURO_FLAG - np.log10(np.maximum(ndays, 1)) > 0
+        if args.term == "lif":
+            flag = best - NEURO_FLAG - np.log10(np.maximum(ndays, 1)) > 0
+        else:
+            flag = _term_flags(args.term, u, ndays, ip[sel], cch[sel], crg[sel],
+                               d, args.window, hdays, hip, hpr, hdr, n_pop)
         nf = int(flag.sum())
         nocal = np.zeros(len(u), dtype=bool)
         if nf:
@@ -145,7 +204,10 @@ def run(args) -> None:
           f"- base escalation rate of all candidates: "
           f"{np.mean([r['base'] for r in per_day]):.4f}", "",
           "| group | escalation rate | 95 % interval |", "| --- | ---: | --- |"]
-    for k, name in (("flagged", "LIF risk term > 0 (`neuro_signal`)"),
+    md.insert(0, f"- term: `{args.term}`, calibration: `{args.calibration}`"
+              + (f", surprisal level log2 {n_pop:,} sources"
+                 if args.term == "surprisal" else ""))
+    for k, name in (("flagged", f"`{args.term}` risk term > 0"),
                     ("nocal", "same count, uncalibrated readouts"),
                     ("control", "not flagged, same activity strata")):
         md.append(f"| {name} | {est[k]:.4f} | [{ci[k][0]:.4f}, {ci[k][1]:.4f}] |")
@@ -155,8 +217,10 @@ def run(args) -> None:
            "difference must be above 0)", "",
            "The classical twin (a calibrated `pacing` flag) is not in this "
            "test: the neuro cache has no pacing readouts for each source-day."]
+    suffix = ("" if (args.term, args.calibration) == ("lif", "count")
+              else f"{args.term}_{args.calibration}")
     paths = lib.Report(name="phase4_gate", rows=rows, schema=SCHEMA,
-                       markdown="\n".join(md) + "\n").write()
+                       markdown="\n".join(md) + "\n").write(suffix=suffix)
     print(f"[phase4_gate] wrote {paths['markdown']}", file=sys.stderr)
 
 
@@ -167,6 +231,10 @@ def main() -> int:
     ap.add_argument("--horizon", type=int, default=30)
     ap.add_argument("--every", type=int, default=7)
     ap.add_argument("--seed", type=int, default=20261025)
+    ap.add_argument("--term", choices=("lif", "capped", "surprisal"),
+                    default="lif")
+    ap.add_argument("--calibration", choices=("count", "context"),
+                    default="count")
     run(ap.parse_args())
     return 0
 

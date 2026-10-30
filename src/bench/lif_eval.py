@@ -41,6 +41,15 @@ arithmetic of ``bench/baselines.py``:
   *_cal          each round 2 twin with the lif calibration
   pkt_count, random   sanity rows
 
+``--ctx-only`` (proposal A1, sg.context) adds to the saved harness2 ranks:
+  lif_ctx        lif with the calibration with context: the reference is
+                 the fit-window source-days of the same context stratum
+                 (port class, l7 label, ASN type, sensor state)
+  lif_count      its matched twin: lif from the same inputs with the
+                 packet-count calibration only (equal to lif)
+The fit-day readouts and contexts come from the neuro stage cache
+(neuro._day_readouts, neuro._day_context: the same loader and bank).
+
 Calibration: the fit window is the ``--fit-days`` (28) recorded days
 before D.  Each readout of D is turned into -log10 of its exceedance rate
 among the fit-window source-days in the same packet-count decile, with an
@@ -79,6 +88,7 @@ OUT = lib.REPORTS / "lif_eval"
 DETECTORS = ("lif", "lif_change", "lif_reg", "lif_nocal", "untrained_lif",
              "hawkes", "hawkes_nocal", "pacing", "pacing_cal", "pacing_robust",
              "pacing_robust_cal", "pkt_count", "random")
+CTX_ONLY = ("lif_ctx", "lif_ctx_change", "lif_ctx_reg", "lif_count")
 TWINS_ONLY = ("pacing_robust", "pacing_robust_cal", "periodogram",
               "periodogram_cal", "burst_fano", "burst_fano_cal", "burst_b",
               "burst_b_cal")
@@ -337,6 +347,8 @@ def run(args: argparse.Namespace) -> None:
     fit_days = bl._fit_days(con, day, args.fit_days)
     mask_ends = np.array(sorted(e.timestamp() for _, e, _ in
                                 lib.load_sensor_mask()))
+    if args.ctx_only:
+        return _ctx_only(args, con, day, fit_days, mask_ends, truth, t0)
     # the same tau range as the trained bank (round 2 correction D12; the
     # first round drew 10 ms .. 10 days)
     utaus = np.sort(np.exp(np.random.default_rng(args.seed).uniform(
@@ -471,6 +483,50 @@ def _twins_only(args, day, d, fit, truth, t0) -> None:
           f"({time.time() - t0:.0f}s)", file=sys.stderr)
 
 
+def _ctx_only(args, con, day, fit_days, mask_ends, truth, t0) -> None:
+    """Add the CTX_ONLY rank rows (proposal A1) to a saved set's ranks."""
+    import neuro
+    from sg import context
+    from bench import harness2
+    rkey, ckey = neuro._cache_key(args.min_pkts), neuro._ctx_key()
+    parts = []
+    for fd in fit_days:
+        r = pq.read_table(neuro._day_readouts(str(fd), args.min_pkts, rkey))
+        if not r.num_rows:
+            continue
+        ips = r["src_ip"].to_pylist()
+        parts.append({"change": r["change"].to_numpy(),
+                      "reg": r["reg"].to_numpy(),
+                      "logn": np.log(np.maximum(r["n_pkts"].to_numpy(), 1)),
+                      "ctx": neuro._ctx_for(ips, neuro._day_context(str(fd), ckey))})
+    if not parts:
+        raise SystemExit(f"[lif_eval] no fit sources before {day}")
+    fit = {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
+    d = load_day(con, day, args.min_pkts, mask_ends)
+    c = context.day_context(con, day, context.scanner_cidr_ips(),
+                            context.masked_days())
+    con.close()
+    med = lif.median_iat(d["t"], d["seg"], d["starts"])
+    ch, rg = lif.bank_scores(d["t"], d["seg"], d["starts"], med)
+    rg = np.where(np.isfinite(rg), rg, -1e9)
+    logn = np.log(d["n"])
+    cx = context.align(d["ips"], c["ips"], c["ctx"])
+    cc, _ = context.calibrate_ctx(ch, logn, cx, fit["change"], fit["logn"], fit["ctx"])
+    rc, _ = context.calibrate_ctx(rg, logn, cx, fit["reg"], fit["logn"], fit["ctx"])
+    scores = {"lif_ctx": np.maximum(cc, rc), "lif_ctx_change": cc,
+              "lif_ctx_reg": rc,
+              "lif_count": np.maximum(
+                  lif.calibrate(ch, logn, fit["change"], fit["logn"]),
+                  lif.calibrate(rg, logn, fit["reg"], fit["logn"]))}
+    new = harness2.truth_ranks(args.eval, day, d["ips"], scores, truth, args.seed)
+    path = harness2.OUT / "lif_eval" / f"{args.eval}_ranks.parquet"
+    old = [r for r in pq.read_table(path).to_pylist()
+           if r["detector"] not in CTX_ONLY] if path.exists() else []
+    harness2.write_ranks("lif_eval", args.eval, old + new)
+    print(f"[lif_eval] {args.eval}: added {', '.join(CTX_ONLY)} ranks "
+          f"({time.time() - t0:.0f}s)", file=sys.stderr)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -486,6 +542,10 @@ def main() -> int:
     ap.add_argument("--twins-only", action="store_true",
                     help="with --eval: compute only the pacing_robust twins "
                          "and add their ranks to the saved harness2 ranks")
+    ap.add_argument("--ctx-only", action="store_true",
+                    help="with --eval: compute only lif_ctx (proposal A1) and "
+                         "its twin lif_count, and add their ranks to the "
+                         "saved harness2 ranks")
     args = ap.parse_args()
     if args.summary:
         summary(args.summary)

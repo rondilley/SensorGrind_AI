@@ -112,6 +112,55 @@ def neuro_score(r: dict) -> tuple[float, str]:
             ", ".join(label))
 
 
+# Surprisal term (proposal C1, docs/NEUROMORPHIC_NEXT_PATHS.md §5): one rule
+# for every calibrated detector in place of a flag level per detector.
+#   p_i   = min(1, days_i * 10^-best_i)   Bonferroni over the source's days
+#   p     = min(1, L * HM(p_1..p_L))      L detectors with a value; L times
+#           the harmonic mean is >= L * min p_i (Bonferroni), thus a valid
+#           p-value for any dependence between the detectors.  The asymptotic
+#           harmonic mean p-value (Wilson, PNAS 2019) is not valid at small L.
+#   bits  = -log2 p
+#   term  = BITS_POINTS * (bits - log2 N), N = sources with a neuro score:
+#           only the surprisal above the expected maximum of N sources
+#           gives points, so the population size sets the level, not a
+#           constant.  BITS_POINTS keeps the slope of the capped term
+#           (2 points for each log10 unit).
+# NEURO_TERM selects the term: "capped" (the matched twin) or "surprisal".
+NEURO_TERM = "capped"
+BITS_POINTS = 2.0 / math.log2(10)
+NEURO_DETECTORS = (("lif-change", "neuro_change", "neuro_days"),
+                   ("lif-metronome", "neuro_reg", "neuro_days"),
+                   ("hdc-proto", "neuro_hdc_proto", "neuro_hdc_days"),
+                   ("hdc-drift", "neuro_hdc_drift", "neuro_hdc_days"))
+
+
+def neuro_bits(r: dict) -> tuple[float, str]:
+    """Combined surprisal (bits) of the calibrated detectors of a source,
+    and the name of the detector with the smallest p-value."""
+    ps, best_name, best_p = [], "", 1.0
+    for name, col, days_col in NEURO_DETECTORS:
+        days = r.get(days_col) or 0
+        if days <= 0 or r.get(col) is None:
+            continue
+        p = min(1.0, days * 10.0 ** -float(r[col]))
+        ps.append(max(p, 1e-300))
+        if p < best_p:
+            best_name, best_p = name, p
+    if not ps:
+        return 0.0, ""
+    hm = len(ps) / sum(1.0 / p for p in ps)
+    return -math.log2(min(1.0, len(ps) * hm)), best_name
+
+
+def neuro_surprisal(r: dict, n_pop: int) -> tuple[float, str]:
+    bits, name = neuro_bits(r)
+    excess = bits - math.log2(max(1, n_pop))
+    if excess <= 0:
+        return 0.0, ""
+    return (min(NEURO_CAP, BITS_POINTS * excess),
+            f"neuro-surprisal={bits:.1f}b ({name})")
+
+
 def infra_score(asn_org: str) -> tuple[float, str]:
     s = (asn_org or "").lower()
     if any(k in s for k in BULLETPROOF_KEYWORDS):
@@ -155,6 +204,12 @@ def run() -> int:
 
     table = sf.load_snapshot(snap)
     print(f"[risk] scoring {table.num_rows:,} IPs...", file=sys.stderr)
+    n_neuro = sum(1 for a, b in zip(table.column("neuro_days").to_pylist(),
+                                    table.column("neuro_hdc_days").to_pylist())
+                  if (a or 0) > 0 or (b or 0) > 0)
+    print(f"[risk] neuro term: {NEURO_TERM}"
+          + (f" (level log2 {n_neuro:,} = {math.log2(max(1, n_neuro)):.1f} bits)"
+             if NEURO_TERM == "surprisal" else ""), file=sys.stderr)
 
     out_rows: list[dict] = []
     tier_counts: dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
@@ -193,7 +248,9 @@ def run() -> int:
         in_cidr = ip in cidr_scanners
         benign_offset = SCANNER_CIDR_OFFSET if in_cidr else 0.0
 
-        neuro_signal, neuro_label = neuro_score(r)
+        neuro_signal, neuro_label = (neuro_surprisal(r, n_neuro)
+                                     if NEURO_TERM == "surprisal"
+                                     else neuro_score(r))
 
         composite = (35.0 * ml +
                      persistence + breadth + exploit_signal +

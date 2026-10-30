@@ -33,6 +33,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sg import features as sf
 from sg import lib
 
 
@@ -178,6 +179,15 @@ CHAINFP_TOP_RARE_BURST      = 8      # rare chains promoted by burstiness
 # token cadence) is a tight mechanical/tooling fingerprint.  Above this share
 # of sources concentrating in the dominant tempo mode we flag it as such.
 CHAINFP_MECHANICAL_TEMPO    = 0.80
+# Burst chains: distinctive chains whose sources all used them inside a short
+# span.  pat_anomalous_chain takes the largest distinctive chains over the
+# whole corpus, which are long-lived; a chain that ~100 sources share only for
+# a few days is the fingerprint of one event (59618:7 on 2025-08-16..18).  The
+# variants of one event differ by a token or two, thus one finding per
+# dominant port holds all its burst chains.
+CHAINFP_BURST_MAX_SPAN_D    = 7
+CHAINFP_TOP_BURST_PORTS     = 15     # finding fan-out cap
+CHAINFP_BURST_KEEP_CHAINS   = 20     # chains listed per finding (by sources)
 
 # compositeprint rotation thresholds (Phase 3).  A behavioral fingerprint
 # (core_hash) fuses stack+sequence+tempo+app+payload and is independent of
@@ -197,6 +207,10 @@ BP_CLUSTER_MIN_EDGE         = 3      # cohost edge weight (shared campaigns) to 
 BP_CLUSTER_MIN_ASNS         = 3      # min ASNs in a cluster to report
 BP_CLUSTER_COOP_HIGH        = 0.5    # mean asnintel cooperation_score -> coordinated
 BP_CLUSTER_TOP              = 20     # finding fan-out cap
+# Severity from the share of the cluster's ASNs that are bulletproof or
+# block-grade (union).  0.5 matches verdict.BULLETPROOF_SHARE.
+BP_CLUSTER_SEV_HIGH         = 0.5
+BP_CLUSTER_SEV_MEDIUM       = 0.1
 
 # Coordinated HTTP campaign: one httppatterns template (a tool/campaign
 # fingerprint) sent by many distinct source IPs spread across many /16s. The
@@ -206,6 +220,55 @@ MIN_HTTP_CAMPAIGN_IPS       = 50
 MIN_HTTP_CAMPAIGN_SUBNETS   = 10     # distinct /16s the sources span
 HTTP_CAMPAIGN_HIGH_IPS      = 200    # promote to high severity
 TOP_HTTP_CAMPAIGNS          = 15     # finding fan-out cap
+
+# Neuromorphic flag groups (neuro step, report Section 32).  The neuro step
+# flags a source on its best day; sources flagged on the same UTC day are one
+# group and one finding, so a storyline can hold them with the other signals.
+# HDC flags are rare (tens of sources over the corpus), LIF flags are not
+# (thousands), thus LIF needs a larger group to count.
+NEURO_HDC_MIN_GROUP         = 3
+NEURO_LIF_MIN_GROUP         = 10
+NEURO_TOP_GROUPS            = 15     # finding fan-out cap for each detector
+NEURO_P2P_SHARE             = 0.5    # group sources with BitTorrent packets on
+                                     # the day at or above this share: the group
+                                     # is a P2P swarm, severity "low"
+
+# Facts that other analyzers only print in their report sections (l7 events,
+# the itemset miner, the landscape).  As findings, graph.py can connect them to
+# the neuro groups and to each other by the port, payload and day of their
+# members.  Member sets are capped (by packets or events) to keep the
+# finding_members table small; the cap keeps the heaviest sources.
+FACT_MAX_MEMBERS            = 50000
+FACT_TOP                    = 15     # finding fan-out cap for each fact rule
+# l7 surge: a month whose events of one l7 protocol are this many times the
+# median month before it, with at least L7_SURGE_MIN_EVENTS events.  Each port
+# with at least L7_SURGE_PORT_SHARE of that month's events is one finding.
+L7_SURGE_RATIO              = 10.0
+L7_SURGE_MIN_EVENTS         = 10000
+L7_SURGE_MIN_PRIOR_MONTHS   = 3
+L7_SURGE_PORT_SHARE         = 0.10
+# Landscape: a port at monthly rank <= LANDSCAPE_NEW_RANK that was in no
+# earlier month's top list.
+LANDSCAPE_NEW_RANK          = 3
+# The usual ports of each l7 protocol.  A miner rule "l7:X + port:N" with N
+# not in this map is a protocol on a port where it does not belong.
+L7_STD_PORTS: dict[str, frozenset[int]] = {
+    "http":  frozenset({80, 81, 8000, 8008, 8080, 8081, 8088, 8888}),
+    "tls":   frozenset({443, 8443, 4443, 993, 995, 465, 636}),
+    "ssh":   frozenset({22, 2222}),
+    "ftp":   frozenset({21}),
+    "smtp":  frozenset({25, 465, 587}),
+    "dns":   frozenset({53}),
+    "telnet": frozenset({23, 2323}),
+    "rdp":   frozenset({3389}),
+    "smb":   frozenset({139, 445}),
+    "mqtt":  frozenset({1883, 8883}),
+    "irc":   frozenset({6667, 6697}),
+    "bittorrent": frozenset(range(6881, 6890)),
+    "mongo": frozenset({27017}),
+    "redis": frozenset({6379}),
+    "vnc":   frozenset(range(5900, 5911)),
+}
 
 
 # ----------------------------------------------------------------------
@@ -770,12 +833,24 @@ def pat_global_arrival_burst(con) -> list[dict]:
     """).fetchall()
     if not rows:
         return []
+    # Members: the sources whose FIRST packet is in one of these minutes
+    # (first_seen of the newest per-IP feature snapshot), sorted.
+    members: list[str] = []
+    snap = sf.latest_snapshot("ip", 1)
+    if snap:
+        buckets = ",".join(f"TIMESTAMPTZ '{r[0]}'" for r in rows)
+        members = [ip for (ip,) in con.execute(f"""
+            SELECT src_ip FROM read_parquet('{sf.snapshot_dir(snap)}/*.parquet')
+            WHERE date_trunc('minute', first_seen) IN ({buckets})
+            ORDER BY src_ip
+        """).fetchall()]
     return [_finding(
         pattern_id="global_arrival_burst",
         pattern_title="Coordinated arrival bursts - sudden floods of brand-new sources",
         severity="high",
         category="botnet-rotation",
-        src_ips=[],
+        src_ips=members[:25],
+        members=members,
         key_metrics={"top": [
             {"bucket_start": str(r[0]), "new_ip_count": int(r[1]),
              "baseline": float(r[2]), "ratio": float(r[3])}
@@ -1199,6 +1274,91 @@ def pat_anomalous_chain(con) -> list[dict]:
     return out
 
 
+def _best_chain_window(con) -> str:
+    if _have(con, "chainfp_snr"):
+        try:
+            row = con.execute("SELECT window_label FROM chainfp_snr "
+                              "WHERE is_best = TRUE LIMIT 1").fetchone()
+            if row:
+                return row[0]
+        except Exception:
+            pass
+    return "40m"
+
+
+def pat_burst_chain(con) -> list[dict]:
+    """Distinctive chains used only inside a short burst, one finding per port.
+
+    Members are the union of the sample IPs of the port's burst chains
+    (chainfp keeps a sample per chain, not the full membership).  The chains
+    go into key_metrics so graph.py links the finding to any anom_chain
+    finding with the same chain; port / payload / day come from the members.
+    """
+    if not _have(con, "chainfp"):
+        return []
+    win = _best_chain_window(con)
+    rows = con.execute(f"""
+        WITH b AS (
+            SELECT chain, source_count, packet_count, token_count, sample_ips,
+                   first_seen, last_seen,
+                   TRY_CAST(regexp_extract(top_dst_ports, '^([0-9]+)', 1) AS INTEGER)
+                       AS port
+            FROM chainfp
+            WHERE window_label = '{win}'
+              AND anomaly_tier = 'distinctive'
+              AND source_count BETWEEN {CHAINFP_DISTINCTIVE_MIN}
+                                  AND {CHAINFP_DISTINCTIVE_MAX}
+              AND token_count >= {CHAINFP_MIN_TOKENS}
+              AND chain NOT LIKE 'ICMP/8.0%'
+              AND last_seen - first_seen <= INTERVAL {CHAINFP_BURST_MAX_SPAN_D} DAY
+        )
+        SELECT port, count(*) AS n_chains, sum(source_count) AS src_sum,
+               sum(packet_count) AS pkts, min(first_seen), max(last_seen),
+               list(chain ORDER BY source_count DESC, packet_count DESC, chain),
+               list(sample_ips ORDER BY source_count DESC, packet_count DESC, chain),
+               max(source_count), max(token_count)
+        FROM b WHERE port IS NOT NULL
+        GROUP BY port
+        ORDER BY src_sum DESC, pkts DESC
+        LIMIT {CHAINFP_TOP_BURST_PORTS}
+    """).fetchall()
+    out: list[dict] = []
+    for (port, n_chains, src_sum, pkts, ts0, ts1, chains, samples,
+         max_src, max_tok) in rows:
+        members = _dedupe([ip.strip() for sm in samples
+                           for ip in (sm or "").split(",") if ip.strip()])
+        if not members:
+            continue
+        span_h = (ts1 - ts0).total_seconds() / 3600.0
+        out.append(_finding(
+            pattern_id=f"burst_chain_{int(port)}",
+            pattern_title=(f"Burst choreography on port {port}: {n_chains:,} "
+                           f"distinctive chains, each used for "
+                           f"<= {CHAINFP_BURST_MAX_SPAN_D} days "
+                           f"({ts0:%Y-%m-%d} to {ts1:%Y-%m-%d})"),
+            severity="medium",
+            category="choreography-anomaly",
+            src_ips=members[:25],
+            key_metrics={
+                "chain":          [c[:512] for c in chains[:CHAINFP_BURST_KEEP_CHAINS]],
+                "window":         win,
+                "port":           int(port),
+                "n_chains":       int(n_chains),
+                "source_count_sum": int(src_sum),
+                "packet_count":   int(pkts),
+                "max_chain_sources": int(max_src),
+                "max_token_count":  int(max_tok),
+                "span_hours":     round(span_h, 1),
+            },
+            evidence_refs=[{"section": "chainfp",
+                            "label": "Per-IP chain fingerprint (burst chains)"}],
+            report_anchor="#chain-fingerprints-chainfp",
+            first_seen=str(ts0), last_seen=str(ts1),
+            members=members,
+        ))
+    return out
+
+
 def pat_critical_persistent_botnet(con) -> list[dict]:
     """Critical-tier IPs with botnet rationale AND long persistence."""
     risk_path = _newest_risk_path()
@@ -1308,6 +1468,16 @@ def pat_fingerprint_rotation(con) -> list[dict]:
         return []
 
     timeline = _rotation_timeline(con, [c[0] for c in clusters])
+    # Full source set of each fingerprint (sorted), so downstream facts
+    # (conclusions/verdict) use all of its sources, not the display sample.
+    members: dict[str, list[str]] = {}
+    if _have(con, "composite_ep"):
+        hashes = ",".join(f"'{c[0]}'" for c in clusters)
+        for h, ips in con.execute(f"""
+            SELECT core_hash, list_sort(array_agg(DISTINCT src_ip))
+            FROM composite_ep WHERE core_hash IN ({hashes}) GROUP BY 1
+        """).fetchall():
+            members[h] = list(ips)
 
     out: list[dict] = []
     for (core_hash, n_ips, n_eps, n_asns, n_cidrs, n_countries, pkts, ts0, ts1,
@@ -1345,6 +1515,7 @@ def pat_fingerprint_rotation(con) -> list[dict]:
             severity=sev,
             category="infrastructure-rotation",
             src_ips=ip_list,
+            members=members.get(core_hash),
             asns=asn_list,
             key_metrics={
                 "core_hash":     core_hash,
@@ -1415,7 +1586,9 @@ def _asn_communities(edge_list: list[tuple[int, int, int]]) -> list[set]:
 
 def pat_bulletproof_asn_cluster(con) -> list[dict]:
     """Communities of ASNs that host the SAME migrating campaign fingerprints
-    AND carry bulletproof signals.
+    AND contain at least one bulletproof or block-grade ASN.  Most member ASNs
+    can be ordinary ISPs; the title, severity and hostile_asn_share give how
+    much of the cluster is hostile.
 
     campaignmigration's ISP-collaboration graph links two ASNs when they
     co-host the same compositeprint ``core_hash`` (a behaviour, independent of
@@ -1488,16 +1661,26 @@ def pat_bulletproof_asn_cluster(con) -> list[dict]:
             tells.append(f"{len(block_asns)}-block-grade")
         if mean_coop >= BP_CLUSTER_COOP_HIGH:
             tells.append("high-coordination")
-        sev = "high" if (bp_asns or len(block_asns) >= 2 or len(asns) >= 6) else "medium"
+        # Severity follows how much of the cluster is hostile, not its size:
+        # big clusters are mostly ordinary ISPs and transit (the 2026-10-29
+        # clusters are 2% to 35% bulletproof or block-grade).
+        hostile_share = len(set(bp_asns) | set(block_asns)) / len(asns)
+        sev = ("high" if hostile_share >= BP_CLUSTER_SEV_HIGH else
+               "medium" if hostile_share >= BP_CLUSTER_SEV_MEDIUM else "low")
         labels = ", ".join(f"AS{a}({info.get(a, {}).get('org', '')[:14]})"
                            for a in asns[:12])
 
         out.append(_finding(
             pattern_id=f"bp_asn_cluster_{hashlib.sha256(str(asns).encode()).hexdigest()[:8]}",
-            pattern_title=(f"Bulletproof ASN cluster: {len(asns)} networks "
-                           f"sharing {links_w} campaign links"),
+            # The trigger is ONE bulletproof or block-grade ASN, so the title
+            # gives the counts; it does not call the whole cluster bulletproof
+            # (the 2026-10-29 clusters are 0-5% bulletproof).
+            pattern_title=(f"ASN co-hosting cluster: {len(asns)} networks "
+                           f"sharing {links_w} campaign links "
+                           f"({len(bp_asns)} bulletproof, "
+                           f"{len(block_asns)} block-grade)"),
             severity=sev,
-            category="bulletproof-hosting",
+            category="asn-cohost-cluster",
             src_ips=[],
             asns=[f"AS{a}" for a in asns],
             countries=countries,
@@ -1509,6 +1692,7 @@ def pat_bulletproof_asn_cluster(con) -> list[dict]:
                 "bulletproof_asns":      [f"AS{a}" for a in bp_asns],
                 "block_grade_asns":      [f"AS{a}" for a in block_asns],
                 "mean_cooperation_score": round(mean_coop, 3),
+                "hostile_asn_share":     round(hostile_share, 4),
                 "countries":             countries,
                 "tells":                 tells,
             },
@@ -1549,7 +1733,9 @@ def pat_coordinated_http_campaign(con) -> list[dict]:
                              || '.' || split_part(m.src_ip, '.', 2)) AS subnets,
                count(*) AS events,
                min(m.ts) AS first_seen, max(m.ts) AS last_seen,
-               array_slice(array_agg(DISTINCT m.src_ip), 1, 25) AS sample_ips,
+               -- sorted: array_agg order is arbitrary, and the sample sets
+               -- the finding_id hash, so an unsorted one changed every run
+               array_slice(list_sort(array_agg(DISTINCT m.src_ip)), 1, 25) AS sample_ips,
                array_agg(DISTINCT m.src_ip) AS all_ips
         FROM m JOIN http_templates t ON t.cluster_id = m.cluster_id
         GROUP BY m.cluster_id
@@ -1582,6 +1768,328 @@ def pat_coordinated_http_campaign(con) -> list[dict]:
     return out
 
 
+def _neuro_groups(con, det: str, min_group: int) -> list[dict]:
+    """One finding for each day with >= min_group sources flagged by ``det``.
+
+    ``det`` is "hdc" or "lif": the column prefix in neuro.parquet.  The score
+    of a source is its highest calibrated readout of that detector.
+    """
+    if not _have(con, "neuro"):
+        return []
+    score = ("GREATEST(COALESCE(hdc_proto_max, 0), COALESCE(hdc_drift_max, 0))"
+             if det == "hdc" else "COALESCE(lif_max, 0)")
+    rows = con.execute(f"""
+        WITH f AS (
+            SELECT src_ip, {det}_best_day AS day, {score} AS score
+            FROM neuro
+            WHERE {det}_flag_days > 0 AND {det}_best_day IS NOT NULL
+        ), g AS (
+            SELECT day, count(*) AS n FROM f GROUP BY day
+            HAVING count(*) >= {int(min_group)}
+            ORDER BY n DESC, day LIMIT {NEURO_TOP_GROUPS}
+        )
+        SELECT g.day, g.n, list(f.src_ip ORDER BY f.score DESC, f.src_ip),
+               list(f.score ORDER BY f.score DESC, f.src_ip)
+        FROM g JOIN f USING (day)
+        GROUP BY g.day, g.n
+        ORDER BY g.n DESC, g.day
+    """).fetchall()
+    if not rows:
+        return []
+    p2p = _bittorrent_sources(con, rows)
+    geo = lib.GeoLookup()
+    out = []
+    try:
+        for day, n, ips, scores in rows:
+            sample = list(ips[:25])
+            recs = [geo.lookup(ip) for ip in sample]
+            asns = _dedupe([r.asn_org or "" for r in recs])
+            countries = _dedupe([r.country_iso or "" for r in recs])
+            bt_share = p2p.get(day, 0) / n
+            if det == "hdc":
+                title = (f"HDC choreography flags - {n} sources on {day} "
+                         "with the same unusual session pattern")
+                sev = "high" if n >= 10 else "medium"
+            else:
+                title = (f"LIF timing flags - {n} sources on {day} "
+                         "with a surprising packet rhythm")
+                sev = "medium"
+            # A swarm of P2P peers shares one session shape and one rhythm,
+            # thus it makes a group; the finding stays, but not at the top.
+            if bt_share >= NEURO_P2P_SHARE:
+                title += f" ({bt_share:.0%} BitTorrent peers)"
+                sev = "low"
+            out.append(_finding(
+                pattern_id=f"neuro_{det}_group",
+                pattern_title=title,
+                severity=sev,
+                category="neuromorphic",
+                src_ips=sample,
+                # The members are mostly home and mobile carrier IPs.  Those
+                # ASNs are hubs, and two shared carriers would pass the graph
+                # link bar, thus they go into key_metrics, not asns_sample.
+                countries=countries,
+                key_metrics={
+                    "asn_orgs": asns,
+                    "detector": det,
+                    "day": str(day),
+                    "n_sources": int(n),
+                    "bittorrent_sources": int(p2p.get(day, 0)),
+                    "score_max": round(float(scores[0]), 2),
+                    "top": [{"src_ip": ip, "score": round(float(sc), 2)}
+                            for ip, sc in zip(ips[:10], scores[:10])],
+                },
+                evidence_refs=[{"section": "32",
+                                "label": "Neuromorphic per-source scores"}],
+                report_anchor="#32-neuromorphic-per-source-scores-neuro-lif-arrival-hdc",
+                first_seen=str(day), last_seen=str(day),
+                members=list(ips),
+            ))
+    finally:
+        geo.close()
+    return out
+
+
+def _bittorrent_sources(con, rows) -> dict:
+    """Per group day: how many group sources sent a BitTorrent-labelled
+    packet (the parser l7 label of the handshake) on that day."""
+    if not _have(con, "pkt_view"):
+        return {}
+    mem = pa.table({
+        "dt": pa.array([d for d, _, ips, _ in rows for _ in ips], pa.date32()),
+        "src_ip": pa.array([ip for _, _, ips, _ in rows for ip in ips], pa.string())})
+    con.register("neuro_group_members", mem)
+    try:
+        days = ", ".join(f"DATE '{d}'" for d, _, _, _ in rows)
+        return dict(con.execute(f"""
+            SELECT m.dt, count(DISTINCT m.src_ip)
+            FROM neuro_group_members m
+            JOIN pkt_view p ON p.dt = m.dt AND p.src_ip = m.src_ip
+            WHERE p.dt IN ({days}) AND p.l7_proto = {lib.L7_ID['bittorrent']}
+            GROUP BY 1
+        """).fetchall())
+    finally:
+        con.unregister("neuro_group_members")
+
+
+def pat_neuro_hdc_group(con) -> list[dict]:
+    """Sources that the HDC prototypes or drift flagged on the same day.
+
+    The HDC terms (hdc_proto, hdc_drift) flag few sources, and the flags come
+    in groups of related sources on a small number of days.  Each group is
+    one finding.  The group itself says only "these sources had an unusual
+    choreography on this day"; graph.py then connects it to the findings of
+    the other analyzers by the port, payload and day that the members share.
+    """
+    return _neuro_groups(con, "hdc", NEURO_HDC_MIN_GROUP)
+
+
+def pat_neuro_lif_group(con) -> list[dict]:
+    """Sources that the LIF bank flagged on the same day (timing surprise)."""
+    return _neuro_groups(con, "lif", NEURO_LIF_MIN_GROUP)
+
+
+def _fact_members(con, where: str, order: str = "count(*) DESC") -> tuple[list[str], str, str]:
+    """Source IPs of l7_events rows matching ``where`` (heaviest first, capped),
+    with the first and last event time."""
+    rows = con.execute(f"""
+        SELECT src_ip, min(ts), max(ts) FROM l7_events WHERE {where}
+        GROUP BY src_ip ORDER BY {order}, src_ip LIMIT {FACT_MAX_MEMBERS}
+    """).fetchall()
+    if not rows:
+        return [], "", ""
+    return ([r[0] for r in rows], str(min(r[1] for r in rows)),
+            str(max(r[2] for r in rows)))
+
+
+def _geo_sample(ips: list[str]) -> tuple[list[str], list[str]]:
+    geo = lib.GeoLookup()
+    try:
+        recs = [geo.lookup(ip) for ip in ips[:25]]
+    finally:
+        geo.close()
+    return (_dedupe([r.asn_org or "" for r in recs]),
+            _dedupe([r.country_iso or "" for r in recs]))
+
+
+def pat_miner_l7_offport(con) -> list[dict]:
+    """Miner rules "l7:X + port:N" where port N is not a usual port of X.
+
+    The itemset miner (mining/promote_patterns) auto-promotes rules such as
+    l7:bittorrent + port:59618 (15,468 IPs) but only prints them in the report.
+    A protocol in volume on a port where it does not belong is a fact about
+    one population; as a finding, graph.py can connect it to the timing and
+    choreography findings of the same sources.
+    """
+    path = lib.OUTPUT_DIR / "patterns" / "candidate_rules.parquet"
+    if not path.exists() or not _have(con, "l7_events"):
+        return []
+    rules = con.execute(f"""
+        SELECT rule_id, itemset, ip_count, threat_pct, avg_risk
+        FROM read_parquet('{path.as_posix()}')
+        WHERE disposition = 'auto_promoted' AND len(itemset) = 2
+          AND len(list_filter(itemset, x -> x LIKE 'l7:%')) = 1
+          AND len(list_filter(itemset, x -> x LIKE 'port:%')) = 1
+        ORDER BY ip_count DESC
+    """).fetchall()
+    out = []
+    for rule_id, items, ip_count, threat_pct, avg_risk in rules:
+        l7 = next(x for x in items if x.startswith("l7:"))[3:]
+        port = int(next(x for x in items if x.startswith("port:"))[5:])
+        if l7 not in L7_STD_PORTS or port in L7_STD_PORTS[l7] or l7 not in lib.L7_ID:
+            continue
+        ips, first, last = _fact_members(
+            con, f"l7_proto = {lib.L7_ID[l7]} AND dst_port = {port}")
+        if not ips:
+            continue
+        asns, countries = _geo_sample(ips)
+        out.append(_finding(
+            pattern_id="miner_l7_offport",
+            pattern_title=(f"Miner rule {rule_id}: {l7} on port {port} "
+                           f"from {int(ip_count):,} sources (not a usual {l7} port)"),
+            severity="medium",
+            category="protocol-misuse",
+            src_ips=ips[:25],
+            countries=countries,  # carrier ASNs are hubs: key_metrics only
+            key_metrics={"asn_orgs": asns, "rule_id": rule_id, "l7": l7, "port": port,
+                         "rule_ip_count": int(ip_count),
+                         "threat_pct": round(float(threat_pct or 0), 3),
+                         "avg_risk": round(float(avg_risk or 0), 1),
+                         "members": len(ips)},
+            evidence_refs=[{"section": "mining", "label": "Candidate rules"}],
+            first_seen=first, last_seen=last,
+            members=ips,
+        ))
+        if len(out) >= FACT_TOP:
+            break
+    return out
+
+
+def pat_landscape_new_top_port(con) -> list[dict]:
+    """A port that enters a month's top ranks with no earlier top-list entry.
+
+    landscape ranks the ports of each month (top 10).  A port that appears at
+    rank <= LANDSCAPE_NEW_RANK and was in no earlier month's list is a new mass
+    target (59618 at #2 in 2025-08).  Members are the sources that sent to the
+    port in that month.
+    """
+    path = lib.REPORTS / "landscape" / "monthly_top_ports.parquet"
+    if not path.exists() or not _have(con, "pkt_view"):
+        return []
+    rows = con.execute(f"""
+        WITH t AS (SELECT * FROM read_parquet('{path.as_posix()}'))
+        SELECT a.month, a.dst_port, a.rank, a.packets, a.distinct_ips
+        FROM t a
+        WHERE a.rank <= {LANDSCAPE_NEW_RANK}
+          AND a.month > (SELECT min(month) FROM t)
+          AND NOT EXISTS (SELECT 1 FROM t b
+                          WHERE b.dst_port = a.dst_port AND b.month < a.month)
+        ORDER BY a.distinct_ips DESC LIMIT {FACT_TOP}
+    """).fetchall()
+    out = []
+    for month, port, rank, packets, n_ips in rows:
+        lo = _dt.date.fromisoformat(month + "-01")
+        hi = (lo.replace(day=28) + _dt.timedelta(days=4)).replace(day=1)
+        mem = con.execute(f"""
+            SELECT src_ip, min(ts), max(ts) FROM pkt_view
+            WHERE dt >= DATE '{lo}' AND dt < DATE '{hi}' AND dst_port = {int(port)}
+            GROUP BY src_ip ORDER BY count(*) DESC, src_ip
+            LIMIT {FACT_MAX_MEMBERS}
+        """).fetchall()
+        if not mem:
+            continue
+        ips = [r[0] for r in mem]
+        asns, countries = _geo_sample(ips)
+        out.append(_finding(
+            pattern_id="landscape_new_top_port",
+            pattern_title=(f"New top port: {port} at rank {rank} in {month} "
+                           f"({int(n_ips):,} sources), in no earlier monthly top list"),
+            severity="medium",
+            category="landscape",
+            src_ips=ips[:25],
+            countries=countries,  # carrier ASNs are hubs: key_metrics only
+            key_metrics={"asn_orgs": asns, "month": month, "port": int(port), "rank": int(rank),
+                         "packets": int(packets), "distinct_ips": int(n_ips),
+                         "members": len(ips)},
+            evidence_refs=[{"section": "landscape", "label": "Monthly top ports"}],
+            first_seen=str(min(r[1] for r in mem)),
+            last_seen=str(max(r[2] for r in mem)),
+            members=ips,
+        ))
+    return out
+
+
+def pat_l7_protocol_surge(con) -> list[dict]:
+    """A month in which one l7 protocol surges, one finding per main port.
+
+    The l7 classifier labels each payload (l7_events).  A month whose events of
+    one protocol are L7_SURGE_RATIO times the median of the months before it is
+    a surge; each port with L7_SURGE_PORT_SHARE of the month's events is one
+    finding, because a surge on two ports is often two populations.
+    """
+    if not _have(con, "l7_events"):
+        return []
+    rows = con.execute(f"""
+        WITH m AS (
+            SELECT l7_proto, strftime(ts AT TIME ZONE 'UTC', '%Y-%m') AS month,
+                   count(*) AS ev
+            FROM l7_events WHERE l7_proto > 0 GROUP BY 1, 2
+        ), b AS (
+            SELECT a.l7_proto, a.month, a.ev,
+                   (SELECT median(x.ev) FROM m x
+                    WHERE x.l7_proto = a.l7_proto AND x.month < a.month) AS base,
+                   (SELECT count(*) FROM m x
+                    WHERE x.l7_proto = a.l7_proto AND x.month < a.month) AS prior
+            FROM m a
+        ), s AS (
+            SELECT * FROM b
+            WHERE prior >= {L7_SURGE_MIN_PRIOR_MONTHS} AND ev >= {L7_SURGE_MIN_EVENTS}
+              AND ev >= {L7_SURGE_RATIO} * base
+        ), p AS (
+            SELECT e.l7_proto, strftime(e.ts AT TIME ZONE 'UTC', '%Y-%m') AS month,
+                   e.dst_port, count(*) AS ev, count(DISTINCT e.src_ip) AS ips
+            FROM l7_events e JOIN s
+              ON e.l7_proto = s.l7_proto
+             AND strftime(e.ts AT TIME ZONE 'UTC', '%Y-%m') = s.month
+            GROUP BY 1, 2, 3
+        )
+        SELECT p.l7_proto, p.month, p.dst_port, p.ev, p.ips, s.ev, s.base
+        FROM p JOIN s USING (l7_proto, month)
+        WHERE p.ev >= {L7_SURGE_PORT_SHARE} * s.ev
+        ORDER BY p.ips DESC LIMIT {FACT_TOP}
+    """).fetchall()
+    out = []
+    for l7_id, month, port, ev, n_ips, month_ev, base in rows:
+        l7 = lib.L7_NAME.get(int(l7_id), str(l7_id))
+        lo = _dt.date.fromisoformat(month + "-01")
+        hi = (lo.replace(day=28) + _dt.timedelta(days=4)).replace(day=1)
+        ips, first, last = _fact_members(
+            con, f"l7_proto = {int(l7_id)} AND dst_port = {int(port)} "
+                 f"AND dt >= DATE '{lo}' AND dt < DATE '{hi}'")
+        if not ips:
+            continue
+        asns, countries = _geo_sample(ips)
+        ratio = float(month_ev) / float(base) if base else None
+        out.append(_finding(
+            pattern_id="l7_protocol_surge",
+            pattern_title=(f"{l7} surge in {month} on port {port}: "
+                           f"{int(ev):,} events from {int(n_ips):,} sources"),
+            severity="medium",
+            category="protocol-misuse",
+            src_ips=ips[:25],
+            countries=countries,  # carrier ASNs are hubs: key_metrics only
+            key_metrics={"asn_orgs": asns, "l7": l7, "month": month, "port": int(port),
+                         "port_events": int(ev), "month_events": int(month_ev),
+                         "baseline_median": float(base or 0),
+                         "ratio": round(ratio, 1) if ratio else None,
+                         "members": len(ips)},
+            evidence_refs=[{"section": "l7", "label": "L7 events"}],
+            first_seen=first, last_seen=last,
+            members=ips,
+        ))
+    return out
+
+
 PATTERNS: list[Callable] = [
     pat_telco_ss7_recon,
     pat_routing_protocol_on_public_ip,
@@ -1605,6 +2113,12 @@ PATTERNS: list[Callable] = [
     pat_bulletproof_asn_cluster,
     pat_critical_persistent_botnet,
     pat_coordinated_http_campaign,
+    pat_neuro_hdc_group,
+    pat_neuro_lif_group,
+    pat_miner_l7_offport,
+    pat_landscape_new_top_port,
+    pat_l7_protocol_surge,
+    pat_burst_chain,
 ]
 
 
@@ -1646,6 +2160,7 @@ def _register_views(con) -> None:
         ("isp_collab",       R / "campaignmigration" / "isp_collab.parquet"),
         ("http_clusters",    R / "http_patterns" / "payload_clusters.parquet"),
         ("http_templates",   R / "http_patterns" / "http_patterns.parquet"),
+        ("neuro",            R / "neuro" / "neuro.parquet"),
     ]
     for view, path in mapping:
         if not path.exists():

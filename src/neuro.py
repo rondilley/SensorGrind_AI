@@ -30,6 +30,14 @@ the gate, and each source with a session on D gets
 Both are calibrated like the LIF readouts, with the D session count in place
 of the packet count, and a source-day is flagged at the same --flag.
 
+Calibration with context (proposal A1, sg.context): each readout is also
+calibrated against the reference source-days of the same context (port
+class, l7 label, ASN type, sensor state), with the merge to the parent
+stratum when a stratum has fewer than sg.context.MIN_REF source-days.  The
+day tables keep both values (``*_cal`` with the packet count only,
+``*_ctx`` with context); ``--calibration`` selects the one that goes into
+the per-source maxima, the flags and thus the risk step.
+
 The global arrival detector of Phase 2 adds one more column when
 output/reports/arrival_eval/arrival_scores_full.parquet exists (from
 ``bench/arrival_eval.py --mode full``): the alarm minutes are the minutes
@@ -64,7 +72,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sg import hdc, lib, lif
+from sg import context, hdc, lib, lif
 from bench import arrival_series as ars
 
 CACHE = lib.OUTPUT_DIR / ".neuro_cache"
@@ -96,6 +104,10 @@ HDC_DAY_SCHEMA = pa.schema([
     ("drift",      pa.float32()),
     ("proto_cal",  pa.float32()),
     ("drift_cal",  pa.float32()),
+    ("ctx",        pa.uint16()),
+    ("ctx_level",  pa.uint8()),
+    ("proto_ctx",  pa.float32()),
+    ("drift_ctx",  pa.float32()),
 ])
 HDC_SEED = 1                  # the first encoder seed of the gate runs
 
@@ -107,6 +119,10 @@ DAY_SCHEMA = pa.schema([
     ("reg",        pa.float32()),
     ("change_cal", pa.float32()),
     ("reg_cal",    pa.float32()),
+    ("ctx",        pa.uint16()),     # sg.context key: port, l7, asn, mask
+    ("ctx_level",  pa.uint8()),      # context fields the calibration used
+    ("change_ctx", pa.float32()),
+    ("reg_ctx",    pa.float32()),
 ])
 
 
@@ -155,8 +171,80 @@ def _day_readouts(day: str, min_pkts: int, key: str) -> str:
     return str(path)
 
 
-def lif_days(days: list[str], args: argparse.Namespace, log=sys.stderr
-             ) -> pa.Table:
+# ---------------------------------------------------------------- context
+
+def _ctx_key() -> str:
+    h = hashlib.sha1()
+    for b in context.key_inputs():
+        h.update(b)
+    return h.hexdigest()[:12]
+
+
+_CTX_STATE: dict = {}
+
+
+def _day_context(day: str, key: str) -> str:
+    """sg.context codes of every source of one day into the cache."""
+    path = CACHE / f"dt={day}" / f"context_{key}.parquet"
+    part = lib.PARQUET / "packets" / f"dt={day}"
+    if path.exists() and all(p.stat().st_mtime <= path.stat().st_mtime
+                             for p in part.glob("*.parquet")):
+        return str(path)
+    if not _CTX_STATE:                 # once per worker process
+        _CTX_STATE.update(scanners=context.scanner_cidr_ips(),
+                          masked=context.masked_days(), geo=lib.GeoLookup())
+    con = lib.duck(memory_limit="3GB", threads=2)
+    lib.register_views(con)
+    c = context.day_context(con, _dt.date.fromisoformat(day),
+                            _CTX_STATE["scanners"], _CTX_STATE["masked"],
+                            _CTX_STATE["geo"])
+    con.close()
+    tab = pa.table({"src_ip": pa.array(c["ips"], pa.string()),
+                    "ctx": pa.array(context._keys(c["ctx"], len(context.FIELDS)),
+                                    pa.uint16())})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for old in path.parent.glob("context_*.parquet"):
+        if old != path:
+            old.unlink()
+    # own temporary name: harness processes can build the same day at once
+    tmp = path.with_suffix(f".parquet.{os.getpid()}.tmp")
+    pq.write_table(tab, tmp, compression="zstd")
+    tmp.replace(path)
+    return str(path)
+
+
+def context_days(days: list[str], args: argparse.Namespace, log=sys.stderr
+                 ) -> dict[str, str]:
+    key = _ctx_key()
+    t0 = time.time()
+    paths: dict[str, str] = {}
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futs = {d: pool.submit(_day_context, d, key) for d in days}
+        for i, d in enumerate(days):
+            paths[d] = futs[d].result()
+            if (i + 1) % 100 == 0 or i + 1 == len(days):
+                print(f"[neuro] context {i + 1}/{len(days)} days "
+                      f"{time.time() - t0:.0f}s", file=log)
+    return paths
+
+
+def ctx_codes(key: np.ndarray) -> np.ndarray:
+    """4-digit context keys back to the (n, 4) code array."""
+    k = np.asarray(key, dtype=np.int64)
+    n = len(context.FIELDS)
+    return np.stack([(k // 10 ** (n - 1 - i)) % 10 for i in range(n)],
+                    axis=1).astype(np.int8) if len(k) else \
+        np.zeros((0, n), dtype=np.int8)
+
+
+def _ctx_for(ips, ctx_path: str) -> np.ndarray:
+    c = pq.read_table(ctx_path)
+    return context.align(list(ips), c["src_ip"].to_pylist(),
+                         ctx_codes(c["ctx"].to_numpy()))
+
+
+def lif_days(days: list[str], args: argparse.Namespace,
+             ctx_paths: dict[str, str], log=sys.stderr) -> pa.Table:
     key = _cache_key(args.min_pkts)
     t0 = time.time()
     paths: dict[str, str] = {}
@@ -175,14 +263,19 @@ def lif_days(days: list[str], args: argparse.Namespace, log=sys.stderr
         n = r["n_pkts"].to_numpy().astype(float)
         ch, rg = r["change"].to_numpy(), r["reg"].to_numpy()
         logn = np.log(np.maximum(n, 1))
+        cx = _ctx_for(r["src_ip"].to_pylist(), ctx_paths[d])
         if len(ref) >= args.min_cal_days and len(n):
             fl = np.concatenate([x[0] for x in ref])
             fc = np.concatenate([x[1] for x in ref])
             fr = np.concatenate([x[2] for x in ref])
+            fx = np.concatenate([x[3] for x in ref])
             cc = lif.calibrate(ch, logn, fc, fl)
             rc = lif.calibrate(rg, logn, fr, fl)
+            ccx, lvl = context.calibrate_ctx(ch, logn, cx, fc, fl, fx)
+            rcx, _ = context.calibrate_ctx(rg, logn, cx, fr, fl, fx)
         else:
-            cc = rc = np.full(len(n), np.nan)
+            cc = rc = ccx = rcx = np.full(len(n), np.nan)
+            lvl = np.zeros(len(n), dtype=np.int8)
         parts.append(pa.table({
             "src_ip": r["src_ip"],
             "dt": pa.array([_dt.date.fromisoformat(d)] * len(n), pa.date32()),
@@ -190,9 +283,13 @@ def lif_days(days: list[str], args: argparse.Namespace, log=sys.stderr
             "change": pa.array(ch, pa.float32()),
             "reg": pa.array(rg, pa.float32()),
             "change_cal": pa.array(cc, pa.float32()),
-            "reg_cal": pa.array(rc, pa.float32())}, schema=DAY_SCHEMA))
+            "reg_cal": pa.array(rc, pa.float32()),
+            "ctx": pa.array(context._keys(cx, len(context.FIELDS)), pa.uint16()),
+            "ctx_level": pa.array(lvl, pa.uint8()),
+            "change_ctx": pa.array(ccx, pa.float32()),
+            "reg_ctx": pa.array(rcx, pa.float32())}, schema=DAY_SCHEMA))
         if len(n):
-            ref.append((logn, ch, rg))
+            ref.append((logn, ch, rg, cx))
     return pa.concat_tables(parts) if parts else DAY_SCHEMA.empty_table()
 
 
@@ -290,8 +387,8 @@ def _day_hdc(day: str, fit_days: int, key: str, device: str = "cpu") -> str:
     return str(path)
 
 
-def hdc_days(days: list[str], args: argparse.Namespace, log=sys.stderr
-             ) -> pa.Table:
+def hdc_days(days: list[str], args: argparse.Namespace,
+             ctx_paths: dict[str, str], log=sys.stderr) -> pa.Table:
     if args.hdc_device == "auto":
         try:
             import torch
@@ -322,14 +419,19 @@ def hdc_days(days: list[str], args: argparse.Namespace, log=sys.stderr
         n = r["n_sess"].to_numpy().astype(float)
         pr, dr = r["proto"].to_numpy(), r["drift"].to_numpy()
         logn = np.log(np.maximum(n, 1))
+        cx = _ctx_for(r["src_ip"].to_pylist(), ctx_paths[d])
         if len(ref) >= args.min_cal_days and len(n):
             fl = np.concatenate([x[0] for x in ref])
             fp = np.concatenate([x[1] for x in ref])
             fd = np.concatenate([x[2] for x in ref])
+            fx = np.concatenate([x[3] for x in ref])
             pc = lif.calibrate(pr, logn, fp, fl)
             dc = lif.calibrate(dr, logn, fd, fl)
+            pcx, lvl = context.calibrate_ctx(pr, logn, cx, fp, fl, fx)
+            dcx, _ = context.calibrate_ctx(dr, logn, cx, fd, fl, fx)
         else:
-            pc = dc = np.full(len(n), np.nan)
+            pc = dc = pcx = dcx = np.full(len(n), np.nan)
+            lvl = np.zeros(len(n), dtype=np.int8)
         parts.append(pa.table({
             "src_ip": r["src_ip"],
             "dt": pa.array([_dt.date.fromisoformat(d)] * len(n), pa.date32()),
@@ -337,9 +439,13 @@ def hdc_days(days: list[str], args: argparse.Namespace, log=sys.stderr
             "proto": pa.array(pr, pa.float32()),
             "drift": pa.array(dr, pa.float32()),
             "proto_cal": pa.array(pc, pa.float32()),
-            "drift_cal": pa.array(dc, pa.float32())}, schema=HDC_DAY_SCHEMA))
+            "drift_cal": pa.array(dc, pa.float32()),
+            "ctx": pa.array(context._keys(cx, len(context.FIELDS)), pa.uint16()),
+            "ctx_level": pa.array(lvl, pa.uint8()),
+            "proto_ctx": pa.array(pcx, pa.float32()),
+            "drift_ctx": pa.array(dcx, pa.float32())}, schema=HDC_DAY_SCHEMA))
         if len(n):
-            ref.append((logn, pr, dr))
+            ref.append((logn, pr, dr, cx))
     return (pa.concat_tables(parts) if parts
             else HDC_DAY_SCHEMA.empty_table())
 
@@ -401,32 +507,36 @@ def run(args: argparse.Namespace) -> lib.Report:
     con.close()
     days = [d for d in days if (not args.start or d >= args.start)
             and (not args.end or d <= args.end)]
-    per_day = lif_days(days, args)
-    hdc_day = hdc_days(days, args)
+    ctx_paths = context_days(days, args)
+    per_day = lif_days(days, args, ctx_paths)
+    hdc_day = hdc_days(days, args, ctx_paths)
     OUT.mkdir(parents=True, exist_ok=True)
     for name, t in (("neuro_days", per_day), ("neuro_hdc_days", hdc_day)):
         tmp = OUT / f"{name}.parquet.tmp"
         pq.write_table(t, tmp, compression="zstd")
         tmp.replace(OUT / f"{name}.parquet")
 
+    sfx = "ctx" if args.calibration == "context" else "cal"
+    ch, rg, pr, dr = (f"change_{sfx}", f"reg_{sfx}", f"proto_{sfx}",
+                      f"drift_{sfx}")
     con = lib.duck()
     con.register("d", per_day)
     agg = con.execute(f"""
         SELECT src_ip, count(*) AS lif_days,
-               max(change_cal) AS lif_change_max, max(reg_cal) AS lif_reg_max,
-               max(greatest(change_cal, reg_cal)) AS lif_max,
-               count(*) FILTER (WHERE greatest(change_cal, reg_cal) >= {args.flag})
+               max({ch}) AS lif_change_max, max({rg}) AS lif_reg_max,
+               max(greatest({ch}, {rg})) AS lif_max,
+               count(*) FILTER (WHERE greatest({ch}, {rg}) >= {args.flag})
                    AS lif_flag_days,
-               arg_max(dt, greatest(change_cal, reg_cal)) AS lif_best_day
-        FROM d WHERE change_cal IS NOT NULL AND NOT isnan(change_cal)
+               arg_max(dt, greatest({ch}, {rg})) AS lif_best_day
+        FROM d WHERE {ch} IS NOT NULL AND NOT isnan({ch})
         GROUP BY src_ip
     """).to_arrow_table()
     con.register("h", hdc_day)
     hagg = {r[0]: r[1:] for r in con.execute(f"""
-        SELECT src_ip, count(*), max(proto_cal), max(drift_cal),
-               count(*) FILTER (WHERE greatest(proto_cal, drift_cal) >= {args.flag}),
-               arg_max(dt, greatest(proto_cal, drift_cal))
-        FROM h WHERE proto_cal IS NOT NULL AND NOT isnan(proto_cal)
+        SELECT src_ip, count(*), max({pr}), max({dr}),
+               count(*) FILTER (WHERE greatest({pr}, {dr}) >= {args.flag}),
+               arg_max(dt, greatest({pr}, {dr}))
+        FROM h WHERE {pr} IS NOT NULL AND NOT isnan({pr})
         GROUP BY src_ip
     """).fetchall()}
     con.close()
@@ -469,7 +579,9 @@ def run(args: argparse.Namespace) -> lib.Report:
           f"{args.hdc_fit_days} fit days before it): {hdc_day.num_rows:,}; "
           f"sources with a flagged HDC day: {hflagged:,}",
           f"- calibration: the previous {args.cal_days} recorded days "
-          f"(no score for the first {args.min_cal_days})",
+          f"(no score for the first {args.min_cal_days}); the per-source "
+          f"values use the `{args.calibration}` calibration "
+          f"(day tables keep both)",
           (f"- arrival alarms: {len(alarms):,} minutes of `{args.arrival_detector}` "
            f"at {args.arrival_rate:g} per day; {len(arr):,} sources sent "
            "packets in an alarm minute" if alarms is not None else
@@ -501,6 +613,14 @@ def main() -> int:
     ap.add_argument("--min-pkts", type=int, default=20)
     ap.add_argument("--cal-days", type=int, default=28)
     ap.add_argument("--min-cal-days", type=int, default=3)
+    # context: operator decision 2026-10-29 (A1 escalation result, §8a of
+    # docs/NEUROMORPHIC_NEXT_PATHS.md); count is the matched twin
+    ap.add_argument("--calibration", choices=("count", "context"),
+                    default="context",
+                    help="reference set of the per-source values: the "
+                         "source-days of a similar packet count (count) or "
+                         "also of the same sg.context stratum (context, "
+                         "proposal A1)")
     ap.add_argument("--flag", type=float, default=4.0,
                     help="calibrated -log10 exceedance that flags a source-day")
     ap.add_argument("--workers", type=int,

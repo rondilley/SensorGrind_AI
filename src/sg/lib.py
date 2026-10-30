@@ -97,6 +97,7 @@ L7_NAME = {
     0: "unknown", 1: "http", 2: "tls", 3: "ssh", 4: "ftp", 5: "smtp",
     6: "dns", 7: "telnet", 8: "rdp", 9: "smb", 10: "mqtt", 11: "irc",
     12: "bittorrent", 13: "mirai", 14: "mongo", 15: "redis", 16: "vnc",
+    17: "levin",
 }
 L7_ID = {v: k for k, v in L7_NAME.items()}
 

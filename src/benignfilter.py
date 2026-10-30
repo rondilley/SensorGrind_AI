@@ -136,17 +136,28 @@ UA_PATTERNS: dict[str, list[str]] = {
 # ------------------------------------------------------------------
 # Known scanner ASNs
 # ------------------------------------------------------------------
+# The org of each ASN is its GeoLite2-ASN name.  2026-10-28: 398705 is Censys
+# (it was "shodan"); 202425 (IP Volume inc, a bulletproof host) and 19994
+# (Rackspace Hosting) were removed, they are not scanner orgs; the Alpha Strike
+# Labs, second Censys, Driftnet, Internet Measurement Research, Arbor Networks
+# (NETSCOUT ATLAS) and Academy for Internet Research ASNs were added.
 SCANNER_ASNS: dict[int, str] = {
     398677: "shodan",
-    398705: "shodan",
+    398705: "censys",
     398324: "censys",
-    19994: "rapid7",
+    398722: "censys",
     11022: "shadowserver",
     210631: "onyphe",
     213412: "onyphe",
     209334: "modat",
     40027: "bitsight",
-    202425: "alpha_strike",
+    208843: "alpha_strike",
+    215778: "alpha_strike",
+    42969: "alpha_strike",
+    211298: "driftnet",
+    399628: "internet_measurement",
+    20052: "arbor",
+    400161: "academy_for_internet_research",
     21501: "kudelski",
 }
 

@@ -12,7 +12,8 @@ itself and becomes better from run to run. The pipeline does these steps:
    - FP-Growth pattern mining
    - Leiden community detection
    - Change-point detection and drift detection
-   - **A cross-analyzer correlator, with a narrative from an LLM for each result**
+   - **A cross-analyzer correlator, with a verdict from fixed rules for each
+     result**. It uses no LLM. The LLM narrative is an opt-in step.
    - A review by many AI providers
    - More than 20 analyzers that the project made for this data
 4. It writes a full threat intelligence report for defenders, in markdown,
@@ -29,7 +30,7 @@ values from the last full run (snapshot of 2026-10-25). The input was the
 | Total packets (after the removal of duplicates) | 1,232,067,956 |
 | Different source IP addresses | 1,259,496 |
 | Different payload blobs (SHA-256) | 106,414,804 |
-| Events with an L7 protocol class | 34,777,746 |
+| Events with an L7 protocol class | 34,777,746 (89,511,623 after the L7 backfills of 2026-10-30, refer to the note below) |
 | IOCs found | 28,092,187 |
 | Days with traffic in the corpus | 899 |
 | Corpus range (UTC days) | 2023-07-07 to 2026-06-30 (8 sensor outages, refer to the table below) |
@@ -37,9 +38,14 @@ values from the last full run (snapshot of 2026-10-25). The input was the
 | Threats in the `high` tier | 164,308 |
 | Actor communities (Leiden, 4 or more members) | 16 of 80 groups in the graph of the top 10,000 threat IPs |
 | Behavior rules that the pipeline promoted (this run) | 20 |
-| Cross-signal findings (correlator and LLM) | 86 (7 critical, 52 high, 27 medium) |
+| Cross-signal findings (correlator) | 86 (7 critical, 52 high, 27 medium). On 2026-10-30: 175 (7 critical, 48 high, 99 medium, 21 low) |
 | Campaigns (10 or more IP addresses, burst of less than 60% of the corpus) | 1,853 of 2,000 payload waves |
 | Full time (parser and evolve) | 8 h 9 min: parser 2 h 13 min, evolve steps 5 h 56 min |
+
+The L7 event count is from the parser. Two runs of `src/l7_backfill.py`
+added rows after the snapshot. The BitTorrent backfill added 54,261,465 rows,
+and the Levin backfill added 472,412 rows. The total on 2026-10-30 is
+89,511,623.
 
 The full time does not include `honeypi_logs.py`. The evolve time is the sum
 of the step times of two runs, because the memory limit stopped the first
@@ -111,8 +117,12 @@ venv/bin/python scripts/consolidate_logs.py
 #    file, or a folder.  The parse takes ~75-95 min on 1.1-1.2B events.
 venv/bin/python src/evolve.py --input ~/temp/sensor_logs/consolidated/merged.log.gz
 
-# 2. Run the pipeline again on the parsed tables (no --input: no parse)
+# 2. Run the pipeline again on the parsed tables (no --input: no parse).
+#    A run with no step names does not run the opt-in steps (conclude).
 venv/bin/python src/evolve.py
+
+# 2a. Optional: LLM narratives for the findings (paid API calls)
+venv/bin/python src/evolve.py conclude
 
 # 3. Read the report
 output/reports/COMPREHENSIVE.md
@@ -201,8 +211,8 @@ venv/bin/python src/bench/baselines.py --eval phase0
 
 ## AI provider setup (optional)
 
-Some steps (`originintel`, `aipayloaddecode`, `aireview`) send prompts to
-hosted LLMs. Put one or more of these key files in the root of the
+Some steps (`originintel`, `aipayloaddecode`, `aireview`, and the opt-in
+`conclude`) send prompts to hosted LLMs. Put one or more of these key files in the root of the
 repository. Each of these steps uses the first provider that has a key that
 works and an installed SDK.
 
@@ -222,6 +232,8 @@ the pipeline. The other steps do not use them.
 ```
 src/                                  # all working code lives here
   parser.py                           # raw log to 4 Parquet tables
+  l7_backfill.py                      # apply a new L7 label to the stored
+                                      #   tables (no full parse)
                                       #   (the `parse` step)
   evolve.py                           # DAG orchestrator + skip-if-fresh
   sgquery.py                          # meta-runner over base analyzers
@@ -253,17 +265,19 @@ src/                                  # all working code lives here
   risk/                               # composite risk scoring
     compute_risk_score.py             #   ML x persistence x breadth x ...
     risk_dossier.py                   #   per-IP markdown dossiers
-  conclusions/                        # cross-signal findings + LLM narrative
-    correlate.py                      #   18 hand-coded cross-analyzer rules
+  conclusions/                        # cross-signal findings and verdicts
+    correlate.py                      #   hand-coded cross-analyzer rules
                                       #     (telco SS7 recon, sync campaign
                                       #     burst, recent tight campaign, ...)
-    synthesize.py                     #   per-finding LLM conclusion:
-                                      #     what / why-noteworthy / threat
-                                      #     model / risk / recommended-action
+    graph.py                          #   KG-lite: findings -> storylines
+    verdict.py                        #   fixed rules: facts -> one verdict
+                                      #     per finding; findings -> problems
+    synthesize.py                     #   opt-in (`conclude`): LLM narrative
+                                      #     per finding (paid API calls)
   report/                             # output composition
-    comprehensive_report.py           #   18+ sections incl. Section 0 TL;DR
-                                      #     and Section 0.5 Cross-Signal
-                                      #     Findings & Conclusions
+    comprehensive_report.py           #   Sections 0 to 32 incl. Section 0 TL;DR,
+                                      #     Section 0.5 Cross-Signal Problems
+                                      #     and Section 32 neuromorphic scores
     render.py                         #   Mermaid + Matplotlib + PDF
                                       #     (svg_gantt_chart for campaigns)
   slowlow.py                          # slow-and-low scanners
@@ -272,9 +286,17 @@ src/                                  # all working code lives here
   adversarysim.py                     # synthetic adversary coverage harness
                                       #   (--inject: full-schema eval overlay)
   sensormask.py                       # sensor-off gaps + clock-run boundaries
-  neuro.py                            # LIF/ALIF scores per source (Phase 4)
+  neuro.py                            # LIF/ALIF and HDC scores per source (Phase 4)
   sg/lif.py, sg/stdp.py               # LIF/ALIF bank, Hawkes twin, WTA-STDP
+  sg/hdc.py, sg/hdc_gpu.py            # HDC encoder and prototypes (CPU),
+                                      #   GPU kernels (ROCm/CUDA PyTorch)
+  sg/akd/                             # pybind11 binding to libakida (AKD1500)
   bench/lif_eval.py, bench/stdp_eval.py  # Phase 3 / Phase 5 gate harnesses
+  bench/hdc_eval.py, bench/harness2.py   # HDC gate harness, round 2 summaries
+  bench/hdc_gpu_check.py, bench/hdc_gpu_gate.py  # GPU path check and gate
+  bench/akd_check.py, bench/akd_h1.py    # AKD1500 bit-exact check, H1 model
+  bench/verdict_eval.py               # verdicts vs cached LLM cards
+                                      #   (no API calls)
   bench/baselines.py                  # baseline detectors vs injected
                                       #   archetypes (recall@k, chance)
 scripts/                              # source-data preprocessing (NOT analyzers)
@@ -343,8 +365,9 @@ The top of the graph (text only, with no box-drawing characters):
 | `actorlink` | `analyzers`, `tooling`, `risk` |
 | `originintel` | `actorlink` |
 | `correlate` | `risk`, `nonipproto`, `protocolanomaly`, `asnintel`, `cidrintel`, `tooling`, `slowlow`, `selfmimic`, `isc_compare`, `coordination`, `chains` |
-| `conclude` | `correlate` (findings with an LLM narrative) |
-| `report` | All the steps before it (25 or more, with `conclude`) |
+| `verdict` | `correlate`, `analyzers`, `risk` (a verdict from fixed rules for each finding) |
+| `conclude` | `correlate`, `kg` (opt-in: an LLM narrative for each finding) |
+| `report` | All the steps before it (25 or more, with `verdict`) |
 | `adversarysim` | `slowlow`, `dnstlsintel`, `selfmimic`, `risk`, `report` |
 | `aireview` | `report` |
 
@@ -435,6 +458,34 @@ providers gave. The important changes are:
     - RDP credential spray, IPsec ESP probes and covert tunnels
   - Section 0.5 of the report shows each finding before the executive
     summary. Thus a defender can find them quickly.
+  - Since 2026-10-30, `src/conclusions/verdict.py` gives the verdicts, and
+    `synthesize.py` is an opt-in step. Refer to the next item.
+- **Verdicts from fixed rules** (2026-10-30):
+  - The LLM narratives had 3 problems. They were expensive (approximately
+    $6 for each full run), they were long (883 KB of text for 175
+    findings), and cards with the same facts got different verdicts.
+  - `src/conclusions/verdict.py` measures facts for all the member sources
+    of each finding:
+    - the share of each L7 protocol
+    - the share of known research scanners (`benignfilter`)
+    - the share of botnet payloads and of bulletproof hosting (risk
+      rationale)
+    - the number of sources that sent HTTP credentials and that are not
+      known scanners
+    - the share of bulletproof ASNs in an ASN-level finding (`asnintel`)
+  - An ordered rule table gives one verdict: `exploit_attempt`,
+    `credential_attack`, `hostile_infrastructure`, `service_recon`,
+    `protocol_anomaly`, `research_scanner`, `benign_p2p`, `context` or
+    `unclassified`. When no rule fires, the verdict is `unclassified`.
+  - Each verdict has the rule, the ATT&CK technique, a sentence that gives
+    the numbers, an action and a basis (`members`, `sample`, `asns` or
+    `pattern`).
+  - The step merges the findings with the same verdict and target into
+    problems (`output/conclusions/problems.parquet`).
+  - The same corpus always gives the same output. The step runs in
+    approximately 2 seconds, and it makes no API calls.
+  - `src/bench/verdict_eval.py` compares the verdicts with the cached LLM
+    cards. Refer to `docs/ARCHITECTURE.md` section 2 for the results.
 - **Campaign start detection** (2026-05-30):
   - `detect_coordination.py` calculates the first-arrival percentiles of
     each payload (p5 start, p25, p50, p75, p95 end) and the day with the
@@ -497,7 +548,7 @@ classical twins on the test sets and on the development sets: `lif` on
 | 2. Global arrival detector | `bench/arrival_series.py`, `bench/arrival_eval.py` | Failure. `ngrc_htm` gave 97.6 incorrect alarms each year, and `stl_z` gave 10.3. |
 | 3. LIF/ALIF timing for each source | `sg/lif.py`, `bench/lif_eval.py` | Failure by 0.01. On 43 days, `lif` found 0.82 of 430 beacons in the top 10, `pacing` 0.04. But `pacing` with the same calibration found 0.86. |
 | 4. Feature and risk inputs | `neuro.py` (DAG step), 8 `neuro_*` feature columns, `neuro_signal` risk term (8 points or less) | Built and run on all data. The arrival term gave an alarm minute to all sources in that minute, so its cap is 0 (operator decision of 2026-10-25). The HDC term (`hdc_proto`, `hdc_drift`, cap 4 points) uses the LIF flag level of 4 (operator decision of 2026-10-27). Few sources get HDC points, because only a very small number of calibrated HDC scores are 4 or more. The gate uses the escalation labels of `docs/NEUROMORPHIC_ROUND2_PLAN.md` §3.4. |
-| 5. WTA-STDP port prototypes | `sg/stdp.py`, `bench/stdp_eval.py` | Failure. No recall on `chain_mutation`. No Akida hardware for the Pi 5 part. |
+| 5. WTA-STDP port prototypes | `sg/stdp.py`, `bench/stdp_eval.py` | Failure. No recall on `chain_mutation`. The AKD1500 card part is in the next section. |
 
 To run the tests again:
 
@@ -525,6 +576,54 @@ nothing. Phases 1 to 3 must find this archetype.
 
 See `docs/ARCHITECTURE.md` section 9 for the phase table, the data
 contracts, and the rules for each stateful detector.
+
+### GPU path for HDC (2026-10-27)
+
+`sg/hdc_gpu.py` runs the HDC encoder and the prototype step on the GPU
+with ROCm or CUDA PyTorch. The `neuro` step uses it when PyTorch finds a
+GPU (`--hdc-device auto`, the default). On the GPU, the default is 2 workers
+(`--hdc-workers`), because the integrated GPU uses host memory.
+
+- The encoder output is bit-exact with the CPU encoder.
+- The GPU path calculates the prototype dot values as integers, with no rounding. The
+  CPU path rounds in float32. Thus `hdc_proto` is not fully the same on
+  the two paths (Spearman 0.995 to 0.999).
+- The GPU path is in the cache key. A change of device calculates the days
+  again.
+- Throughput on 8 days: CPU with 4 workers 55.4 s for each day, GPU with
+  2 workers 16.8 s. The full run of 899 days took 7.7 hours.
+- `bench/hdc_gpu_gate.py` calculated the GPU path as `hdc_proto_gpu` on
+  all 305 gate sets. It gets `pass` against `rff_proto` on `rotating_actor`
+  (test and development sets), with no difference from the CPU
+  `hdc_proto`.
+
+```bash
+./venv/bin/python src/bench/hdc_gpu_check.py      # encode and score, CPU against GPU
+./venv/bin/python src/neuro.py --hdc-device gpu   # or: evolve.py neuro
+```
+
+### AKD1500 card (2026-10-27)
+
+The BrainChip AKD1500 PCIe card is in the host. It operates with
+a driver that the operator built for kernel 7.0 (`/dev/akd1500_0`). The
+vendor Python package must have TensorFlow and Python 3.12 or older. Thus
+`src/sg/akd/` is a pybind11 binding to libakida 2.19.3 (C++), and the
+models train in PyTorch.
+
+- `bench/akd_check.py` compares the card, the libakida software and a
+  NumPy reference. With 4-bit weights, the outputs are bit-exact.
+- Fault: with 1-bit weights and 15 to 32 units, output unit 13 uses the
+  `act_step` of unit 14 (742 mismatches of 2,171,664 outputs). Do not use
+  1-bit weights on the card. The driver notes have the full report.
+- Speed of model H1: the card uses 17.4 µs for each window (batches) and
+  39 µs for one call. The libakida software uses 0.78 µs on the CPU. The
+  PCIe cost is larger than the calculation. At this time, there is no
+  energy value.
+
+```bash
+./venv/bin/python src/bench/akd_check.py
+./venv/bin/python src/bench/akd_h1.py score --device auto   # card if found
+```
 
 ## Performance changes (2026-05-30)
 
@@ -588,18 +687,22 @@ Each run makes the same full report in three formats at
 `output/reports/COMPREHENSIVE.{md,html,pdf}`:
 
 - Section 0 is a summary that a defender can read in 60 seconds.
-- Section 0.5 gives the cross-signal findings.
-- Sections 1 to 25 give the full analysis, with a caption for each table.
+- Section 0.5 gives the cross-signal problems.
+- Sections 1 to 32 give the full analysis, with a caption for each table.
 
 The report has these parts:
 
 - Summary (Section 0): top-5 threats, top-5 actor communities, the drift
-  warning, the counts of cross-signal findings, and the recommended steps.
-- **Cross-signal findings** (Section 0.5): one card for
-  each cross-analyzer rule that found a match.
-  - Each card has a narrative that an LLM writes: what, why it is
-    important, threat model, risk if it occurs, and the recommended action.
-  - Each card has a link to the analyzer section with the evidence.
+  warning, the number of problems that need action, and the recommended
+  steps.
+- **Cross-signal problems** (Section 0.5):
+  - A problem table. Each row is one verdict and one target, with the
+    number of findings, the number of different sources, the ports, the `detail` column and
+    the dates.
+  - A legend that gives one action for each verdict.
+  - A finding index, with one line for each finding: the verdict, the rule
+    and the facts that caused the verdict.
+  - The report shows no LLM narrative.
 - Sensor outages (Section 1): each run of UTC days with no packets, with
   its first day, last day and day count. The report finds these days from
   the `packets` day partitions. Rates and baselines have no data for these
@@ -624,6 +727,12 @@ The report has these parts:
   an AI provider.
 - A catalog of the non-IP protocols, with sample payloads that an AI
   decoded (SCTP, GRE, ESP/AH, IP-in-IP, 6to4 and others).
+- Neuromorphic scores, Section 32:
+  - The count of sources that the LIF/ALIF bank and HDC gave a score to,
+    and the count that they flagged.
+  - The sources with a `neuro_signal` risk term, for each tier.
+  - The top 25 sources by that term.
+  - The HDC-flagged sources, in groups by day.
 - A data-quality appendix for each analyzer.
 
 ## License and data

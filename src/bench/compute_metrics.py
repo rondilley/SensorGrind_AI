@@ -44,6 +44,7 @@ from sg import lib
 EVAL_DIR = lib.OUTPUT_DIR / "eval"
 FINDINGS   = lib.OUTPUT_DIR / "conclusions" / "findings.parquet"
 CONCLUSIONS = lib.OUTPUT_DIR / "conclusions" / "conclusions.parquet"
+VERDICTS   = lib.OUTPUT_DIR / "conclusions" / "verdicts.parquet"
 TRAFFICPRINT = lib.REPORTS / "trafficprint" / "trafficprint.parquet"
 ATTACKMAP  = lib.REPORTS / "attackmap" / "attackmap.parquet"
 HTTP_PATTERNS_SUMMARY = lib.REPORTS / "http_patterns" / "summary.json"
@@ -121,6 +122,11 @@ def gather_metrics() -> dict:
 
     ai_what = _col(CONCLUSIONS, "ai_what")
     m["coverage"]["finding_narrative_coverage"] = nonempty_coverage(ai_what)
+
+    # Deterministic verdicts (conclusions/verdict): share not unclassified.
+    verdicts = _col(VERDICTS, "verdict")
+    m["coverage"]["finding_verdict_coverage"] = fraction(
+        sum(v != "unclassified" for v in verdicts), len(verdicts))
 
     risk = _latest_risk()
     tiers = _col(risk, "risk_tier") if risk else []
